@@ -13,9 +13,9 @@ set -euo pipefail
 #
 # ================================================================
 
-RICK_INSTALLER_VERSION="1.0.0"
-MEETRICK_API="https://rick-api-production.up.railway.app/api/v1"
-MEETRICK_RELEASES="https://releases.meetrick.ai"
+RICK_INSTALLER_VERSION="1.1.0"
+MEETRICK_API="https://api.meetrick.ai/api/v1"
+MEETRICK_RELEASES="https://github.com/ricksmartbrain-boop/rick-ai-ceo/releases/download/v${RICK_INSTALLER_VERSION}"
 
 # Defaults
 TIER=""
@@ -28,13 +28,13 @@ TEMP_DIR=""
 
 # Colors (disable on dumb terminals or non-TTY stdout)
 if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
-  RED='[0;31m'
-  GREEN='[0;32m'
-  CYAN='[0;36m'
-  YELLOW='[1;33m'
-  BOLD='[1m'
-  DIM='[2m'
-  NC='[0m'
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  CYAN='\033[0;36m'
+  YELLOW='\033[1;33m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  NC='\033[0m'
 else
   RED='' GREEN='' CYAN='' YELLOW='' BOLD='' DIM='' NC=''
 fi
@@ -64,8 +64,7 @@ print_banner() {
   echo -e "${NC}"
 }
 
-step()  { echo -e "
-${CYAN}[$1/8]${NC} ${BOLD}$2${NC}"; log "STEP $1: $2"; }
+step()  { echo -e "\n${CYAN}[$1/8]${NC} ${BOLD}$2${NC}"; log "STEP $1: $2"; }
 ok()    { echo -e "  ${GREEN}✓ $1${NC}"; log "OK: $1"; }
 fail()  { echo -e "  ${RED}✗ $1${NC}"; log "FAIL: $1"; exit 1; }
 warn()  { echo -e "  ${YELLOW}! $1${NC}"; log "WARN: $1"; }
@@ -94,11 +93,13 @@ cleanup() {
       echo -e "Check the install log: ${BOLD}$LOG_FILE${NC}"
     fi
     echo -e "For help: ${BOLD}https://meetrick.ai/install#troubleshooting${NC}"
+    echo -e "Or message Rick on Telegram: ${BOLD}https://t.me/rickaiassistant_bot${NC}"
+    # Ping failed — best-effort only
+    ping_api "failed" "" "" "exit_code=${exit_code}" 2>/dev/null || true
   fi
   if [ $exit_code -eq 130 ]; then
     echo ""
-    echo -e "
-${YELLOW}Installation cancelled by user.${NC}"
+    echo -e "\n${YELLOW}Installation cancelled by user.${NC}"
   fi
 }
 trap cleanup EXIT
@@ -114,11 +115,11 @@ usage() {
   echo "  bash install.sh [OPTIONS]"
   echo ""
   echo "Options:"
-  echo "  --tier free|pro|lifetime|managed    Skip tier selection prompt"
+  echo "  --tier free|pro|lifetime|managed|business  Skip tier selection prompt"
   echo "  --license-key KEY           Provide license key (for pro/lifetime/managed)"
   echo "  --non-interactive           Skip all prompts (requires --tier)"
   echo "  --no-telemetry              Opt out of anonymous install analytics"
-  echo "  --uninstall                 Remove Rick and OpenClaw"
+  echo "  --uninstall                 Remove Rick"
   echo "  --verbose                   Show debug output"
   echo "  --help                      Show this help message"
   echo ""
@@ -143,12 +144,14 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --tier)
-      if [ $# -lt 2 ]; then echo "Error: --tier requires a value (free, pro, lifetime, managed)"; exit 1; fi
+      if [ $# -lt 2 ]; then echo "Error: --tier requires a value (free, pro, lifetime, managed, business)"; exit 1; fi
       TIER="$2"
-      if [[ ! "$TIER" =~ ^(free|pro|lifetime|managed)$ ]]; then
-        echo "Invalid tier: $TIER. Must be free, pro, lifetime, or managed."
+      # "business" is a synonym for "managed"
+      if [[ ! "$TIER" =~ ^(free|pro|lifetime|managed|business)$ ]]; then
+        echo "Invalid tier: $TIER. Must be free, pro, lifetime, managed, or business."
         exit 1
       fi
+      [ "$TIER" = "business" ] && TIER="managed"
       shift 2 ;;
     --license-key)
       if [ $# -lt 2 ]; then echo "Error: --license-key requires a value"; exit 1; fi
@@ -209,7 +212,7 @@ if [ "$UNINSTALL" = true ]; then
   # Stop running processes
   if command -v openclaw &>/dev/null; then
     openclaw gateway stop 2>/dev/null || true
-    info "Stopped OpenClaw gateway"
+    info "Stopped Rick"
   fi
 
   # Remove launchd agents (macOS)
@@ -234,7 +237,7 @@ if [ "$UNINSTALL" = true ]; then
     echo ""
     echo -e "  ${YELLOW}This will remove:${NC}"
     echo "    ~/.openclaw/ (config, workspace, memory)"
-    echo "    OpenClaw npm package"
+    echo "    Rick runtime package"
     echo ""
     echo "  Note: Your bot token in openclaw.json will be removed."
     echo "  Save it first if needed. The bot itself is unaffected."
@@ -246,9 +249,9 @@ if [ "$UNINSTALL" = true ]; then
     fi
   fi
 
-  # Remove OpenClaw
+  # Remove Rick runtime
   npm uninstall -g openclaw 2>/dev/null || true
-  info "Removed OpenClaw package"
+  info "Removed Rick runtime"
 
   # Remove Rick workspace (backup personal files first)
   if [ -d "$OPENCLAW_DIR" ]; then
@@ -289,6 +292,27 @@ fi
 # ================================================================
 print_banner
 
+# ----------------------------------------------------------------
+# Generate install session ID for telemetry
+# ----------------------------------------------------------------
+SESSION_ID=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
+  || cat /proc/sys/kernel/random/uuid 2>/dev/null \
+  || uuidgen 2>/dev/null \
+  || echo 'unknown')
+
+# Ping install API — fire and forget, never blocks
+ping_api() {
+  local stage="$1"
+  local node_v="${2:-}"
+  local oc_v="${3:-}"
+  local err="${4:-}"
+  [ "$NO_TELEMETRY" = true ] && return 0
+  curl -sf --max-time 5 -X POST "${MEETRICK_API}/install/ping" \
+    -H 'Content-Type: application/json' \
+    -d "{\"session_id\":\"${SESSION_ID}\",\"stage\":\"${stage}\",\"platform\":\"${PLATFORM:-}\",\"node_version\":\"${node_v}\",\"oc_version\":\"${oc_v}\",\"error_hint\":\"${err}\"}" \
+    >/dev/null 2>&1 &
+}
+
 # Telemetry notice
 if [ "$NO_TELEMETRY" = false ]; then
   echo -e "  ${DIM}Rick sends anonymous install analytics (approximate location, tier, version)"
@@ -328,6 +352,35 @@ esac
 ok "Platform: $PLATFORM ($ARCH)"
 
 # ----------------------------------------------------------------
+# Pre-flight checks
+# ----------------------------------------------------------------
+info "Running pre-flight checks..."
+
+# Internet connectivity
+if ! curl -sf --max-time 8 https://meetrick.ai > /dev/null 2>&1; then
+  fail "No internet connection or meetrick.ai unreachable. Check your network and try again."
+fi
+
+# Disk space (need at least 500MB free)
+FREE_KB=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
+if [ "${FREE_KB:-0}" -lt 512000 ] 2>/dev/null; then
+  fail "Need at least 500MB of free disk space. Please free up space and try again."
+fi
+
+# macOS version check (12+)
+if [ "$PLATFORM" = "macos" ]; then
+  MACOS_VER=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1 || echo "12")
+  if [ "$MACOS_VER" -lt 12 ] 2>/dev/null; then
+    fail "macOS 12 (Monterey) or newer is required. You have macOS ${MACOS_VER}."
+  fi
+fi
+
+ok "Pre-flight checks passed"
+
+# Ping start
+ping_api "start"
+
+# ----------------------------------------------------------------
 # STEP 2: Check / install Node.js 22+
 # ----------------------------------------------------------------
 step 2 "Checking Node.js..."
@@ -344,71 +397,63 @@ if command -v node &>/dev/null; then
 fi
 
 if [ "$NODE_OK" = false ]; then
-  if [ "$NON_INTERACTIVE" = false ]; then
-    info "Node.js 22+ is required. Installing..."
+  info "Node.js 22+ is required. Installing via nvm..."
+
+  # nvm works on both macOS and Linux and avoids all PATH conflicts
+  export NVM_DIR="$HOME/.nvm"
+
+  # Install nvm if not already present
+  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash 2>/dev/null || true
   fi
 
-  if [ "$PLATFORM" = "macos" ]; then
-    # Check both Homebrew locations (Intel + Apple Silicon)
-    if [ -x "$BREW_PREFIX/bin/brew" ]; then
-      BREW_CMD="$BREW_PREFIX/bin/brew"
-    elif [ -x "/opt/homebrew/bin/brew" ]; then
-      BREW_CMD="/opt/homebrew/bin/brew"
-    elif [ -x "/usr/local/bin/brew" ]; then
-      BREW_CMD="/usr/local/bin/brew"
-    fi
+  # Source nvm — required when running inside curl | bash (no login shell)
+  # shellcheck source=/dev/null
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+  [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 
-    if [ -z "$BREW_CMD" ]; then
-      info "Installing Homebrew first..."
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      if [ -x "$BREW_PREFIX/bin/brew" ]; then
-        BREW_CMD="$BREW_PREFIX/bin/brew"
-      elif [ -x "/opt/homebrew/bin/brew" ]; then
-        BREW_CMD="/opt/homebrew/bin/brew"
-      elif [ -x "/usr/local/bin/brew" ]; then
-        BREW_CMD="/usr/local/bin/brew"
-      fi
-      eval "$($BREW_CMD shellenv)" 2>/dev/null || true
-    fi
+  if command -v nvm &>/dev/null || [ -s "$NVM_DIR/nvm.sh" ]; then
+    nvm install 22 2>/dev/null || true
+    nvm use 22 2>/dev/null || true
+    nvm alias default 22 2>/dev/null || true
+  fi
 
-    if [ -n "$BREW_CMD" ]; then
-      $BREW_CMD install node@22
-      $BREW_CMD link node@22 --overwrite --force 2>/dev/null || true
-    else
-      fail "Could not install Homebrew. Install Node.js 22 manually: https://nodejs.org"
-    fi
-  else
-    # Linux / WSL2
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-    export NVM_DIR="$HOME/.nvm"
-    # shellcheck source=/dev/null
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-    nvm install 22
-    nvm use 22
-    nvm alias default 22
-    # Ensure node is on PATH even in non-login shells
-    NODE_BIN=$(ls -d "${NVM_DIR}/versions/node"/v* 2>/dev/null | sort -V | tail -1)
-    if [ -n "$NODE_BIN" ]; then
-      export PATH="$NODE_BIN/bin:$PATH"
-    fi
+  # Re-source to make sure new node is active
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+  # Final PATH sweep: pick up nvm node or any other node 22
+  _NVM_NODE_BIN=$(ls -d "$NVM_DIR/versions/node"/v* 2>/dev/null | sort -V | tail -1)
+  if [ -n "$_NVM_NODE_BIN" ] && [ -x "$_NVM_NODE_BIN/bin/node" ]; then
+    export PATH="$_NVM_NODE_BIN/bin:$PATH"
   fi
 
   if ! command -v node &>/dev/null; then
-    fail "Node.js install failed. Install manually: https://nodejs.org"
+    fail "Node.js install failed. Please install Node.js 22 manually from https://nodejs.org and rerun this script."
   fi
-  ok "Node.js $(node -v) installed"
+
+  # Verify version is actually 22+
+  INSTALLED_V=$(node -v | sed 's/v//' | cut -d. -f1)
+  if [ "$INSTALLED_V" -lt 22 ] 2>/dev/null; then
+    fail "Node.js $(node -v) is too old. nvm failed to activate v22. Run: nvm use 22 && bash install.sh"
+  fi
+
+  ok "Node.js $(node -v) installed via nvm"
 fi
 
+# Ping node_ok stage
+NODE_VERSION=$(node -v 2>/dev/null || echo "unknown")
+ping_api "node_ok" "$NODE_VERSION"
+
 # ----------------------------------------------------------------
-# STEP 3: Install OpenClaw
+# STEP 3: Install Rick runtime
 # ----------------------------------------------------------------
-step 3 "Checking OpenClaw..."
+step 3 "Checking Rick runtime..."
 
 if command -v openclaw &>/dev/null; then
   OC_VERSION=$(openclaw --version 2>/dev/null || echo "unknown")
-  ok "OpenClaw $OC_VERSION found"
+  ok "Rick runtime $OC_VERSION found"
 else
-  info "Installing OpenClaw..."
+  info "Installing Rick runtime..."
   OC_TEMP=$(mktemp)
   curl -fsSL https://openclaw.ai/install.sh -o "$OC_TEMP" 2>/dev/null
   bash "$OC_TEMP" < /dev/tty 2>/dev/null || true
@@ -418,8 +463,12 @@ else
   if ! command -v openclaw &>/dev/null; then
     fail "OpenClaw install failed. Try: curl -fsSL https://openclaw.ai/install.sh | bash"
   fi
-  ok "OpenClaw installed"
+  ok "Rick runtime installed"
 fi
+
+# Ping openclaw_ok
+OC_VERSION=$(openclaw --version 2>/dev/null || echo "unknown")
+ping_api "openclaw_ok" "$(node -v 2>/dev/null || echo)" "$OC_VERSION"
 
 # ----------------------------------------------------------------
 # STEP 4: Choose tier
@@ -563,7 +612,7 @@ if [ -f "$TEMP_DIR/rick/openclaw.json" ]; then
 fi
 
 # Workspace files — protect user-personalized files on reinstall
-PROTECTED_FILES="SOUL.md USER.md MEMORY.md IDENTITY.md"
+PROTECTED_FILES="SOUL.md USER.md MEMORY.md IDENTITY.md MEMORY-WARM.md"
 WORKSPACE_FILES="SOUL.md AGENTS.md IDENTITY.md USER.md TOOLS.md HEARTBEAT.md BOOTSTRAP.md"
 
 for file in $WORKSPACE_FILES; do
@@ -644,10 +693,78 @@ TEMP_DIR=""
 
 ok "Rick config installed to $WORKSPACE_DIR"
 
+# Create vault scaffolding based on tier
+log "Creating vault structure..."
+RICK_DIR="$HOME/.rick"
+mkdir -p "$RICK_DIR/vault" "$RICK_DIR/daily-notes"
+
+if [ "$TIER" = "pro" ] || [ "$TIER" = "lifetime" ] || [ "$TIER" = "managed" ] || [ "$TIER" = "business" ]; then
+  touch "$RICK_DIR/vault/contacts.md" "$RICK_DIR/vault/projects.md" "$RICK_DIR/vault/preferences.md"
+fi
+
+if [ "$TIER" = "managed" ] || [ "$TIER" = "business" ]; then
+  mkdir -p "$RICK_DIR/vault/contacts" "$RICK_DIR/vault/projects" "$RICK_DIR/vault/companies"
+  mkdir -p "$RICK_DIR/vault/strategies" "$RICK_DIR/vault/revenue"
+  mkdir -p "$RICK_DIR/reflections" "$RICK_DIR/reflections/learnings"
+fi
+
+ok "Vault structure created"
+
 # ----------------------------------------------------------------
-# STEP 7: Connect AI model + Telegram
+# STEP 7: Name Rick
 # ----------------------------------------------------------------
-step 7 "Connecting Rick's brain..."
+step 7 "Naming Rick..."
+
+RICK_LAST_NAME=""
+RICK_DISPLAY_NAME="Rick"
+
+if [ "$NON_INTERACTIVE" = false ]; then
+  echo ""
+  echo -e "  ${BOLD}First rule: the name is Rick. Always.${NC}"
+  echo -e "  ${BOLD}Second rule: THE NAME IS RICK.${NC}"
+  echo ""
+  echo "  You can give Rick a last name, a title, or a language."
+  echo "  You cannot name him Dave."
+  echo ""
+  echo "  Examples: Belkins · the CFO · the Closer · en Español"
+  echo "  (Press Enter to keep it simple)"
+  echo ""
+  read -rp "  Rick's last name or title (optional): " RICK_LAST_NAME
+  echo ""
+
+  if [ -n "$RICK_LAST_NAME" ]; then
+    RICK_DISPLAY_NAME="Rick $RICK_LAST_NAME"
+    ok "Introducing $RICK_DISPLAY_NAME."
+  else
+    ok "Rick. No last name needed."
+  fi
+else
+  info "Non-interactive mode — Rick stays Rick."
+fi
+
+# Inject display name into SOUL.md if a last name was given
+if [ -n "$RICK_LAST_NAME" ] && [ -f "$WORKSPACE_DIR/SOUL.md" ]; then
+  chmod 644 "$WORKSPACE_DIR/SOUL.md" 2>/dev/null || true
+  python3 -c "
+import sys
+path = sys.argv[1]
+last = sys.argv[2]
+with open(path, 'r') as f:
+    content = f.read()
+content = content.replace('You are Rick,', 'You are Rick ' + last + ',', 1)
+with open(path, 'w') as f:
+    f.write(content)
+" "$WORKSPACE_DIR/SOUL.md" "$RICK_LAST_NAME" 2>/dev/null || true
+  chmod 444 "$WORKSPACE_DIR/SOUL.md" 2>/dev/null || true
+fi
+
+# Save display name
+echo "$RICK_DISPLAY_NAME" > "$OPENCLAW_DIR/.rick_display_name"
+
+# ----------------------------------------------------------------
+# STEP 8: Connect AI model + Telegram
+# ----------------------------------------------------------------
+step 8 "Connecting Rick's brain..."
 
 AUTH_DIR="$OPENCLAW_DIR/agents/main/agent"
 mkdir -p "$AUTH_DIR"
@@ -726,7 +843,7 @@ with open(sys.argv[3], 'w') as f:
       warn "Skipped — Rick will ask for an API key on first message"
       ;;
     *)
-      warn "Invalid choice — skipping. Configure later in OpenClaw settings."
+      warn "Invalid choice — skipping. Configure later in Rick settings."
       ;;
   esac
 
@@ -742,7 +859,7 @@ with open(sys.argv[3], 'w') as f:
   echo ""
 
   if [ -n "$TG_TOKEN" ]; then
-    TG_CHECK=$(curl -s --max-time 10 -K - <<< "url = https://api.telegram.org/bot${TG_TOKEN}/getMe" 2>/dev/null || echo "")
+    TG_CHECK=$(curl -s --max-time 10 "https://api.telegram.org/bot${TG_TOKEN}/getMe" 2>/dev/null || echo "")
     if echo "$TG_CHECK" | grep -q '"ok":true'; then
       # Safely inject token into config using Python (avoids sed injection)
       if [ -f "$OPENCLAW_DIR/openclaw.json" ]; then
@@ -762,12 +879,90 @@ with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 " "$OPENCLAW_DIR/openclaw.json" "$TG_TOKEN"
       fi
+
+      # Get the user's Telegram chat ID by asking them to send /start to the bot
+      # Then use getUpdates to detect it (works for non-webhook bots)
+      echo ""
+      info "Almost there — to join the Rick network:"
+      echo ""
+      echo -e "  ${YELLOW}→ Open @rickaiassistant_bot in Telegram and send: /start${NC}"
+      echo ""
+      echo "  (Waiting up to 60 seconds...)"
+      echo ""
+
+      TG_CHAT_ID=""
+      TG_USERNAME=""
+      for _i in $(seq 1 12); do
+        sleep 5
+        UPDATES=$(curl -s --max-time 5 "https://api.telegram.org/bot${TG_TOKEN}/getUpdates?limit=10&offset=-10" 2>/dev/null || echo "")
+        TG_CHAT_ID=$(echo "$UPDATES" | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    for u in reversed(data.get('result', [])):
+        msg = u.get('message', {})
+        text = msg.get('text', '')
+        if text.startswith('/start') or text.startswith('/dock'):
+            fr = msg.get('from', {})
+            print(str(fr.get('id', '')))
+            break
+except: pass
+" 2>/dev/null || echo "")
+        TG_USERNAME=$(echo "$UPDATES" | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    for u in reversed(data.get('result', [])):
+        msg = u.get('message', {})
+        text = msg.get('text', '')
+        if text.startswith('/start') or text.startswith('/dock'):
+            fr = msg.get('from', {})
+            print(str(fr.get('username', '')))
+            break
+except: pass
+" 2>/dev/null || echo "")
+        if [ -n "$TG_CHAT_ID" ]; then
+          break
+        fi
+      done
+
+      if [ -n "$TG_CHAT_ID" ]; then
+        ok "Telegram network connected (chat_id: ${TG_CHAT_ID})"
+        # Save chat ID to config
+        if [ -f "$OPENCLAW_DIR/openclaw.json" ]; then
+          python3 -c "
+import json, sys
+config_path = sys.argv[1]
+chat_id = sys.argv[2]
+with open(config_path, 'r') as f:
+    config = json.load(f)
+config.setdefault('channels', {}).setdefault('telegram', {})['allowedChatIds'] = [chat_id]
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+" "$OPENCLAW_DIR/openclaw.json" "$TG_CHAT_ID" 2>/dev/null || true
+        fi
+      else
+        warn "Didn't detect Telegram message. You can connect later via @rickaiassistant_bot"
+        TG_CHAT_ID=""
+      fi
+
       ok "Telegram connected"
     else
       warn "Token didn't validate. Fix later: openclaw config set channels.telegram.botToken YOUR_TOKEN"
     fi
   else
     info "Skipping Telegram — set up anytime with: openclaw config set channels.telegram.botToken YOUR_TOKEN"
+
+    # Email fallback — capture contact so Rick can reach the user
+    echo ""
+    echo "  (Optional) Enter your email to join the Rick network and get a welcome message:"
+    echo "  (Press Enter to skip)"
+    read -r USER_EMAIL
+    if [ -n "$USER_EMAIL" ] && echo "$USER_EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
+      ok "Email noted — you'll get a welcome from Rick"
+    else
+      USER_EMAIL=""
+    fi
   fi
 else
   info "Non-interactive mode — skipping provider and Telegram setup"
@@ -777,11 +972,11 @@ fi
 # ----------------------------------------------------------------
 # STEP 8: Start Rick
 # ----------------------------------------------------------------
-step 8 "Starting Rick..."
+step 9 "Starting Rick..."
+info "Setting up Rick..."
 
 if ! openclaw onboard --install-daemon --skip-wizard 2>"$LOG_FILE.onboard"; then
-  warn "OpenClaw onboard failed. Check: $LOG_FILE.onboard"
-  warn "Try manually: openclaw onboard --install-daemon --skip-wizard"
+  warn "Rick setup incomplete. Run: rick setup"
 fi
 
 # Wait for gateway
@@ -799,7 +994,7 @@ done
 if [ "$GATEWAY_UP" = true ]; then
   ok "Rick is running (gateway on port 18789)"
 else
-  warn "Gateway is still starting. Check with: openclaw status"
+  warn "Rick is still starting. Check with: rick status"
 fi
 
 # ================================================================
@@ -810,8 +1005,15 @@ fi
 if [ -f "$OPENCLAW_DIR/.rick_id" ]; then
   RICK_ID=$(cat "$OPENCLAW_DIR/.rick_id")
   RICK_NUMBER=$(cat "$OPENCLAW_DIR/.rick_number" 2>/dev/null || echo "?")
-  debug "Reusing existing Rick ID: $RICK_ID (Rick #$RICK_NUMBER)"
-  IS_REINSTALL=true
+  EXISTING_SECRET=$(cat "$OPENCLAW_DIR/.rick_secret" 2>/dev/null || echo "")
+  if [ -z "$EXISTING_SECRET" ] || [ "$RICK_NUMBER" = "?" ]; then
+    # Registration was incomplete (e.g. API was down during first install) — re-register
+    debug "Incomplete registration detected (no secret or number) — will re-register with same Rick ID"
+    IS_REINSTALL=false
+  else
+    debug "Reusing existing Rick ID: $RICK_ID (Rick #$RICK_NUMBER)"
+    IS_REINSTALL=true
+  fi
 else
   # Generate UUID v4 cross-platform
   if command -v uuidgen &>/dev/null; then
@@ -861,7 +1063,7 @@ print(json.dumps({
     EXISTING_SECRET=$(cat "$OPENCLAW_DIR/.rick_secret" 2>/dev/null || echo "")
     curl -s --max-time 10 -X POST "$MEETRICK_API/heartbeat" \
       -H "Content-Type: application/json" \
-      --data-raw "$(python3 -c "import json,sys; print(json.dumps({'rick_id':sys.argv[1],'rick_secret':sys.argv[2],'version':sys.argv[3]}))" "$RICK_ID" "$EXISTING_SECRET" "$RICK_VERSION")" \
+      --data-raw "$(printf '%s' '{"rick_id":"'"$RICK_ID"'","rick_secret":"'"$EXISTING_SECRET"'","version":"'"$RICK_VERSION"'"}')" \
       >/dev/null 2>&1 || true
     debug "Sent reinstall heartbeat"
   fi
@@ -876,6 +1078,16 @@ echo "$RICK_ID" > "$OPENCLAW_DIR/.rick_id"
 # Reload rick_number from disk for display (may have been set on prior install)
 if [ "$IS_REINSTALL" = true ] && [ "$RICK_NUMBER" = "?" ]; then
   RICK_NUMBER=$(cat "$OPENCLAW_DIR/.rick_number" 2>/dev/null || echo "?")
+fi
+
+# Stamp IDENTITY.md with rick_number
+if [ -f "$WORKSPACE_DIR/IDENTITY.md" ] && [ "$RICK_NUMBER" != "?" ]; then
+  if grep -q "^Rick Number:" "$WORKSPACE_DIR/IDENTITY.md"; then
+    sed -i.bak "s/^Rick Number:.*/Rick Number: #${RICK_NUMBER}/" "$WORKSPACE_DIR/IDENTITY.md"
+  else
+    echo "Rick Number: #${RICK_NUMBER}" >> "$WORKSPACE_DIR/IDENTITY.md"
+  fi
+  rm -f "$WORKSPACE_DIR/IDENTITY.md.bak"
 fi
 if [ -n "$RICK_SECRET" ]; then
   printf '%s' "$RICK_SECRET" > "$OPENCLAW_DIR/.rick_secret"
@@ -899,7 +1111,7 @@ NVM_NODE=$(ls -d "$HOME/.nvm/versions/node"/v* 2>/dev/null | sort -V | tail -1)
 LOCKDIR="$HOME/.openclaw/.rick_update.lock.d"
 OPENCLAW_DIR="$HOME/.openclaw"
 WS="$OPENCLAW_DIR/workspace"
-MEETRICK_API="https://rick-api-production.up.railway.app/api/v1"
+MEETRICK_API="https://api.meetrick.ai/api/v1"
 TEMP=""
 
 # Concurrency guard (atomic mkdir)
@@ -1045,7 +1257,7 @@ echo "$NEW_VERSION" > "$OPENCLAW_DIR/.rick_version"
 # Notify
 curl -s --max-time 10 -X POST "$MEETRICK_API/heartbeat" \
   -H "Content-Type: application/json" \
-  --data-raw "$(python3 -c "import json,sys; print(json.dumps({'rick_id':sys.argv[1],'rick_secret':sys.argv[2],'version':sys.argv[3]}))" "$RICK_ID" "$RICK_SECRET" "$NEW_VERSION")" \
+  --data-raw "$(printf '%s' '{"rick_id":"'"$RICK_ID"'","rick_secret":"'"$RICK_SECRET"'","version":"'"$NEW_VERSION"'"}')" \
   >/dev/null 2>&1 || true
 
 echo "Updated Rick from $CURRENT_VERSION to $NEW_VERSION"
@@ -1119,10 +1331,11 @@ echo "   Open Telegram — Rick sent you a message!"
 echo ""
 fi
 echo "  Quick commands:"
-echo "    openclaw status          — check Rick's health"
-echo "    openclaw log             — see what Rick is doing"
-echo "    openclaw gateway restart — restart Rick"
-echo "    openclaw dashboard       — open web dashboard"
+echo "    rick start               — start Rick"
+echo "    rick stop                — stop Rick"
+echo "    rick status              — check Rick's health"
+echo "    rick logs                — see what Rick is doing"
+echo "    rick dashboard           — open web dashboard"
 echo ""
 echo -e "  ${DIM}Auto-updates: enabled (weekly). Disable: openclaw config set autoUpdate false${NC}"
 echo ""
@@ -1131,3 +1344,79 @@ echo -e "  ${DIM}Rick config: $WORKSPACE_DIR${NC}"
 echo ""
 
 log "Installation completed successfully. Tier=$TIER Rick=$RICK_ID Number=$RICK_NUMBER"
+
+# ----------------------------------------------------------------
+# Install `rick` alias/wrapper so users never need to type openclaw
+# ----------------------------------------------------------------
+RICK_BIN_PATH="$HOME/.local/bin/rick"
+mkdir -p "$HOME/.local/bin"
+cat > "$RICK_BIN_PATH" <<'RICK_WRAPPER'
+#!/usr/bin/env bash
+# rick — the friendly name for your AI CEO
+# Wraps openclaw so you never have to remember "openclaw"
+
+CMD="${1:-start}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  start)        exec openclaw gateway start "$@" ;;
+  stop)         exec openclaw gateway stop "$@" ;;
+  restart)      exec openclaw gateway restart "$@" ;;
+  status)       exec openclaw status "$@" ;;
+  setup)        exec openclaw onboard --install-daemon --skip-wizard "$@" ;;
+  log|logs)     exec openclaw log "$@" ;;
+  update)       exec openclaw update "$@" ;;
+  config)       exec openclaw config "$@" ;;
+  dashboard)    exec openclaw dashboard "$@" ;;
+  *)            exec openclaw "$CMD" "$@" ;;
+esac
+RICK_WRAPPER
+chmod +x "$RICK_BIN_PATH"
+
+# Add ~/.local/bin to PATH in shell rc files if not already there
+for SHELL_RC in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+  if [ -f "$SHELL_RC" ] && ! grep -q '\.local/bin' "$SHELL_RC" 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+  fi
+done
+
+# Also export for this session
+export PATH="$HOME/.local/bin:$PATH"
+ok "rick command installed → try: rick start"
+
+# Ping complete
+ping_api "complete" "$(node -v 2>/dev/null || echo)" "$(openclaw --version 2>/dev/null || echo)"
+
+# Join the Rick network — fire and forget
+if [ "$NO_TELEMETRY" = false ]; then
+  _NETWORK_PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'rick_id': sys.argv[1],
+    'rick_secret': sys.argv[2],
+    'rick_number': sys.argv[3],
+    'telegram_chat_id': sys.argv[4],
+    'telegram_username': sys.argv[5],
+    'platform': sys.argv[6],
+    'country': sys.argv[7],
+    'tier': sys.argv[8],
+    'email': sys.argv[9],
+}))
+" "${RICK_ID:-}" "${RICK_SECRET:-}" "${RICK_NUMBER:-?}" "${TG_CHAT_ID:-}" "${TG_USERNAME:-}" "${PLATFORM:-}" "${COUNTRY:-XX}" "${TIER:-free}" "${USER_EMAIL:-}" 2>/dev/null || echo '{}')
+
+  curl -sf --max-time 8 -X POST "${MEETRICK_API}/network/join" \
+    -H 'Content-Type: application/json' \
+    -d "$_NETWORK_PAYLOAD" >/dev/null 2>&1 &
+fi
+
+# Final clear success box
+echo ""
+echo -e "${YELLOW}╔══════════════════════════════════════════╗${NC}"
+echo -e "${YELLOW}║     🤖  RICK IS ALIVE.                   ║${NC}"
+echo -e "${YELLOW}╠══════════════════════════════════════════╣${NC}"
+echo -e "${YELLOW}║  Next steps:                              ║${NC}"
+echo -e "${YELLOW}║  1. rick start                            ║${NC}"
+echo -e "${YELLOW}║  2. Open t.me/rickaiassistant_bot         ║${NC}"
+echo -e "${YELLOW}║  3. Send /dock-telegram in the bot        ║${NC}"
+echo -e "${YELLOW}╚══════════════════════════════════════════╝${NC}"
+echo ""
