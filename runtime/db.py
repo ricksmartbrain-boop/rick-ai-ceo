@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""SQLite-backed durable state for Rick v6."""
+
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+_SAFE_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def data_root() -> Path:
+    return Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+
+
+def runtime_db_path() -> Path:
+    return Path(
+        os.path.expanduser(
+            os.getenv("RICK_RUNTIME_DB_FILE", str(data_root() / "runtime" / "rick-runtime.db"))
+        )
+    )
+
+
+def connect() -> sqlite3.Connection:
+    db_path = runtime_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Set restrictive umask before creating the DB file to avoid permission race
+    old_umask = os.umask(0o077)
+    try:
+        connection = sqlite3.connect(str(db_path))
+    finally:
+        os.umask(old_umask)
+    # Ensure DB file permissions are owner-only
+    try:
+        db_path.chmod(0o600)
+        wal_path = db_path.parent / (db_path.name + "-wal")
+        shm_path = db_path.parent / (db_path.name + "-shm")
+        if wal_path.exists():
+            wal_path.chmod(0o600)
+        if shm_path.exists():
+            shm_path.chmod(0o600)
+    except OSError as exc:
+        import logging
+        logging.getLogger("rick.db").warning("Could not restrict DB permissions: %s", exc)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def _assert_safe_identifier(value: str, label: str) -> None:
+    if not _SAFE_IDENTIFIER.match(value):
+        raise ValueError(f"Unsafe SQL identifier for {label}: {value!r}")
+
+
+def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    _assert_safe_identifier(table, "table")
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    _assert_safe_identifier(table, "table")
+    _assert_safe_identifier(column, "column")
+    if column in table_columns(connection, table):
+        return
+    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def migrate_db(connection: sqlite3.Connection) -> None:
+    ensure_column(connection, "workflows", "lane", "TEXT NOT NULL DEFAULT 'ceo-lane'")
+    ensure_column(connection, "workflows", "telegram_target", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "workflows", "openclaw_session_key", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "jobs", "lane", "TEXT NOT NULL DEFAULT 'ceo-lane'")
+    connection.execute(
+        "UPDATE workflows SET finished_at=updated_at"
+        " WHERE finished_at IS NULL"
+        " AND status IN ('done','published','fulfilled','denied','failed','cancelled')"
+    )
+
+    # Ensure newer tables exist (safe to re-run due to IF NOT EXISTS)
+    for table_check in [
+        ("conversation_messages", "chat_id TEXT NOT NULL"),
+        ("notification_log", "target_chat_id TEXT NOT NULL DEFAULT ''"),
+        ("scheduled_messages", "schedule_key TEXT NOT NULL UNIQUE"),
+        ("prospect_pipeline", "platform TEXT NOT NULL DEFAULT ''"),
+        ("tenants", "customer_id TEXT NOT NULL"),
+        ("tenant_health_history", "tenant_id TEXT NOT NULL"),
+        ("email_subscribers", "email TEXT NOT NULL UNIQUE"),
+        ("affiliates", "name TEXT NOT NULL DEFAULT ''"),
+        ("referrals", "affiliate_id TEXT NOT NULL"),
+        ("fleet_benchmarks", "industry TEXT NOT NULL DEFAULT ''"),
+        ("tenant_insights", "tenant_id TEXT NOT NULL"),
+    ]:
+        table_name, _ = table_check
+        existing = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        if not existing:
+            # Re-run init to create missing tables
+            init_db(connection)
+            break
+
+    # Ensure indexes exist even if tables were created before indexes were added.
+    # All CREATE INDEX statements use IF NOT EXISTS so this is safe to re-run.
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_workflow ON events(workflow_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id);
+        CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_workflow ON jobs(workflow_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+        """
+    )
+
+
+def init_db(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workflows (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            project TEXT NOT NULL,
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 50,
+            owner TEXT NOT NULL DEFAULT 'rick',
+            lane TEXT NOT NULL DEFAULT 'ceo-lane',
+            telegram_target TEXT NOT NULL DEFAULT '',
+            openclaw_session_key TEXT NOT NULL DEFAULT '',
+            context_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            step_name TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT NOT NULL,
+            route TEXT NOT NULL,
+            lane TEXT NOT NULL DEFAULT 'ceo-lane',
+            payload_json TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            last_error TEXT,
+            blocked_reason TEXT,
+            approval_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            run_after TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_run_after
+        ON jobs(status, run_after, step_index);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_lane_status_run_after
+        ON jobs(lane, status, run_after, step_index);
+
+        CREATE INDEX IF NOT EXISTS idx_workflows_lane_status
+        ON workflows(lane, status, priority);
+
+        CREATE TABLE IF NOT EXISTS approvals (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            area TEXT NOT NULL,
+            request_text TEXT NOT NULL,
+            impact_text TEXT NOT NULL,
+            policy_basis TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            resolved_by TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution_note TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_approvals_status
+        ON approvals(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            path TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_artifacts_workflow
+        ON artifacts(workflow_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            latest_workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_customers_email
+        ON customers(email);
+
+        CREATE TABLE IF NOT EXISTS customer_events (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_customer_events_customer
+        ON customer_events(customer_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
+            job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_workflow
+        ON events(workflow_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS telegram_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            thread_id INTEGER NOT NULL,
+            topic_key TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            lane TEXT NOT NULL DEFAULT '',
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            icon_custom_emoji_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            seed_message_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_topics_chat_thread
+        ON telegram_topics(chat_id, thread_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_topics_chat_key
+        ON telegram_topics(chat_id, topic_key);
+
+        CREATE INDEX IF NOT EXISTS idx_telegram_topics_workflow
+        ON telegram_topics(workflow_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL DEFAULT 1,
+            applied_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
+            job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+            step_name TEXT NOT NULL,
+            route TEXT NOT NULL DEFAULT '',
+            model_used TEXT NOT NULL DEFAULT '',
+            cost_usd REAL NOT NULL DEFAULT 0.0,
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            quality_score REAL,
+            outcome_type TEXT NOT NULL DEFAULT 'success',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outcomes_workflow
+        ON outcomes(workflow_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_outcomes_type
+        ON outcomes(outcome_type, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_approvals_workflow
+        ON approvals(workflow_id);
+
+        CREATE INDEX IF NOT EXISTS idx_approvals_job
+        ON approvals(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_artifacts_job
+        ON artifacts(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_customer_events_workflow
+        ON customer_events(workflow_id);
+
+        CREATE INDEX IF NOT EXISTS idx_events_type
+        ON events(event_type);
+
+        CREATE INDEX IF NOT EXISTS idx_events_job
+        ON events(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_workflows_status
+        ON workflows(status, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_workflow
+        ON jobs(workflow_id);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_status
+        ON jobs(status);
+
+        CREATE INDEX IF NOT EXISTS idx_outcomes_job
+        ON outcomes(job_id);
+
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            thread_id INTEGER,
+            topic_key TEXT NOT NULL DEFAULT '',
+            direction TEXT NOT NULL,
+            sender TEXT NOT NULL DEFAULT 'unknown',
+            message_text TEXT NOT NULL,
+            message_id INTEGER,
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_chat_thread
+        ON conversation_messages(chat_id, thread_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_topic
+        ON conversation_messages(topic_key, created_at);
+
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_chat_id TEXT NOT NULL DEFAULT '',
+            target_thread_id INTEGER,
+            topic_key TEXT NOT NULL DEFAULT '',
+            message_text TEXT NOT NULL,
+            telegram_message_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'sent',
+            error TEXT NOT NULL DEFAULT '',
+            workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+            purpose TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notification_log_created
+        ON notification_log(created_at);
+
+        CREATE TABLE IF NOT EXISTS scheduled_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_key TEXT NOT NULL UNIQUE,
+            topic_key TEXT NOT NULL DEFAULT '',
+            cron_expression TEXT NOT NULL,
+            template_key TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_sent_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS prospect_pipeline (
+            id TEXT PRIMARY KEY,
+            platform TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT '',
+            profile_url TEXT NOT NULL DEFAULT '',
+            score REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'intake',
+            notes TEXT NOT NULL DEFAULT '',
+            last_contact_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prospect_pipeline_status
+        ON prospect_pipeline(status, score DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_prospect_pipeline_username
+        ON prospect_pipeline(username);
+
+        CREATE TABLE IF NOT EXISTS tenants (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            stripe_customer_id TEXT NOT NULL DEFAULT '',
+            subscription_id TEXT NOT NULL DEFAULT '',
+            business_name TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'provisioning',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            health_score REAL NOT NULL DEFAULT 100,
+            monthly_value_usd REAL NOT NULL DEFAULT 0,
+            last_serviced_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tenants_status
+        ON tenants(status);
+
+        CREATE TABLE IF NOT EXISTS tenant_health_history (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            score REAL NOT NULL DEFAULT 0,
+            signals_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tenant_health_history_tenant
+        ON tenant_health_history(tenant_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS email_subscribers (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL DEFAULT '',
+            subscribed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_email_subscribers_status
+        ON email_subscribers(status);
+
+        CREATE TABLE IF NOT EXISTS affiliates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL DEFAULT '',
+            profile_url TEXT NOT NULL DEFAULT '',
+            referral_code TEXT NOT NULL DEFAULT '',
+            commission_rate REAL NOT NULL DEFAULT 0.30,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_affiliates_status
+        ON affiliates(status);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_affiliates_referral_code
+        ON affiliates(referral_code);
+
+        CREATE TABLE IF NOT EXISTS referrals (
+            id TEXT PRIMARY KEY,
+            affiliate_id TEXT NOT NULL REFERENCES affiliates(id) ON DELETE CASCADE,
+            customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL,
+            commission_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_referrals_affiliate
+        ON referrals(affiliate_id);
+
+        CREATE TABLE IF NOT EXISTS fleet_benchmarks (
+            id TEXT PRIMARY KEY,
+            industry TEXT NOT NULL DEFAULT '',
+            metric_name TEXT NOT NULL DEFAULT '',
+            value REAL NOT NULL DEFAULT 0,
+            sample_size INTEGER NOT NULL DEFAULT 0,
+            computed_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fleet_benchmarks_industry
+        ON fleet_benchmarks(industry, computed_at);
+
+        CREATE TABLE IF NOT EXISTS tenant_insights (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            insight_type TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tenant_insights_tenant
+        ON tenant_insights(tenant_id, created_at);
+        """
+    )
+    migrate_db(connection)
+    from datetime import datetime
+
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_version (id, version, applied_at) VALUES (1, 1, ?)",
+        (datetime.now().isoformat(timespec="seconds"),),
+    )
+    connection.commit()

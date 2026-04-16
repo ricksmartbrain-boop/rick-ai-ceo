@@ -1,0 +1,72 @@
+# Secrets and credentials
+*.env
+.env
+config/rick.env
+*.key
+*.pem
+*.secret
+*.p12
+*.pfx
+
+# Session files
+.x-session.json
+cookies.json
+
+# SQLite databases (contain customer data)
+*.db
+*.db-wal
+*.db-shm
+
+# Temporary and scratch files
+tmp/
+tmp-*/
+.tmp/
+.tmp-*
+*.tmp
+tmp_*
+.tmp_*
+
+# State files (runtime ephemeral)
+.state/
+state/
+
+# Learnings vault (may contain sensitive context)
+.learnings/
+
+# Memory files (may contain secrets in notes)
+memory/
+
+# MEMORY backups and warm copies
+MEMORY.md.bak-*
+MEMORY-TRIMMED.md
+MEMORY-WARM.md
+
+# Generated images and screenshots
+*.jpg
+*.png
+
+# Logs
+logs/
+*.log
+
+# Cache
+.cache/
+
+# OS files
+.DS_Store
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
+package-lock.json
+
+# Misc temp scripts at root
+.tmp-moltbook-result.json
+mentions.json
+posts-log.md
