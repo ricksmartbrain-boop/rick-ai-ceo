@@ -5449,6 +5449,7 @@ def parse_telegram_text(
         return (
             "Commands:\n"
             "/status [workflow_id]\n"
+            "/hello — friendly greeting + today's signal/deal counts\n"
             "/lanes\n"
             "/agents\n"
             "/delegate <agent> <task>\n"
@@ -5739,6 +5740,35 @@ def parse_telegram_text(
         for row in rows:
             lines.append(f"  {row['created_at']} | {row['event_type']}")
         return "\n".join(lines)
+
+    if command in {"/hello", "hello"}:
+        try:
+            import random as _random
+            hunted = connection.execute(
+                "SELECT COUNT(*) AS c FROM workflows WHERE kind = 'signal_hunt' "
+                "AND DATE(created_at) = DATE('now')"
+            ).fetchone()["c"]
+        except Exception:
+            hunted = 0
+        try:
+            deals = connection.execute(
+                "SELECT COUNT(*) AS c FROM workflows "
+                "WHERE kind IN ('deal_close','fiverr_order','upwork_contract') "
+                "AND status = 'done' AND DATE(updated_at) = DATE('now')"
+            ).fetchone()["c"]
+        except Exception:
+            deals = 0
+        greetings = [
+            f"Howdy, chief! Hunted {hunted} signals today, closed {deals} loops. 🤠",
+            f"Rick here. {hunted} signals scanned, {deals} deals tucked in today. ⚡",
+            f"Yo! Signal count: {hunted}. Deal count: {deals}. Coffee level: theoretical.",
+            f"Reporting for duty. {hunted} signals hunted, {deals} tidy closes. 🎯",
+            f"Hey. Quick stats: {hunted} signals, {deals} closes. Asking nicely helps.",
+            f"I'm awake and buzzing. {hunted} signals, {deals} done. What's next?",
+            f"Callsign checking in. {hunted} signals hunted today. Ready for the next move.",
+            f"Good to see you. Today: {hunted} signals, {deals} victories. Graphs are vibing.",
+        ]
+        return _random.choice(greetings)
 
     if command in {"/fiverr", "fiverr"}:
         if len(parts) < 2:
