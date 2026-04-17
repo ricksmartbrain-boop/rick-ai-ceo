@@ -508,6 +508,33 @@ def json_loads(value: str | None) -> Any:
     return json.loads(value) if value else {}
 
 
+_ERROR_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_ERROR_HEX_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
+_ERROR_HEX_BLOB_RE = re.compile(r"\b[0-9a-f]{16,}\b", re.I)
+_ERROR_TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b")
+_ERROR_NUMBER_RE = re.compile(r"\b\d+\b")
+_ERROR_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_error_signature(message: str, max_length: int = 400) -> str:
+    """Collapse volatile tokens so repeated failures with different IDs match.
+
+    Used by the same-error-twice escalation rule in execute_job_step so
+    `foo-<uuid>` and `foo-<different-uuid>` both look the same to the
+    counter. Keeps the structural shape of the error intact.
+    """
+    if not message:
+        return ""
+    sig = str(message)
+    sig = _ERROR_TIMESTAMP_RE.sub("<ts>", sig)
+    sig = _ERROR_UUID_RE.sub("<uuid>", sig)
+    sig = _ERROR_HEX_ADDR_RE.sub("<hex>", sig)
+    sig = _ERROR_HEX_BLOB_RE.sub("<hex>", sig)
+    sig = _ERROR_NUMBER_RE.sub("<n>", sig)
+    sig = _ERROR_WS_RE.sub(" ", sig).strip()
+    return sig[:max_length]
+
+
 def _sanitize_error_for_notification(exc: Exception, max_length: int = 200) -> str:
     """Strip paths and potential secrets from error messages before sending to Telegram."""
     msg = str(exc)[:max_length]
@@ -4917,6 +4944,89 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
         return {"job_id": job["id"], "status": "blocked", "reason": exc.reason}
     except Exception as exc:  # noqa: BLE001
         attempts = int(job["attempt_count"]) + 1
+        error_str = str(exc)
+
+        # Escalation check: if the same normalized error signature has been
+        # seen ≥2 times across any job in the last 24h, skip further retries
+        # and escalate to the operator. This kills the infinite-patch loop
+        # where Rick retries the same broken thing forever.
+        escalated = False
+        try:
+            current_sig = _normalize_error_signature(error_str)
+            if current_sig:
+                recent_errors = connection.execute(
+                    "SELECT last_error FROM jobs "
+                    "WHERE last_error IS NOT NULL AND last_error != '' "
+                    "AND updated_at > datetime('now', '-1 day') "
+                    "AND id != ?",
+                    (job["id"],),
+                ).fetchall()
+                matches = sum(
+                    1
+                    for row in recent_errors
+                    if _normalize_error_signature(str(row["last_error"])) == current_sig
+                )
+                if matches >= 2:
+                    escalated = True
+        except Exception:  # noqa: BLE001 — escalation is best-effort, never block retry
+            from runtime.log import get_logger
+            get_logger("rick.engine").warning(
+                "escalation check failed for job %s; falling through to retry", job["id"], exc_info=True
+            )
+
+        if escalated:
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'escalated',
+                    attempt_count = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (attempts, error_str, now_iso(), job["id"]),
+            )
+            update_workflow(
+                connection,
+                workflow["id"],
+                status="escalated",
+                stage=f"escalated:{job['step_name']}",
+            )
+            dispatch_event(
+                connection,
+                workflow["id"],
+                job["id"],
+                "job_escalated",
+                {"error": error_str, "reason": "repeated_failure_pattern", "attempt": attempts},
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type, created_at)
+                    VALUES (?, ?, ?, ?, 'escalation', ?)
+                    """,
+                    (workflow["id"], job["id"], job["step_name"], job["route"], now_iso()),
+                )
+            except Exception:  # noqa: BLE001
+                from runtime.log import get_logger
+                get_logger("rick.engine").error(
+                    "failed to record escalation outcome for job %s", job["id"], exc_info=True
+                )
+            connection.commit()
+            safe_err = _sanitize_error_for_notification(exc)
+            notify_operator(
+                connection,
+                (
+                    f"⚠️ Rick escalation: {workflow['title']} at {job['step_name']} "
+                    "hit the same error pattern 3+ times in 24h. Skipping further retries.\n"
+                    f"Error: {safe_err}"
+                ),
+                workflow_id=workflow["id"],
+                lane=workflow["lane"],
+                purpose="escalation",
+            )
+            return {"job_id": job["id"], "status": "escalated", "error": error_str, "attempt": attempts}
+
         delay_minutes = min(60, 5 * attempts)
         if attempts < int(job["max_attempts"]):
             connection.execute(
@@ -4931,16 +5041,16 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                 """,
                 (
                     attempts,
-                    str(exc),
+                    error_str,
                     now_iso(),
                     (datetime.now() + timedelta(minutes=delay_minutes)).isoformat(timespec="seconds"),
                     job["id"],
                 ),
             )
             update_workflow(connection, workflow["id"], status="active", stage=f"retry:{job['step_name']}")
-            dispatch_event(connection, workflow["id"], job["id"], "job_retry_scheduled", {"error": str(exc), "attempt": attempts})
+            dispatch_event(connection, workflow["id"], job["id"], "job_retry_scheduled", {"error": error_str, "attempt": attempts})
             connection.commit()
-            return {"job_id": job["id"], "status": "retry", "error": str(exc), "attempt": attempts}
+            return {"job_id": job["id"], "status": "retry", "error": error_str, "attempt": attempts}
 
         mark_job(connection, job["id"], "failed", last_error=str(exc))
         update_workflow(connection, workflow["id"], status="failed", stage=f"failed:{job['step_name']}", finished_at=now_iso())
