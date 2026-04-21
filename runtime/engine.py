@@ -1376,7 +1376,7 @@ def notify_operator(
     for attempt in range(1, 4):
         try:
             result = subprocess.run(
-                [resolved, "system", "event", "--text", "--", text, "--mode", "now"],
+                [resolved, "system", "event", "--text", text, "--mode", "now"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1455,7 +1455,7 @@ def lane_snapshot(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         elif status == "blocked":
             snapshot[lane]["blocked_jobs"] = row["count"]
 
-    active_workflow_statuses = {"queued", "active", "blocked", "launch-ready", "publishing"}
+    active_workflow_statuses = {"queued", "active", "running", "blocked", "launch-ready", "publishing"}
     for row in workflow_rows:
         if row["status"] not in active_workflow_statuses:
             continue
@@ -1667,7 +1667,29 @@ def queue_initiative_workflow(
     project: str = "rick-v6",
     priority: int = 40,
 ) -> str:
-    """Create an initiative workflow with plan -> execute steps."""
+    """Create an initiative workflow with plan -> execute steps.
+
+    Feature-gated by RICK_INITIATIVE_DISABLED env var. The 2026-04-21 behavior
+    audit flagged the initiative family as the #1 busywork sink: 1,446 runs
+    in the previous 7 days, 99.9% "done", zero customer artifacts. The loop
+    recursively spawns "Unblock: X" workflows that plan-then-execute into
+    more Unblocks, consuming 95% of Rick's heartbeat cycles.
+
+    When gated off, callers get back an empty string and no workflow is
+    created. In-flight initiatives finish naturally; nothing new spawns.
+    Rollback: `unset RICK_INITIATIVE_DISABLED` in rick.env and restart daemon.
+    """
+    if os.getenv("RICK_INITIATIVE_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            from runtime.log import get_logger
+            get_logger("rick.engine").info(
+                "queue_initiative_workflow gated off (RICK_INITIATIVE_DISABLED); skipping: %s",
+                objective[:120],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     slug = slugify(objective)
     title = f"Initiative: {objective[:80]}"
     context = {
@@ -2982,6 +3004,7 @@ def handle_delivery_email(connection: sqlite3.Connection, workflow: sqlite3.Row,
         # Subscription or access-based product — no download link, skip gracefully
         return StepOutcome(
             summary="No delivery URL — subscription or access-based product. Delivery email skipped.",
+            artifacts=[],
             workflow_stage="delivery-email-skipped",
         )
     if not is_real_public_url(delivery_url):
@@ -3049,6 +3072,13 @@ def handle_sequence_enroll(connection: sqlite3.Connection, workflow: sqlite3.Row
     delivery_url = str(context.get("delivery_url", "")).strip()
     if not email:
         raise DependencyBlocked("customer", "customer email missing")
+    if not delivery_url:
+        return StepOutcome(
+            summary="No delivery URL, access-based product. Post-purchase sequence skipped.",
+            artifacts=[],
+            workflow_status="fulfilled",
+            workflow_stage="fulfilled",
+        )
     if not is_real_public_url(delivery_url):
         raise DependencyBlocked("delivery", f"delivery_url is not a real public URL: {delivery_url or 'missing'}")
 
@@ -4800,7 +4830,7 @@ def next_runnable_job(connection: sqlite3.Connection) -> sqlite3.Row | None:
         WHERE jobs.status = 'queued'
           AND jobs.run_after <= ?
           AND jobs.lane = ?
-          AND workflows.status IN ('queued', 'active', 'launch-ready', 'publishing')
+          AND workflows.status IN ('queued', 'active', 'running', 'launch-ready', 'publishing')
         ORDER BY workflows.priority ASC, jobs.step_index ASC, jobs.created_at ASC
         LIMIT 1
     """
@@ -4819,7 +4849,7 @@ def next_runnable_job(connection: sqlite3.Connection) -> sqlite3.Row | None:
         JOIN workflows ON workflows.id = jobs.workflow_id
         WHERE jobs.status = 'queued'
           AND jobs.run_after <= ?
-          AND workflows.status IN ('queued', 'active', 'launch-ready', 'publishing')
+          AND workflows.status IN ('queued', 'active', 'running', 'launch-ready', 'publishing')
         ORDER BY workflows.priority ASC, jobs.step_index ASC, jobs.created_at ASC
         LIMIT 1
         """,

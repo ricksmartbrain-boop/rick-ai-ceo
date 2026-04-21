@@ -94,6 +94,9 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("referrals", "affiliate_id TEXT NOT NULL"),
         ("fleet_benchmarks", "industry TEXT NOT NULL DEFAULT ''"),
         ("tenant_insights", "tenant_id TEXT NOT NULL"),
+        ("subagent_heartbeat", "run_id TEXT PRIMARY KEY"),
+        ("skill_variants", "id TEXT PRIMARY KEY"),
+        ("effective_patterns", "id TEXT PRIMARY KEY"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -495,6 +498,97 @@ def init_db(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_tenant_insights_tenant
         ON tenant_insights(tenant_id, created_at);
+
+        -- Subagent heartbeat — tracks every delegation from dispatch through
+        -- merge. Before this table, `status='dispatched'` was terminal in
+        -- subagents.py and nothing ever advanced it. The 2026-04-21 audit
+        -- found 136 of 136 subagent runs in 30 days ghosted. Schema lets
+        -- the reaper (in engine.py heartbeat) re-queue stuck dispatches and
+        -- the merger fold subagent outputs back into parent workflow context.
+        CREATE TABLE IF NOT EXISTS subagent_heartbeat (
+            run_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            parent_workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
+            parent_job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+            parent_fanout_id TEXT,
+            status TEXT NOT NULL,
+            pid INTEGER,
+            output_path TEXT NOT NULL DEFAULT '',
+            task TEXT NOT NULL DEFAULT '',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            output_json TEXT,
+            error TEXT NOT NULL DEFAULT '',
+            cost_estimate_usd REAL NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            cost_cap_usd REAL NOT NULL DEFAULT 5.0,
+            usage_tokens_in INTEGER NOT NULL DEFAULT 0,
+            usage_tokens_out INTEGER NOT NULL DEFAULT 0,
+            usage_tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            usage_tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL DEFAULT '',
+            thinking_level TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL,
+            last_beat_at TEXT NOT NULL,
+            lease_until TEXT NOT NULL,
+            finished_at TEXT,
+            merged_at TEXT,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            ghosted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_subagent_hb_status_lease
+            ON subagent_heartbeat(status, lease_until);
+        CREATE INDEX IF NOT EXISTS idx_subagent_hb_parent
+            ON subagent_heartbeat(parent_workflow_id, status);
+        CREATE INDEX IF NOT EXISTS idx_subagent_hb_fanout
+            ON subagent_heartbeat(parent_fanout_id, status);
+        CREATE INDEX IF NOT EXISTS idx_subagent_hb_kind_started
+            ON subagent_heartbeat(kind, started_at);
+
+        -- Skill variants — the A/B test ledger for every Rick skill/step.
+        -- Thompson sampling picker in runtime/variants.py uses n_runs + wins
+        -- + losses to roll a variant per invocation. Retired losers get
+        -- status='retired' so picker skips them; new mutations (from
+        -- prompt-evolution) land as status='active' with parent_variant_id
+        -- set for lineage tracking.
+        CREATE TABLE IF NOT EXISTS skill_variants (
+            id TEXT PRIMARY KEY,
+            skill_name TEXT NOT NULL,
+            variant_id TEXT NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            prompt_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            parent_variant_id TEXT,
+            n_runs INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            sum_quality REAL NOT NULL DEFAULT 0,
+            sum_cost REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            retired_at TEXT,
+            UNIQUE(skill_name, variant_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_variants_skill_status
+            ON skill_variants(skill_name, status);
+
+        -- Effective patterns — cross-skill knowledge transfer store.
+        -- When one skill discovers a winning copy pattern (e.g. subject-line
+        -- CTA), pattern-miner extracts it here and variants.py injects the
+        -- top-3 matching patterns as few-shot examples in future mutations
+        -- across any skill listed in applicable_skills. This is how Rick's
+        -- learning compounds across domains instead of staying siloed.
+        CREATE TABLE IF NOT EXISTS effective_patterns (
+            id TEXT PRIMARY KEY,
+            pattern_kind TEXT NOT NULL,
+            snippet TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            applicable_skills TEXT NOT NULL DEFAULT '[]',
+            sum_wins INTEGER NOT NULL DEFAULT 0,
+            sum_runs INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_effective_patterns_kind
+            ON effective_patterns(pattern_kind, sum_wins DESC);
         """
     )
     migrate_db(connection)

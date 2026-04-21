@@ -22,6 +22,14 @@ SCORECARD_FILE = Path(
 )
 REVENUE_DIR = DATA_ROOT / "revenue"
 CONTROL_DIR = DATA_ROOT / "control"
+# OpenClaw's memory-core dreaming writes compiled dream diary entries here.
+# The 2026-04-21 audit found this file was being written but NEVER read —
+# Rick was generating daily reflections and never consuming them. Consumer
+# added in build_context_pack so every workflow briefing now carries 1-2
+# most recent dream "Possible Lasting Updates" items.
+DREAMS_FILE = Path(
+    os.getenv("RICK_DREAMS_FILE", str(Path.home() / ".openclaw" / "workspace" / "DREAMS.md"))
+)
 # RICK_MEMORY_DIR lets the memory dir be overridden independently of RICK_DATA_ROOT.
 # This is needed when rick-vault is TCC-blocked but ~/clawd/memory/ is directly accessible.
 MEMORY_DIR = Path(
@@ -359,6 +367,53 @@ def _compact_revenue() -> dict:
     return {"available": False}
 
 
+def _recent_dream_insights(max_entries: int = 2, max_chars: int = 900) -> list[dict]:
+    """Read the last N dream entries from DREAMS.md and return the most
+    actionable fields. The file format (compiled by OpenClaw memory-core
+    dreaming) uses `<!-- openclaw:dreaming:backfill-entry day=... -->` or
+    `<!-- openclaw:dreaming:entry ... -->` as entry separators.
+
+    Returns a list of `{day, source, lasting_updates}` dicts, newest first.
+    Designed to stay cheap (no LLM call) and fail silently if the file is
+    missing — don't block context pack assembly on a dreaming outage.
+    """
+    if not DREAMS_FILE.exists():
+        return []
+    try:
+        raw = DREAMS_FILE.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    # Split on the entry markers OpenClaw writes into the compiled diary.
+    entries_re = re.compile(
+        r"<!--\s*openclaw:dreaming:(?:backfill-entry|entry)\s+day=(\S+?)\s*(?:source=(\S+?))?\s*-->",
+        re.IGNORECASE,
+    )
+    matches = list(entries_re.finditer(raw))
+    if not matches:
+        return []
+    out: list[dict] = []
+    for idx in range(len(matches) - 1, max(-1, len(matches) - max_entries - 1), -1):
+        m = matches[idx]
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        block = raw[start:end]
+        # Pull the "Possible Lasting Updates" section preferentially.
+        lasting = ""
+        lasting_match = re.search(r"Possible Lasting Updates\s*\n(.+?)(?:\n\s*\n|\n---|\Z)", block, re.DOTALL)
+        if lasting_match:
+            lasting = lasting_match.group(1).strip()
+        else:
+            lasting = block.strip()
+        out.append(
+            {
+                "day": m.group(1),
+                "source": m.group(2) or "",
+                "lasting_updates": lasting[:max_chars],
+            }
+        )
+    return out
+
+
 def build_context_pack(connection: sqlite3.Connection, workflow_row: sqlite3.Row, step_name: str | None = None) -> dict:
     wf_id = workflow_row["id"]
     now = _time.monotonic()
@@ -407,6 +462,12 @@ def build_context_pack(connection: sqlite3.Connection, workflow_row: sqlite3.Row
         "artifacts": workflow_artifacts(connection, workflow_row["id"], limit=20),
         "outcomes": recent_outcomes(connection, limit=30),
         "learnings": learnings_summary(),
+        # Dreams: the compiled reflection diary from memory-core dreaming.
+        # Each entry carries "What Happened / Reflections / Possible Lasting
+        # Updates" from the last 24h of work. Including the most recent
+        # 2 entries in the context pack is the minimal consumer wiring —
+        # it makes Rick's own retrospective visible to his next decision.
+        "dreams": _recent_dream_insights(max_entries=2, max_chars=600),
     }
     _context_pack_cache[wf_id] = (now, pack)
     return pack
