@@ -1,0 +1,69 @@
+{
+  "reactions": {
+    "lead_qualified": [
+      {
+        "action": "queue_workflow",
+        "workflow": "deal_close",
+        "description": "Qualified lead enters deal-closer pipeline"
+      }
+    ],
+    "fiverr_order_delivered": [
+      {
+        "action": "queue_workflow",
+        "workflow": "proof_publish",
+        "description": "Completed delivery triggers case study generation"
+      }
+    ],
+    "managed_subscription_started": [
+      {
+        "action": "queue_workflow",
+        "workflow": "managed_customer_onboarding",
+        "description": "New $499/mo customer triggers tenant provisioning"
+      }
+    ],
+    "churn_risk_detected": [
+      {
+        "action": "queue_workflow",
+        "workflow": "tenant_retention",
+        "description": "Churn signal triggers retention intervention"
+      }
+    ],
+    "customer_milestone": [
+      {
+        "action": "queue_workflow",
+        "workflow": "testimonial_collect",
+        "description": "Customer milestone triggers testimonial request"
+      }
+    ],
+    "hot_lead_detected": [
+      {
+        "action": "delegate",
+        "agent": "remy",
+        "task_template": "Deep research on prospect: {email}",
+        "description": "High-score prospect routed to Remy for deep research"
+      }
+    ],
+    "proof_artifact_ready": [
+      {
+        "action": "delegate",
+        "agent": "teagan",
+        "task_template": "Format and distribute proof content: {proof_type}",
+        "description": "Proof content ready for Teagan to format and distribute"
+      }
+    ],
+    "checkout_abandoned": [
+      {
+        "action": "queue_workflow",
+        "workflow": "voice_outreach",
+        "description": "Abandoned checkout triggers voice follow-up"
+      }
+    ],
+    "subscription_cancelled": [
+      {
+        "action": "queue_workflow",
+        "workflow": "tenant_retention",
+        "description": "Cancellation triggers win-back sequence"
+      }
+    ]
+  }
+}
