@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.outbound_dispatcher import AuthFailure, PermanentError, TransientError
+from runtime.utm import stamp_urls_in_text
 
 SCRIPT = Path.home() / "clawd" / "scripts" / "moltbook-post.py"
 LOG_FILE = Path.home() / "rick-vault" / "operations" / "formatter-moltbook.jsonl"
@@ -34,6 +35,7 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     submolt = (payload.get("submolt") or payload.get("subreddit") or "").strip()
     title = (payload.get("title") or "").strip()
     content = (payload.get("content") or payload.get("body") or "").strip()
+    content = stamp_urls_in_text(content, "moltbook", payload.get("lane"), payload.get("msg_id"))
     if not submolt or not content:
         raise PermanentError("submolt + content required")
     if not SCRIPT.exists():

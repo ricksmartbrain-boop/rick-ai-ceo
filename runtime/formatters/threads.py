@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.outbound_dispatcher import AuthFailure, PermanentError, TransientError
+from runtime.utm import stamp_urls_in_text
 
 SCRIPTS_DIR = Path.home() / "clawd" / "scripts"
 CDP_SCRIPT = SCRIPTS_DIR / "post-threads-cdp.py"
@@ -28,6 +29,7 @@ def _log(event: dict) -> None:
 
 def send(payload: dict[str, Any]) -> dict[str, Any]:
     caption = (payload.get("caption") or payload.get("body") or payload.get("content") or "").strip()
+    caption = stamp_urls_in_text(caption, "threads", payload.get("lane"), payload.get("msg_id"))
     video_path = (payload.get("video_path") or "").strip()
     if not caption:
         raise PermanentError("caption required")

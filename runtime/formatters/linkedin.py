@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.outbound_dispatcher import AuthFailure, PermanentError, TransientError
+from runtime.utm import stamp_urls_in_text
 
 SCRIPTS_DIR = Path.home() / "clawd" / "scripts"
 POST_SCRIPT = SCRIPTS_DIR / "post_linkedin_publish.js"
@@ -35,6 +36,7 @@ def _log(event: dict) -> None:
 def send(payload: dict[str, Any]) -> dict[str, Any]:
     kind = (payload.get("kind") or "post").lower()
     body = (payload.get("body") or payload.get("content") or "").strip()
+    body = stamp_urls_in_text(body, "linkedin", payload.get("lane"), payload.get("msg_id"))
     target = (payload.get("target_url") or payload.get("profile_handle") or "").strip()
 
     if not body:

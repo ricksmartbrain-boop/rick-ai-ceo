@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.outbound_dispatcher import AuthFailure, PermanentError, TransientError
+from runtime.utm import stamp_urls_in_text
 
 SCRIPTS_DIR = Path.home() / "clawd" / "scripts"
 POST_SCRIPT = SCRIPTS_DIR / "post-reddit-api.py"
@@ -33,6 +34,7 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     subreddit = (payload.get("subreddit") or "").strip()
     title = (payload.get("title") or "").strip()
     body = (payload.get("body") or payload.get("content") or "").strip()
+    body = stamp_urls_in_text(body, "reddit", payload.get("lane"), payload.get("msg_id"))
     target_url = (payload.get("target_url") or "").strip()
 
     if kind == "post":

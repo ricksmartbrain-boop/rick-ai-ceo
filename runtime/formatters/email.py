@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.outbound_dispatcher import PermanentError, TransientError
+from runtime.utm import stamp_urls_in_text
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox" / "ad-hoc"
@@ -27,6 +28,8 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     to = (payload.get("to") or "").strip()
     subject = (payload.get("subject") or "").strip()
     body_md = (payload.get("body_md") or payload.get("body") or "").strip()
+    # Stamp meetrick.ai URLs with UTMs for attribution (no-op on non-meetrick URLs).
+    body_md = stamp_urls_in_text(body_md, "email", payload.get("lane"), payload.get("msg_id"))
     from_addr = payload.get("from") or os.getenv("MEETRICK_FROM_EMAIL") or "Rick <hello@meetrick.ai>"
     if not to or "@" not in to:
         raise PermanentError(f"invalid recipient: {to!r}")
