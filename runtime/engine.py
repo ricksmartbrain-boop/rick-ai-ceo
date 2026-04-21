@@ -4864,6 +4864,15 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
 
     workflow = get_workflow(connection, job["workflow_id"])
     mark_job(connection, job["id"], "running")
+
+    # Begin per-job cost tracking. Every generate_text call inside the step
+    # handler accumulates cost + model + tokens under this job_id so the
+    # outcomes INSERTs below can record real spend instead of the 0.0
+    # default that plagued the last 7 days (3,232 outcomes, $0 logged).
+    from runtime import llm as _llm_track
+    _llm_track.begin_job_tracking(job["id"])
+    _job_started_at = datetime.now()
+
     workflow_status = "publishing" if job["step_name"].startswith("publish_") else "active"
     update_workflow(
         connection,
@@ -5030,12 +5039,20 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                 {"error": error_str, "reason": "repeated_failure_pattern", "attempt": attempts},
             )
             try:
+                _esc_cost = _llm_track.get_and_clear_job_cost(job["id"])
+                _esc_duration = (datetime.now() - _job_started_at).total_seconds()
                 connection.execute(
                     """
-                    INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type, created_at)
-                    VALUES (?, ?, ?, ?, 'escalation', ?)
+                    INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
+                                          created_at, cost_usd, model_used, duration_seconds)
+                    VALUES (?, ?, ?, ?, 'escalation', ?, ?, ?, ?)
                     """,
-                    (workflow["id"], job["id"], job["step_name"], job["route"], now_iso()),
+                    (
+                        workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
+                        float(_esc_cost.get("cost_usd") or 0.0),
+                        str(_esc_cost.get("model") or ""),
+                        float(_esc_duration),
+                    ),
                 )
             except Exception:  # noqa: BLE001
                 from runtime.log import get_logger
@@ -5086,14 +5103,24 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
         update_workflow(connection, workflow["id"], status="failed", stage=f"failed:{job['step_name']}", finished_at=now_iso())
         dispatch_event(connection, workflow["id"], job["id"], "job_failed", {"error": str(exc)})
         connection.commit()
-        # Record failed outcome
+        # Record failed outcome — now with cost/model/duration so the learning
+        # loop can see which routes + models are cheapest to fail (so failing
+        # cheap is better than failing on opus-4-7).
         try:
+            _fail_cost = _llm_track.get_and_clear_job_cost(job["id"])
+            _fail_duration = (datetime.now() - _job_started_at).total_seconds()
             connection.execute(
                 """
-                INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type, created_at)
-                VALUES (?, ?, ?, ?, 'failure', ?)
+                INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
+                                      created_at, cost_usd, model_used, duration_seconds)
+                VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?)
                 """,
-                (workflow["id"], job["id"], job["step_name"], job["route"], now_iso()),
+                (
+                    workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
+                    float(_fail_cost.get("cost_usd") or 0.0),
+                    str(_fail_cost.get("model") or ""),
+                    float(_fail_duration),
+                ),
             )
         except Exception as exc:
             from runtime.log import get_logger
@@ -5135,14 +5162,24 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
 
     dispatch_event(connection, workflow["id"], job["id"], "job_done", {"summary": outcome.summary, "step_name": job["step_name"]})
 
-    # Record outcome for learning loop
+    # Record outcome for learning loop — now with real cost/model/duration.
+    # cost_usd populated only when an LLM was actually called during the step;
+    # subagent-delegated steps may show 0 (the cost lives in subagent_heartbeat).
     try:
+        _succ_cost = _llm_track.get_and_clear_job_cost(job["id"])
+        _succ_duration = (datetime.now() - _job_started_at).total_seconds()
         connection.execute(
             """
-            INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type, created_at)
-            VALUES (?, ?, ?, ?, 'success', ?)
+            INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
+                                  created_at, cost_usd, model_used, duration_seconds)
+            VALUES (?, ?, ?, ?, 'success', ?, ?, ?, ?)
             """,
-            (workflow["id"], job["id"], job["step_name"], job["route"], now_iso()),
+            (
+                workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
+                float(_succ_cost.get("cost_usd") or 0.0),
+                str(_succ_cost.get("model") or ""),
+                float(_succ_duration),
+            ),
         )
     except Exception as exc:
         from runtime.log import get_logger

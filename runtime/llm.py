@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import shutil
@@ -16,6 +17,60 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+# ── Per-job cost tracking ────────────────────────────────────────────────────
+# The 2026-04-21 audit found outcomes.cost_usd was populated 0 of 3232 times in
+# the last 7 days — complete spend blindness. Root cause: log_generation writes
+# cost to ~/rick-vault/operations/llm-usage.jsonl but never back to the
+# outcomes row the engine writes per job. This fix threads the cost via a
+# context-local accumulator so engine.py can read it at outcome INSERT time
+# without every handler being refactored. Zero cost when unused (default path
+# checks a null contextvar).
+_CURRENT_JOB: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "rick_llm_current_job", default=None
+)
+_JOB_COST: dict[str, dict[str, Any]] = {}
+_JOB_COST_LOCK = threading.Lock()
+
+
+def begin_job_tracking(job_id: str) -> None:
+    """Start accumulating LLM cost for this job_id. Called by engine.py::
+    process_one_job right after mark_job('running'). All subsequent
+    generate_text / strategy_panel calls within the same context record their
+    cost + model + usage into this job's accumulator.
+    """
+    _CURRENT_JOB.set(job_id)
+    with _JOB_COST_LOCK:
+        _JOB_COST[job_id] = {
+            "cost_usd": 0.0,
+            "model": "",
+            "provider": "",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "calls": 0,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def get_and_clear_job_cost(job_id: str) -> dict[str, Any]:
+    """Pop the accumulated cost for this job. Called by engine.py at each
+    outcome INSERT site so the numbers land in the outcomes row. Returns {}
+    if tracking was never started (defensive: subagent-only jobs, stub paths).
+    """
+    with _JOB_COST_LOCK:
+        return _JOB_COST.pop(job_id, {})
+
+
+def cleanup_job_tracking(job_id: str) -> None:
+    """Idempotent safety-net cleanup for paths that bypass the INSERT sites
+    (e.g. approval-required, dependency-blocked). Called in engine.py::
+    process_one_job's finally block so a never-popped row can't leak memory
+    across heartbeat cycles.
+    """
+    _CURRENT_JOB.set(None)
+    with _JOB_COST_LOCK:
+        _JOB_COST.pop(job_id, None)
 
 
 ROUTES = {
@@ -594,6 +649,21 @@ def log_generation(
             today = datetime.now().strftime("%Y-%m-%d")
             if _daily_spend_cache["date"] == today:
                 _daily_spend_cache["total"] += usd_cost
+
+    # Also accumulate into the current job's cost tracker if engine started one.
+    # Enables outcomes.cost_usd / model_used / duration_seconds to be populated.
+    if mode != "error":
+        active_job = _CURRENT_JOB.get()
+        if active_job:
+            with _JOB_COST_LOCK:
+                acc = _JOB_COST.get(active_job)
+                if acc is not None:
+                    acc["cost_usd"] += usd_cost
+                    acc["model"] = model
+                    acc["provider"] = provider
+                    acc["tokens_in"] += int(usage_stats.input_tokens or 0)
+                    acc["tokens_out"] += int(usage_stats.output_tokens or 0)
+                    acc["calls"] += 1
 
 
 def finalize(
