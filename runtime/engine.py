@@ -990,7 +990,10 @@ def dispatch_event(
                     agents = load_subagents()
                     spec = agents.get(agent_key)
                     if spec:
-                        dispatch_openclaw(spec, formatted, payload)
+                        dispatch_openclaw(
+                            spec, formatted, payload,
+                            parent_workflow_id=workflow_id,
+                        )
             except Exception as exc:
                 from runtime.log import get_logger
                 get_logger("rick.engine").error("Delegate reaction failed for agent=%s event=%s: %s", agent_key, event_type, exc, exc_info=True)
@@ -4895,11 +4898,23 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                     spec = agents.get(agent_key)
                     if spec:
                         task_text = f"Handle step '{job['step_name']}' for workflow '{workflow['title']}'"
-                        delegation = dispatch_openclaw(spec, task_text, json_loads(job["payload_json"]))
-                        if delegation.status == "dispatched":
+                        delegation = dispatch_openclaw(
+                            spec, task_text, json_loads(job["payload_json"]),
+                            parent_workflow_id=workflow["id"],
+                            parent_job_id=job["id"],
+                        )
+                        # OpenClaw 2026.4.15 runs agents synchronously, so a
+                        # successful run returns status='completed'. The legacy
+                        # fire-and-forget path returned 'dispatched' — accept
+                        # both so subagent work isn't silently discarded and
+                        # the step re-executed inline (which was the old bug).
+                        if delegation.status in ("completed", "dispatched"):
                             mark_job(connection, job["id"], "done")
                             dispatch_event(connection, workflow["id"], job["id"], "job_delegated", {
-                                "agent": agent_key, "run_id": delegation.run_id, "step_name": job["step_name"],
+                                "agent": agent_key,
+                                "run_id": delegation.run_id,
+                                "step_name": job["step_name"],
+                                "subagent_status": delegation.status,
                             })
                             nxt = next_step(workflow["kind"], job["step_name"])
                             if nxt is not None:
@@ -5361,9 +5376,124 @@ def sweep_stale_running_jobs(connection: sqlite3.Connection) -> int:
     return len(stale)
 
 
+def reap_stuck_subagents(connection: sqlite3.Connection, grace_min: int = 20) -> int:
+    """Flip subagent_heartbeat rows that missed their lease to status='ghosted'.
+
+    Runs every heartbeat. Without this the 30-day subagent outage (136/136
+    runs stuck in 'running' after OpenClaw CLI rename) would repeat silently
+    for any future dispatch that exits outside the normal finish path
+    (SIGKILL, OOM, Python crash, etc.).
+    """
+    cutoff = (datetime.now() - timedelta(minutes=grace_min)).strftime("%Y-%m-%dT%H:%M:%S")
+    stuck = connection.execute(
+        """
+        SELECT run_id, parent_workflow_id, parent_job_id, task, kind, pid
+          FROM subagent_heartbeat
+         WHERE status = 'running' AND last_beat_at < ?
+         LIMIT 50
+        """,
+        (cutoff,),
+    ).fetchall()
+    if not stuck:
+        return 0
+    for row in stuck:
+        connection.execute(
+            """
+            UPDATE subagent_heartbeat
+               SET status='ghosted', ghosted=1,
+                   finished_at=?, last_beat_at=?,
+                   error=COALESCE(NULLIF(error,''), ?) || ' [reaped: no beat > ' || ? || 'min]'
+             WHERE run_id=?
+            """,
+            (now_iso(), now_iso(), "ghosted by reaper", grace_min, row["run_id"]),
+        )
+    connection.commit()
+    try:
+        sample = ", ".join(f"{r['kind']}:{r['run_id']}" for r in stuck[:3])
+        notify_operator(
+            connection,
+            f"⚠️ Rick reaped {len(stuck)} stuck subagent run(s) (> {grace_min}min without heartbeat). Sample: {sample}",
+            purpose="ops",
+        )
+    except Exception:
+        pass
+    return len(stuck)
+
+
+def merge_completed_subagents(connection: sqlite3.Connection, limit: int = 50) -> int:
+    """Dispatch follow-up events for completed subagent runs + mark them merged.
+
+    A subagent's output is only useful if Rick reads it. This scans every
+    finished subagent_heartbeat row (completed/failed/ghosted) that hasn't
+    been merged yet and fires a `subagent_result` event against the parent
+    workflow — which routes through config/event-reactions.json just like any
+    other event. Sets merged_at so the same row isn't processed twice.
+    """
+    pending = connection.execute(
+        """
+        SELECT run_id, parent_workflow_id, parent_job_id, kind, status,
+               output_json, cost_usd, finished_at, error
+          FROM subagent_heartbeat
+         WHERE status IN ('completed','failed','ghosted')
+           AND merged_at IS NULL
+         ORDER BY finished_at ASC
+         LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    if not pending:
+        return 0
+    merged_count = 0
+    for row in pending:
+        try:
+            connection.execute(
+                "UPDATE subagent_heartbeat SET merged_at=? WHERE run_id=?",
+                (now_iso(), row["run_id"]),
+            )
+            if row["parent_workflow_id"]:
+                payload = {
+                    "run_id": row["run_id"],
+                    "kind": row["kind"],
+                    "status": row["status"],
+                    "cost_usd": float(row["cost_usd"] or 0.0),
+                    "finished_at": row["finished_at"],
+                    "error": (row["error"] or "")[:500],
+                }
+                try:
+                    parsed = json.loads(row["output_json"] or "{}")
+                    payload["output"] = (parsed.get("output") or "")[:4000]
+                except Exception:
+                    payload["output"] = (row["output_json"] or "")[:4000]
+                dispatch_event(
+                    connection,
+                    row["parent_workflow_id"],
+                    row["parent_job_id"],
+                    "subagent_result",
+                    payload,
+                )
+            merged_count += 1
+        except Exception as exc:
+            from runtime.log import get_logger
+            get_logger("rick.engine").warning(
+                "merge_completed_subagents failed for run_id=%s: %s", row["run_id"], exc
+            )
+    if merged_count:
+        connection.commit()
+    return merged_count
+
+
 def heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     # Sweep stale running jobs first to unblock lanes
     sweep_stale_running_jobs(connection)
+    # Reap ghosted subagent runs + merge completed ones into parent workflows.
+    # Before Wave 2B these never happened — completed agents' output rotted in
+    # SQL with merged_at=NULL, orphans stayed in 'running' forever.
+    try:
+        reap_stuck_subagents(connection)
+        merge_completed_subagents(connection)
+    except Exception as exc:
+        from runtime.log import get_logger
+        get_logger("rick.engine").error("Subagent reap/merge failed: %s", exc)
     open_approvals = connection.execute("SELECT COUNT(*) AS count FROM approvals WHERE status = 'open'").fetchone()["count"]
     queued_jobs = connection.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()["count"]
     blocked_jobs = connection.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'blocked'").fetchone()["count"]

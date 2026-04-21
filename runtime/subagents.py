@@ -12,7 +12,7 @@ import os
 import subprocess
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -213,12 +213,119 @@ def is_delegation_allowed(agent_key: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _open_runtime_db():
+    """Short-lived connection to Rick's runtime DB for heartbeat logging.
+    Returns None on any failure so the subagent dispatch never blocks on DB issues."""
+    try:
+        from runtime.db import connect as _db_connect
+        return _db_connect()
+    except Exception:
+        return None
+
+
+def _heartbeat_start(
+    run_id: str,
+    kind: str,
+    task: str,
+    context: dict[str, Any] | None,
+    model: str,
+    thinking_level: str,
+    cost_cap_usd: float,
+    log_path: str,
+    parent_workflow_id: str | None,
+    parent_job_id: str | None,
+    parent_fanout_id: str | None,
+) -> None:
+    """INSERT a subagent_heartbeat row at dispatch start (status='running')."""
+    conn = _open_runtime_db()
+    if conn is None:
+        return
+    try:
+        now = datetime.now()
+        started = now.isoformat(timespec="seconds")
+        # 15-minute lease — reaper will flip to 'ghosted' if no UPDATE lands by then.
+        lease = (now + timedelta(minutes=15)).isoformat(timespec="seconds")
+        ctx_json = json.dumps(context or {})[:20000]
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO subagent_heartbeat
+              (run_id, kind, parent_workflow_id, parent_job_id, parent_fanout_id,
+               status, pid, output_path, task, context_json,
+               cost_cap_usd, model, thinking_level,
+               started_at, last_beat_at, lease_until, attempt)
+            VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                run_id, kind, parent_workflow_id, parent_job_id, parent_fanout_id,
+                os.getpid(), log_path, task[:2000], ctx_json,
+                float(cost_cap_usd), model, thinking_level,
+                started, started, lease,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _heartbeat_finish(
+    run_id: str,
+    status: str,
+    output: str,
+    error: str,
+    cost_usd: float,
+    tokens_in: int,
+    tokens_out: int,
+    tokens_cache_read: int,
+    tokens_cache_write: int,
+    model: str,
+) -> None:
+    """UPDATE the heartbeat row at completion with real cost + tokens + output."""
+    conn = _open_runtime_db()
+    if conn is None:
+        return
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+        output_json = json.dumps({"output": output[:8000], "error": error[:2000]})
+        conn.execute(
+            """
+            UPDATE subagent_heartbeat
+               SET status=?, finished_at=?, last_beat_at=?,
+                   cost_usd=?, usage_tokens_in=?, usage_tokens_out=?,
+                   usage_tokens_cache_read=?, usage_tokens_cache_write=?,
+                   model=?, output_json=?, error=?
+             WHERE run_id=?
+            """,
+            (
+                status, now, now,
+                float(cost_usd), int(tokens_in), int(tokens_out),
+                int(tokens_cache_read), int(tokens_cache_write),
+                model, output_json, error[:2000], run_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def dispatch_openclaw(
     spec: SubagentSpec,
     task: str,
     context: dict[str, Any] | None = None,
     *,
     workspace_dir: str | None = None,
+    parent_workflow_id: str | None = None,
+    parent_job_id: str | None = None,
+    parent_fanout_id: str | None = None,
 ) -> DelegationResult:
     """Dispatch a task to a sub-agent via OpenClaw subagent spawn."""
     run_id = f"sa_{uuid.uuid4().hex[:12]}"
@@ -273,6 +380,23 @@ def dispatch_openclaw(
         "--timeout", "900",
         "--thinking", thinking_level,
     ]
+
+    # Record a heartbeat row so engine.reap_stuck_subagents can detect ghosts
+    # and engine.merge_completed_subagents can dispatch follow-up events to
+    # the parent workflow. Best-effort; DB failure never blocks the dispatch.
+    _heartbeat_start(
+        run_id=run_id,
+        kind=spec.name.lower(),
+        task=task,
+        context=context,
+        model=spec.model,
+        thinking_level=thinking_level,
+        cost_cap_usd=spec.max_spend_usd,
+        log_path=str(log_file),
+        parent_workflow_id=parent_workflow_id,
+        parent_job_id=parent_job_id,
+        parent_fanout_id=parent_fanout_id,
+    )
 
     output_payload: dict[str, Any] = {}
     try:
@@ -414,10 +538,34 @@ def dispatch_openclaw(
     }
     log_file.write_text(json.dumps(log_payload, indent=2) + "\n", encoding="utf-8")
 
+    # Close the loop: update the heartbeat row with real cost + tokens so
+    # engine.merge_completed_subagents can react. On failure/timeout we still
+    # record 'failed' so the reaper doesn't double-flag this as ghosted later.
+    _heartbeat_finish(
+        run_id=run_id,
+        status=status,
+        output=output,
+        error=error,
+        cost_usd=cost_usd,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        tokens_cache_read=tokens_cache_read,
+        tokens_cache_write=tokens_cache_write,
+        model=winner_model,
+    )
+
     return delegation
 
 
-def delegate(event_type: str, task: str, context: dict[str, Any] | None = None) -> DelegationResult | None:
+def delegate(
+    event_type: str,
+    task: str,
+    context: dict[str, Any] | None = None,
+    *,
+    parent_workflow_id: str | None = None,
+    parent_job_id: str | None = None,
+    parent_fanout_id: str | None = None,
+) -> DelegationResult | None:
     """Top-level delegation: route an event to the right sub-agent and dispatch."""
     agent_key = resolve_agent(event_type)
     if agent_key is None:
@@ -428,7 +576,12 @@ def delegate(event_type: str, task: str, context: dict[str, Any] | None = None) 
     if spec is None:
         return None
 
-    return dispatch_openclaw(spec, task, context)
+    return dispatch_openclaw(
+        spec, task, context,
+        parent_workflow_id=parent_workflow_id,
+        parent_job_id=parent_job_id,
+        parent_fanout_id=parent_fanout_id,
+    )
 
 
 def list_agents() -> list[dict[str, Any]]:
