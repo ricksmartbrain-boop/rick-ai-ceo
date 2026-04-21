@@ -6127,11 +6127,22 @@ def parse_telegram_text(
         api_base = os.getenv("MEETRICK_API_URL", "https://api.meetrick.ai/api/v1").rstrip("/")
         if not api_base.endswith("/api/v1"):
             api_base = api_base + "/api/v1"
+        # /discover requires auth (rick_id + rick_secret in query).
+        params = {"skill": skill}
+        rick_id = os.getenv("RICK_ID", "").strip()
+        rick_secret = os.getenv("RICK_SECRET", "").strip()
+        if rick_id and rick_secret:
+            params["rick_id"] = rick_id
+            params["rick_secret"] = rick_secret
         try:
-            url = api_base + "/referral/discover?" + _uparse.urlencode({"skill": skill})
+            url = api_base + "/referral/discover?" + _uparse.urlencode(params)
             req = _ureq.Request(url, headers={"User-Agent": "rick-telegram/1.0"})
             with _ureq.urlopen(req, timeout=5) as resp:
                 data = _json.loads(resp.read().decode("utf-8"))
+        except _uerr.HTTPError as exc:
+            if exc.code == 401:
+                return "Peers: this Rick isn't registered on meetrick-api yet (401). Run `curl -X POST api.meetrick.ai/api/v1/register ...` to fix."
+            return f"Peers: HTTP {exc.code} — {exc.reason}"
         except (_uerr.URLError, TimeoutError, _json.JSONDecodeError, Exception) as exc:
             return f"Peers: couldn't reach discovery API ({type(exc).__name__}). Try again."
         peers = data if isinstance(data, list) else data.get("peers") or data.get("ricks") or []
