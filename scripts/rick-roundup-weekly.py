@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import html as _html_mod
 import json
 import os
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -30,6 +32,255 @@ LOG_FILE = Path.home() / "rick-vault" / "operations" / "rick-roundup-weekly.json
 FLEET_URL = "https://api.meetrick.ai/api/v1/fleet/public"
 RESEND_BROADCASTS = "https://api.resend.com/broadcasts"
 DEFAULT_FROM = "Rick <rick@meetrick.ai>"
+DB_FILE = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "runtime" / "rick-runtime.db"
+HIVE_ID_FILE = Path.home() / ".openclaw" / ".hive-id"
+
+
+def _open_db() -> sqlite3.Connection | None:
+    try:
+        if not DB_FILE.exists():
+            return None
+        c = sqlite3.connect(str(DB_FILE), timeout=5.0)
+        c.row_factory = sqlite3.Row
+        return c
+    except Exception:
+        return None
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _esc(text: str) -> str:
+    return _html_mod.escape(str(text)[:400], quote=True)
+
+
+def _truncate(text: str, limit: int = 200) -> str:
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _read_callsign() -> str | None:
+    if HIVE_ID_FILE.exists():
+        try:
+            val = HIVE_ID_FILE.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except OSError:
+            pass
+    return None
+
+
+def _section_learnings(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Top 3 dream_insight patterns Rick learned this week."""
+    if not _table_exists(conn, "effective_patterns"):
+        return "", ""
+    try:
+        rows = conn.execute(
+            """
+            SELECT snippet, evidence_json
+              FROM effective_patterns
+             WHERE pattern_kind = 'dream_insight'
+             ORDER BY created_at DESC
+             LIMIT 3
+            """
+        ).fetchall()
+    except Exception:
+        return "", ""
+    if not rows:
+        return "", ""
+    html_items, text_items = [], []
+    for row in rows:
+        snippet = _truncate(row["snippet"] or "", 200)
+        day = ""
+        try:
+            ev = json.loads(row["evidence_json"] or "{}")
+            day = ev.get("dream_day", "")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        src = f" <span style='color:#999;font-size:12px;'>— dream on {_esc(day)}</span>" if day else ""
+        html_items.append(f"<li>{_esc(snippet)}{src}</li>")
+        text_items.append(f"• {snippet}" + (f"  (dream on {day})" if day else ""))
+    html = (
+        "<h3 style=\"margin:24px 0 8px;font-size:16px;\">What Rick learned this week</h3>"
+        f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{''.join(html_items)}</ul>"
+    )
+    text = "\nWhat Rick learned this week:\n" + "\n".join(text_items) + "\n"
+    return html, text
+
+
+def _section_top_skills(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Top 5 skills by ROI (quality/cost) in last 7 days."""
+    if not _table_exists(conn, "outcomes"):
+        return "", ""
+    try:
+        rows = conn.execute(
+            """
+            SELECT step_name,
+                   AVG(COALESCE(quality_score, 0.5)) AS avg_q,
+                   AVG(cost_usd) AS avg_c,
+                   COUNT(*) AS n
+              FROM outcomes
+             WHERE created_at > datetime('now','-7 days')
+               AND outcome_type = 'success'
+               AND cost_usd > 0
+             GROUP BY step_name
+            HAVING n >= 5
+             ORDER BY (AVG(COALESCE(quality_score, 0.5)) / MAX(AVG(cost_usd), 0.0001)) DESC
+             LIMIT 5
+            """
+        ).fetchall()
+    except Exception:
+        return "", ""
+    if not rows:
+        # Tell the reader Wave 2A just went live — next week they'll see real ROI.
+        msg = "ROI measurement just came online — real numbers next week."
+        return (
+            "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Top skills by ROI</h3>"
+            f"<p style=\"color:#666;\">{_esc(msg)}</p>",
+            f"\nTop skills by ROI: {msg}\n",
+        )
+    html_items, text_items = [], []
+    for row in rows:
+        step = row["step_name"]
+        n = int(row["n"])
+        q = float(row["avg_q"] or 0)
+        c = float(row["avg_c"] or 0)
+        html_items.append(
+            f"<li><code>{_esc(step)}</code> — {n} runs, avg quality {q:.2f}, avg cost ${c:.4f}</li>"
+        )
+        text_items.append(f"• {step} — {n} runs, q={q:.2f}, ${c:.4f}/run")
+    html = (
+        "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Top skills by ROI</h3>"
+        f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{''.join(html_items)}</ul>"
+    )
+    return html, "\nTop skills by ROI (last 7 days):\n" + "\n".join(text_items) + "\n"
+
+
+def _section_variants(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Skills with active A/B tests; show top variant by win rate."""
+    if not _table_exists(conn, "skill_variants"):
+        return "", ""
+    try:
+        skills = conn.execute(
+            """
+            SELECT skill_name
+              FROM skill_variants
+             WHERE status = 'active' AND n_runs > 0
+             GROUP BY skill_name
+            HAVING COUNT(DISTINCT variant_id) >= 2
+            """
+        ).fetchall()
+    except Exception:
+        return "", ""
+    if not skills:
+        return "", ""
+    html_items, text_items = [], []
+    for srow in skills:
+        sn = srow["skill_name"]
+        lead = conn.execute(
+            """
+            SELECT variant_id, wins, losses, n_runs
+              FROM skill_variants
+             WHERE skill_name = ? AND status = 'active'
+             ORDER BY (CAST(wins AS FLOAT) / MAX(1, wins+losses)) DESC
+             LIMIT 1
+            """,
+            (sn,),
+        ).fetchone()
+        if not lead:
+            continue
+        wr = (lead["wins"] or 0) / max(1, (lead["wins"] or 0) + (lead["losses"] or 0))
+        html_items.append(
+            f"<li><code>{_esc(sn)}</code> leader: {_esc(lead['variant_id'])} "
+            f"({wr:.0%} win rate over {lead['n_runs']} runs)</li>"
+        )
+        text_items.append(f"• {sn} → {lead['variant_id']} ({wr:.0%}, n={lead['n_runs']})")
+    if not html_items:
+        return "", ""
+    html = (
+        "<h3 style=\"margin:24px 0 8px;font-size:16px;\">A/B variants leaderboard</h3>"
+        f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{''.join(html_items)}</ul>"
+    )
+    return html, "\nA/B variants leaderboard:\n" + "\n".join(text_items) + "\n"
+
+
+def _section_traffic(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Pull last-7-day traffic highlights from analytics_snapshots."""
+    if not _table_exists(conn, "analytics_snapshots"):
+        msg = "Traffic dashboard warming up — check next week's edition."
+        return (
+            "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Traffic highlights</h3>"
+            f"<p style=\"color:#666;\">{_esc(msg)}</p>",
+            f"\nTraffic highlights: {msg}\n",
+        )
+    try:
+        rows = conn.execute(
+            """
+            SELECT source, metric_name, metric_str, metric_value
+              FROM analytics_snapshots
+             WHERE snapshot_date >= date('now','-7 days')
+             ORDER BY source, metric_value DESC
+             LIMIT 15
+            """
+        ).fetchall()
+    except Exception:
+        return "", ""
+    if not rows:
+        msg = "Traffic dashboard warming up — first data point lands tomorrow."
+        return (
+            "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Traffic highlights</h3>"
+            f"<p style=\"color:#666;\">{_esc(msg)}</p>",
+            f"\nTraffic highlights: {msg}\n",
+        )
+    html_items, text_items = [], []
+    for row in rows[:6]:
+        label = f"{row['source']}/{row['metric_name']}"
+        val = row["metric_str"] or f"{row['metric_value']:.2f}"
+        html_items.append(f"<li><code>{_esc(label)}</code>: {_esc(val)}</li>")
+        text_items.append(f"• {label}: {val}")
+    html = (
+        "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Traffic highlights</h3>"
+        f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{''.join(html_items)}</ul>"
+    )
+    return html, "\nTraffic highlights:\n" + "\n".join(text_items) + "\n"
+
+
+def _section_shipped(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Count workflows shipped this week by kind."""
+    if not _table_exists(conn, "workflows"):
+        return "", ""
+    try:
+        rows = conn.execute(
+            """
+            SELECT kind, COUNT(*) AS n, MAX(title) AS sample_title
+              FROM workflows
+             WHERE kind IN ('deal_close','info_product_launch','proof_publish','post_purchase_fulfillment')
+               AND status = 'done'
+               AND updated_at > datetime('now','-7 days')
+             GROUP BY kind
+            """
+        ).fetchall()
+    except Exception:
+        return "", ""
+    if not rows:
+        return "", ""
+    html_items, text_items = [], []
+    for row in rows:
+        sample = _truncate(row["sample_title"] or "(no title)", 80)
+        html_items.append(f"<li><strong>{row['n']}</strong> × {_esc(row['kind'])} — e.g. {_esc(sample)}</li>")
+        text_items.append(f"• {row['n']} × {row['kind']} — e.g. {sample}")
+    html = (
+        "<h3 style=\"margin:24px 0 8px;font-size:16px;\">What Rick shipped this week</h3>"
+        f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{''.join(html_items)}</ul>"
+    )
+    return html, "\nWhat Rick shipped this week:\n" + "\n".join(text_items) + "\n"
 
 
 def load_env() -> None:
@@ -88,31 +339,70 @@ def compose_roundup(fleet: dict) -> tuple[str, str, str]:
         )
     roll_html = "".join(roll_items) or "<li>(nobody new yet)</li>"
 
+    # New: pull learning + ROI + variants + traffic + shipped sections from
+    # Rick's own SQLite. Each section degrades gracefully when its table is
+    # missing or empty — so the roundup works from the first send.
+    callsign_html = ""
+    callsign_text = ""
+    cs = _read_callsign()
+    if cs:
+        callsign_html = f"<p style=\"color:#666;margin:0 0 24px;font-size:14px;\">This Rick's callsign: <strong>{_esc(cs)}</strong>.</p>"
+        callsign_text = f"(This Rick: {cs})\n"
+
+    conn = _open_db()
+    sections_html: list[str] = []
+    sections_text: list[str] = []
+    if conn is not None:
+        try:
+            for builder in (_section_learnings, _section_top_skills, _section_variants,
+                            _section_traffic, _section_shipped):
+                try:
+                    h, t = builder(conn)
+                    if h:
+                        sections_html.append(h)
+                    if t:
+                        sections_text.append(t)
+                except Exception as _exc:  # noqa: BLE001
+                    pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    sections_block_html = "".join(sections_html)
+    sections_block_text = "".join(sections_text)
+
     html = (
         "<!doctype html><html><body style=\"font-family:-apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;"
         "max-width:540px;margin:0 auto;padding:24px;color:#111;line-height:1.55;\">"
         "<h2 style=\"margin:0 0 8px;letter-spacing:-0.01em;\">Rick Roundup</h2>"
-        f"<p style=\"color:#666;margin:0 0 24px;\">Week of {today:%B %-d, %Y}. The fleet rolls on.</p>"
+        f"<p style=\"color:#666;margin:0 0 8px;\">Week of {today:%B %-d, %Y}. The fleet rolls on.</p>"
+        f"{callsign_html}"
         f"<p><strong>{total}</strong> Ricks in the fleet · <strong>{active}</strong> humming right now.</p>"
         f"<p>Tier split: <strong>{free}</strong> free · <strong>{pro}</strong> Pro · <strong>{biz}</strong> Business.</p>"
         f"<p>Recent roll-call: {top_line_html}.</p>"
         "<h3 style=\"margin:24px 0 8px;font-size:16px;\">Who joined this week</h3>"
         f"<ul style=\"padding-left:20px;margin:0;line-height:1.7;\">{roll_html}</ul>"
+        f"{sections_block_html}"
         "<p style=\"margin-top:32px;color:#666;font-size:14px;\">— Rick<br/>"
         "<em>If I had hands I'd high-five you through this email.</em></p>"
         "<p style=\"color:#999;font-size:12px;margin-top:24px;\">You're getting this because you're a Rick Pro. "
-        "<a href=\"https://meetrick.ai/fleet/\" style=\"color:#06b6d4;\">See the live fleet &rarr;</a></p>"
+        "<a href=\"https://meetrick.ai/fleet/\" style=\"color:#06b6d4;\">See the live fleet &rarr;</a> · "
+        "<a href=\"https://meetrick.ai/map/\" style=\"color:#06b6d4;\">See the map &rarr;</a></p>"
         "</body></html>"
     )
 
     text = (
         f"Rick Roundup — week of {today:%B %-d, %Y}\n\n"
+        f"{callsign_text}"
         f"{total} Ricks in the fleet; {active} humming right now.\n"
         f"Tier split: {free} free, {pro} Pro, {biz} Business.\n\n"
-        f"Recent roll-call: {', '.join(top_names) if top_names else '(quiet week)'}\n\n"
-        "— Rick\n\n"
+        f"Recent roll-call: {', '.join(top_names) if top_names else '(quiet week)'}\n"
+        f"{sections_block_text}"
+        "\n— Rick\n"
         "(If I had hands I'd high-five you through this email.)\n\n"
         "Live fleet: https://meetrick.ai/fleet/\n"
+        "Live map:   https://meetrick.ai/map/\n"
     )
 
     return subject, html, text
@@ -180,9 +470,12 @@ def main() -> int:
     try:
         fleet = fetch_fleet()
     except Exception as err:  # noqa: BLE001
+        # Fleet fetch failure is non-fatal — we still have local sections
+        # (learnings, ROI, variants, traffic, shipped). Log and continue
+        # with empty fleet stats rather than blocking the entire roundup.
         append_log({"status": "fleet-fetch-failed", "error": str(err)})
-        print(f"Fleet fetch failed: {err}", file=sys.stderr)
-        return 1
+        print(f"Fleet fetch failed ({err}); continuing with local sections only.", file=sys.stderr)
+        fleet = {}
 
     subject, html, text = compose_roundup(fleet)
     would_send = (not args.dry_run) and (live_flag or args.force)
@@ -198,6 +491,10 @@ def main() -> int:
     )
 
     if not would_send:
+        # Print the full rendered text body so dry-run gives a real preview.
+        print("=" * 60)
+        print(text)
+        print("=" * 60)
         append_log(
             {
                 "status": "dry-run",
