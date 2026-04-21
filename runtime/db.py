@@ -99,6 +99,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("effective_patterns", "id TEXT PRIMARY KEY"),
         ("outbound_jobs", "id TEXT PRIMARY KEY"),
         ("channel_state", "channel TEXT PRIMARY KEY"),
+        ("analytics_snapshots", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -619,6 +620,25 @@ def init_db(connection: sqlite3.Connection) -> None:
             ON outbound_jobs(channel, status, created_at);
         CREATE INDEX IF NOT EXISTS idx_outbound_lead
             ON outbound_jobs(lead_id, created_at);
+
+        -- Analytics snapshots — daily ingest from GA4 / GSC / Ahrefs / Lighthouse.
+        -- Source is one of ga4|gsc|ahrefs|ahrefs_audit|lighthouse. metric_value
+        -- is for numerics; metric_str for URLs/keywords/etc. dim_json holds
+        -- per-row dimensions (page path, query text, country, etc).
+        CREATE TABLE IF NOT EXISTS analytics_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            metric_name TEXT NOT NULL,
+            metric_value REAL,
+            metric_str TEXT NOT NULL DEFAULT '',
+            dim_json TEXT NOT NULL DEFAULT '{}',
+            snapshot_date TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_analytics_source_date
+            ON analytics_snapshots(source, snapshot_date);
+        CREATE INDEX IF NOT EXISTS idx_analytics_metric_date
+            ON analytics_snapshots(metric_name, snapshot_date);
 
         -- Channel state — kill-switch + rate-limit-counter per outbound channel.
         -- outbound_dispatcher reads this before every send; kill_switches
