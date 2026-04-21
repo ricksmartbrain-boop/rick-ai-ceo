@@ -97,6 +97,8 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("subagent_heartbeat", "run_id TEXT PRIMARY KEY"),
         ("skill_variants", "id TEXT PRIMARY KEY"),
         ("effective_patterns", "id TEXT PRIMARY KEY"),
+        ("outbound_jobs", "id TEXT PRIMARY KEY"),
+        ("channel_state", "channel TEXT PRIMARY KEY"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -589,6 +591,54 @@ def init_db(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_effective_patterns_kind
             ON effective_patterns(pattern_kind, sum_wins DESC);
+
+        -- Outbound jobs — unified queue for every outbound touch across
+        -- email / moltbook / reddit / linkedin / threads / instagram / etc.
+        -- fan_out(lead, template, channels) writes one row per channel here;
+        -- outbound_dispatcher drain picks queued rows, enforces
+        -- kill_switches.assert_channel_active, enforces per-channel
+        -- rate-limits from config/channel-limits.json, and calls the matching
+        -- formatter. Keeps every channel behind one queue with uniform safety.
+        CREATE TABLE IF NOT EXISTS outbound_jobs (
+            id TEXT PRIMARY KEY,
+            lead_id TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL,
+            template_id TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'queued',
+            scheduled_at TEXT NOT NULL,
+            last_error TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            finished_at TEXT,
+            result_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_outbound_status_sched
+            ON outbound_jobs(status, scheduled_at);
+        CREATE INDEX IF NOT EXISTS idx_outbound_channel_status
+            ON outbound_jobs(channel, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_outbound_lead
+            ON outbound_jobs(lead_id, created_at);
+
+        -- Channel state — kill-switch + rate-limit-counter per outbound channel.
+        -- outbound_dispatcher reads this before every send; kill_switches
+        -- writes status='paused' when thresholds breach (bounce > 5%,
+        -- shadowban detected, 401 auth failure × 2, DNC hit, etc).
+        -- paused_until is a soft pause (auto-resume); hard pause uses
+        -- status='disabled' with no auto-resume.
+        CREATE TABLE IF NOT EXISTS channel_state (
+            channel TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'active',
+            sends_today INTEGER NOT NULL DEFAULT 0,
+            sends_this_minute INTEGER NOT NULL DEFAULT 0,
+            last_send_at TEXT,
+            paused_until TEXT,
+            pause_reason TEXT NOT NULL DEFAULT '',
+            bounce_count_7d INTEGER NOT NULL DEFAULT 0,
+            complaint_count_7d INTEGER NOT NULL DEFAULT 0,
+            auth_failure_streak INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     migrate_db(connection)

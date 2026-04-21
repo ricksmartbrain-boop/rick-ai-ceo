@@ -1,0 +1,95 @@
+{
+  "_notes": [
+    "Per-channel outbound safety limits. Read by runtime/outbound_dispatcher.py + runtime/kill_switches.py.",
+    "daily: hard cap on sends/day; channel goes paused for today when hit.",
+    "per_minute: hard cap on sends/minute; dispatcher stalls + retries later.",
+    "quiet_hours: {start, end} in 24h local time; sends in this window get rescheduled.",
+    "bounce_threshold_pct: email-only; when exceeded over 24h rolling, channel auto-pauses.",
+    "auth_failure_pause_after: number of consecutive 401/auth failures before hard pause.",
+    "cooldown_per_recipient_days: min days between touches to same recipient on this channel.",
+    "Master gate: RICK_OUTBOUND_ENABLED=0 disables ALL channels (panic button)."
+  ],
+  "channels": {
+    "email": {
+      "active": true,
+      "daily": 500,
+      "per_minute": 10,
+      "quiet_hours": {"start": 22, "end": 7},
+      "bounce_threshold_pct": 5.0,
+      "complaint_threshold_pct": 0.3,
+      "cooldown_per_recipient_days": 14,
+      "formatter_module": "runtime.formatters.email"
+    },
+    "moltbook": {
+      "active": true,
+      "daily": 50,
+      "per_minute": 3,
+      "quiet_hours": {"start": 23, "end": 7},
+      "auth_failure_pause_after": 2,
+      "cooldown_per_recipient_days": 7,
+      "formatter_module": "runtime.formatters.moltbook"
+    },
+    "moltbook_post": {
+      "active": true,
+      "daily": 3,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.moltbook"
+    },
+    "reddit": {
+      "active": true,
+      "daily": 40,
+      "per_minute": 2,
+      "quiet_hours": {"start": 0, "end": 6},
+      "auth_failure_pause_after": 2,
+      "cooldown_per_recipient_days": 14,
+      "formatter_module": "runtime.formatters.reddit"
+    },
+    "reddit_post": {
+      "active": true,
+      "daily": 3,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.reddit"
+    },
+    "linkedin": {
+      "active": true,
+      "daily": 20,
+      "per_minute": 2,
+      "quiet_hours": {"start": 22, "end": 7},
+      "auth_failure_pause_after": 2,
+      "cooldown_per_recipient_days": 14,
+      "formatter_module": "runtime.formatters.linkedin"
+    },
+    "linkedin_post": {
+      "active": true,
+      "daily": 2,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.linkedin"
+    },
+    "threads": {
+      "active": true,
+      "daily": 5,
+      "per_minute": 1,
+      "quiet_hours": {"start": 23, "end": 7},
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.threads"
+    },
+    "instagram": {
+      "active": true,
+      "daily": 2,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.instagram"
+    },
+    "x": {
+      "active": false,
+      "_disabled_reason": "Account suspended 2026-Q1, no ETA. Flip active:true when unsuspended.",
+      "daily": 20,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.x"
+    }
+  }
+}

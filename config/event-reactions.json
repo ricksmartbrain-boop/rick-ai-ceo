@@ -64,6 +64,43 @@
         "workflow": "tenant_retention",
         "description": "Cancellation triggers win-back sequence"
       }
+    ],
+    "subagent_result": [
+      {
+        "action": "notify",
+        "template": "Subagent {kind} → {status} (${cost_usd}) — run_id={run_id}",
+        "description": "Wave 2B merger dispatches this when a subagent run finishes. Routes to ops thread so Rick sees completions land instead of them rotting in subagent_heartbeat."
+      }
+    ],
+    "trial_expiring": [
+      {
+        "action": "queue_workflow",
+        "workflow": "tenant_retention",
+        "description": "Trial about to end — route to retention sequence to convert or close"
+      }
+    ],
+    "new_install": [
+      {
+        "action": "notify",
+        "template": "🎯 New Rick install: callsign={callsign} country={country} tier={tier}",
+        "description": "Fresh install ping — celebrates + gives operator situational awareness"
+      }
+    ],
+    "charge_refunded": [
+      {
+        "action": "delegate",
+        "agent": "iris",
+        "task_template": "A charge was refunded (amount={amount} customer={email}). Read the customer record, classify reason (billing/dissatisfaction/fraud), write a brief retro to ~/rick-vault/operations/refund-retros/, and decide whether to add to suppression list.",
+        "description": "Refunds routed to Iris (customer-ops) for retro + decide suppression"
+      }
+    ],
+    "linkedin_reply": [
+      {
+        "action": "delegate",
+        "agent": "remy",
+        "task_template": "A prospect replied to a LinkedIn DM. Thread: {thread_text}. Classify: buying-signal / objection / not-interested / neutral. Draft Rick's next response in founder voice. If buying-signal, queue deal_close workflow.",
+        "description": "LinkedIn replies routed to Remy for triage + response draft"
+      }
     ]
   }
 }
