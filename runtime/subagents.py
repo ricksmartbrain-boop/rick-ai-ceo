@@ -242,36 +242,97 @@ def dispatch_openclaw(
 
     log_file = SUBAGENT_LOG_DIR / f"{run_id}.json"
 
-    # Try OpenClaw CLI spawn first
+    # OpenClaw 2026.4.15 renamed the subagent CLI surface. `openclaw subagent
+    # spawn` was removed; `openclaw agent` (singular) is the new entry point
+    # that runs a turn through the gateway. Every call using the old name for
+    # the last 30 days failed with "unknown command 'subagent'" — 136 runs, 0
+    # outputs, all prompt tokens burned. Route through the gateway's agent
+    # turn instead. Agent id is always "main" (the one OpenClaw knows); the
+    # subagent persona (iris/remy/teagan) is already encoded in the prompt by
+    # build_task_prompt, so no per-persona OpenClaw agent is required.
     openclaw_bin = os.getenv("RICK_OPENCLAW_BIN", "openclaw")
     ws_dir = workspace_dir or os.getenv("RICK_OPENCLAW_WORKSPACE", str(Path.home() / ".openclaw" / "workspace"))
+    _ = ws_dir  # reserved for future per-subagent workspace isolation
+
+    # Thinking level controls how hard the agent reasons. High for strategy /
+    # research, medium for customer ops, low for mechanical content work.
+    thinking_level = {
+        "research-lane": "high",
+        "ceo-lane": "high",
+        "customer-lane": "medium",
+        "distribution-lane": "medium",
+        "product-lane": "low",
+        "ops-lane": "low",
+    }.get(spec.lane, "medium")
 
     cmd = [
-        openclaw_bin, "subagent", "spawn",
-        "--task", prompt,
-        # Model format: "anthropic/<model-id>" matches OpenClaw subagent runs.json convention
-        "--model", f"anthropic/{spec.model}",
-        "--workspace-dir", ws_dir,
-        "--cleanup", "keep",
+        openclaw_bin, "agent",
+        "--agent", "main",
+        "--message", prompt,
+        "--json",
+        "--timeout", "900",
+        "--thinking", thinking_level,
     ]
 
+    output_payload: dict[str, Any] = {}
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=930,  # slightly longer than --timeout so we catch subprocess exit first
             check=False,
         )
 
-        if result.returncode == 0:
-            status = "dispatched"
-            output = result.stdout.strip()
-            error = ""
+        raw_stdout = result.stdout.strip()
+        if result.returncode == 0 and raw_stdout:
+            try:
+                output_payload = json.loads(raw_stdout)
+            except json.JSONDecodeError:
+                output_payload = {"raw_stdout": raw_stdout[:4000]}
+
+            # OpenClaw 2026.4.15 agent-turn schema:
+            #   { runId, status, summary, result: { payloads: [{text, mediaUrl}], meta: {...} } }
+            # Older / alt schema had agentReply.finalAssistantVisibleText. Support both.
+            visible = ""
+            result_block = output_payload.get("result") if isinstance(output_payload, dict) else None
+            if isinstance(result_block, dict):
+                payloads = result_block.get("payloads") or []
+                if isinstance(payloads, list):
+                    texts = [str(p.get("text")) for p in payloads if isinstance(p, dict) and p.get("text")]
+                    visible = "\n\n".join(t for t in texts if t)
+            if not visible:
+                agent_reply = (
+                    output_payload.get("agentReply")
+                    or output_payload.get("data", {}).get("agentReply")
+                    or {}
+                )
+                visible = str(
+                    agent_reply.get("finalAssistantVisibleText")
+                    or agent_reply.get("finalAssistantRawText")
+                    or ""
+                )
+
+            # `status: "ok"` + any visible text = true completion. Empty text with
+            # status=ok is suspicious (safety refusal, empty reply) — mark as
+            # completed but flag in error so caller can inspect.
+            top_status = output_payload.get("status") if isinstance(output_payload, dict) else None
+            if visible:
+                status = "completed"
+                output = visible
+                error = ""
+            elif top_status == "ok":
+                status = "completed"
+                output = output_payload.get("summary", "") if isinstance(output_payload, dict) else ""
+                error = "agent returned status=ok with no visible payload (refusal, empty reply, or tool-only run)"
+            else:
+                status = "failed"
+                output = raw_stdout[:4000]
+                error = f"agent returned non-ok top status: {top_status!r}"
         else:
             status = "failed"
-            output = result.stdout.strip()
-            error = result.stderr.strip() or "subagent spawn failed"
+            output = result.stdout.strip()[:4000] if result.stdout else ""
+            error = (result.stderr.strip() or "agent spawn failed")[:1000]
     except FileNotFoundError:
         status = "failed"
         output = ""
@@ -279,8 +340,9 @@ def dispatch_openclaw(
     except subprocess.TimeoutExpired:
         status = "failed"
         output = ""
-        error = "subagent spawn timed out after 900s"
+        error = "subagent run timed out at subprocess level (930s)"
 
+    finished_at = datetime.now().isoformat(timespec="seconds")
     delegation = DelegationResult(
         run_id=run_id,
         subagent=spec.name.lower(),
@@ -289,27 +351,66 @@ def dispatch_openclaw(
         output=output,
         error=error,
         started_at=started_at,
-        finished_at=datetime.now().isoformat(timespec="seconds"),
+        finished_at=finished_at,
     )
 
-    # Estimate cost from the prompt size (rough: $0.003 per 1K input tokens for Sonnet)
-    estimated_tokens = max(1, len(prompt.encode("utf-8")) // 4)
-    estimated_cost = (estimated_tokens / 1_000_000) * 3.0 + 0.01  # $3/M input + base
+    # Extract real token + cost from the agent JSON when available; fall back
+    # to prompt-size estimate otherwise. 2026.4.15 shape is
+    # result.meta.agentMeta.{model,usage:{input,output,cacheRead,cacheWrite}}.
+    tokens_in = 0
+    tokens_out = 0
+    tokens_cache_read = 0
+    tokens_cache_write = 0
+    winner_model = f"anthropic/{spec.model}"
+    try:
+        result_block = output_payload.get("result") if isinstance(output_payload, dict) else None
+        agent_meta = (result_block or {}).get("meta", {}).get("agentMeta", {}) if isinstance(result_block, dict) else {}
+        usage = agent_meta.get("usage", {}) if isinstance(agent_meta, dict) else {}
+        tokens_in = int(usage.get("input") or 0)
+        tokens_out = int(usage.get("output") or 0)
+        tokens_cache_read = int(usage.get("cacheRead") or 0)
+        tokens_cache_write = int(usage.get("cacheWrite") or 0)
+        if agent_meta.get("model"):
+            winner_model = f"{agent_meta.get('provider','anthropic')}/{agent_meta['model']}"
+    except Exception:  # noqa: BLE001
+        pass
 
-    # Log the run
+    if tokens_in or tokens_out or tokens_cache_read:
+        # Anthropic pricing (sonnet-4-6 baseline; opus-4-7 is ~5x but we don't
+        # know provider-side rate here). Cache read @ 10% of base input; cache
+        # write @ 125% of base input. Output = output rate.
+        base_in_per_m = 3.0
+        base_out_per_m = 15.0
+        cost_usd = round(
+            (tokens_in / 1_000_000) * base_in_per_m
+            + (tokens_cache_read / 1_000_000) * base_in_per_m * 0.10
+            + (tokens_cache_write / 1_000_000) * base_in_per_m * 1.25
+            + (tokens_out / 1_000_000) * base_out_per_m,
+            4,
+        )
+    else:
+        estimated_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+        cost_usd = round((estimated_tokens / 1_000_000) * 3.0 + 0.01, 4)
+
     log_payload = {
         "run_id": delegation.run_id,
         "subagent": delegation.subagent,
         "role": spec.role,
         "lane": spec.lane,
-        "model": spec.model,
+        "model_requested": spec.model,
+        "model_winner": winner_model,
+        "thinking_level": thinking_level,
         "task": task[:500],
         "status": delegation.status,
         "error": delegation.error,
         "started_at": delegation.started_at,
         "finished_at": delegation.finished_at,
-        "cost_usd": round(estimated_cost, 4),
-        "estimated_tokens": estimated_tokens,
+        "cost_usd": cost_usd,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_cache_read": tokens_cache_read,
+        "tokens_cache_write": tokens_cache_write,
+        "visible_output": output[:4000],
     }
     log_file.write_text(json.dumps(log_payload, indent=2) + "\n", encoding="utf-8")
 
