@@ -5784,7 +5784,10 @@ def parse_telegram_text(
             "/tenants — Tenant overview\n"
             "/churn — Run churn detection\n"
             "/nurture — Run email nurture cycle\n"
-            "/fleet — Run fleet intelligence\n"
+            "/fleet — Show live fleet stats (every Rick on meetrick.ai)\n"
+            "/fleet-analyze — Run fleet intelligence workflow\n"
+            "/map — Link to the live Rick swarm map\n"
+            "/peers <skill> — Find other Ricks offering this skill\n"
             "/onboard <email> <business_name> [industry]"
         )
 
@@ -6076,6 +6079,75 @@ def parse_telegram_text(
             f"Good to see you. Today: {hunted} signals, {deals} victories. Graphs are vibing.",
         ]
         return _random.choice(greetings)
+
+    if command in {"/fleet", "fleet"}:
+        # Live fleet stats from meetrick.ai. Tries /fleet/public first
+        # (richer payload with callsigns), falls back to /stats (always live),
+        # never throws on network errors.
+        import urllib.request as _ureq, urllib.error as _uerr, json as _json
+        api_base = os.getenv("MEETRICK_API_URL", "https://api.meetrick.ai/api/v1").rstrip("/")
+        if not api_base.endswith("/api/v1"):
+            api_base = api_base + "/api/v1"
+        data = None
+        for path in ("/fleet/public", "/stats"):
+            try:
+                req = _ureq.Request(api_base + path, headers={"User-Agent": "rick-telegram/1.0"})
+                with _ureq.urlopen(req, timeout=5) as resp:
+                    data = _json.loads(resp.read().decode("utf-8"))
+                    break
+            except (_uerr.URLError, TimeoutError, _json.JSONDecodeError, Exception):
+                continue
+        if not data:
+            return "Fleet: couldn't reach api.meetrick.ai (try again in a minute)."
+        total = data.get("total") or data.get("total_ricks") or 0
+        active = data.get("active_now") or data.get("active") or 0
+        by_tier = data.get("by_tier") or {}
+        tier_line = " ".join(f"{k}={v}" for k, v in by_tier.items()) or "(tiers warming up)"
+        callsigns = data.get("top_recent_callsigns") or data.get("recent_installs") or []
+        sig_names = []
+        for c in callsigns[:3]:
+            if isinstance(c, dict):
+                sig_names.append(c.get("callsign") or f"rick_{c.get('rick_number','?')}")
+        sig_line = ", ".join(sig_names) if sig_names else "(recent joins below the fold)"
+        return (
+            f"Fleet: {total} Ricks online ({active} active now)\n"
+            f"Tiers: {tier_line}\n"
+            f"Recent: {sig_line}\n"
+            f"Map: https://meetrick.ai/map/  ·  Fleet: https://meetrick.ai/fleet/"
+        )
+
+    if command in {"/map", "map"}:
+        return "Rick swarm map: https://meetrick.ai/map/ — see every Rick worldwide."
+
+    if command in {"/peers", "peers"}:
+        if len(parts) < 2:
+            return "Usage: /peers <skill_name> — e.g. /peers email_automation"
+        skill = parts[1].lower().strip()
+        import urllib.request as _ureq, urllib.parse as _uparse, urllib.error as _uerr, json as _json
+        api_base = os.getenv("MEETRICK_API_URL", "https://api.meetrick.ai/api/v1").rstrip("/")
+        if not api_base.endswith("/api/v1"):
+            api_base = api_base + "/api/v1"
+        try:
+            url = api_base + "/referral/discover?" + _uparse.urlencode({"skill": skill})
+            req = _ureq.Request(url, headers={"User-Agent": "rick-telegram/1.0"})
+            with _ureq.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+        except (_uerr.URLError, TimeoutError, _json.JSONDecodeError, Exception) as exc:
+            return f"Peers: couldn't reach discovery API ({type(exc).__name__}). Try again."
+        peers = data if isinstance(data, list) else data.get("peers") or data.get("ricks") or []
+        if not peers:
+            return f"Peers offering '{skill}': none found yet (fleet is still learning)."
+        lines = [f"Peers offering '{skill}' ({len(peers)} found):"]
+        for p in peers[:3]:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("callsign") or f"rick_{p.get('rick_number','?')}"
+            tier = p.get("tier") or "-"
+            country = p.get("country") or "??"
+            rep = p.get("successful_referrals")
+            rep_str = f" · {rep} referrals" if rep is not None else ""
+            lines.append(f"  {name}  [{tier}, {country}]{rep_str}")
+        return "\n".join(lines)
 
     if command in {"/fiverr", "fiverr"}:
         if len(parts) < 2:
@@ -6409,7 +6481,7 @@ def parse_telegram_text(
         wf_id = queue_email_nurture_workflow(connection)
         return f"Email nurture cycle queued: {wf_id}"
 
-    if command in {"/fleet", "fleet"}:
+    if command in {"/fleet-analyze", "fleet-analyze"}:
         wf_id = queue_fleet_analyze_workflow(connection)
         return f"Fleet intelligence queued: {wf_id}"
 
