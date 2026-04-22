@@ -101,6 +101,18 @@
         "task_template": "A prospect replied to a LinkedIn DM. Thread: {thread_text}. Classify: buying-signal / objection / not-interested / neutral. Draft Rick's next response in founder voice. If buying-signal, queue deal_close workflow.",
         "description": "LinkedIn replies routed to Remy for triage + response draft"
       }
+    ],
+    "roast_request": [
+      {
+        "action": "queue_workflow",
+        "workflow": "deal_close",
+        "description": "Roast request landed on meetrick.ai. Auto-queue deal_close workflow so Rick chases the lead. Wired 2026-04-22 to close the leak Agent A found (roast leads were vanishing in the Railway container's ephemeral filesystem)."
+      },
+      {
+        "action": "notify",
+        "template": "🔥 Roast lead captured: {url} — discovered emails: {emails} — workflow queued",
+        "description": "Loud confirmation in ops thread when a roast lead actually persists (not just the meetrick-subscribe-worker alert which fires regardless of capture success)"
+      }
     ]
   }
 }

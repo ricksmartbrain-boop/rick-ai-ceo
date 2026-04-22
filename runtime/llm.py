@@ -839,6 +839,29 @@ def route_fallback_refs(route: str, primary_provider: str, primary_model: str) -
     return unique_refs
 
 
+def _emit_silent_failure_event(route: str, refs_failed: list[tuple[str, str]], primary: tuple[str, str]) -> None:
+    """Surface silent primary-model failures so they stop being silent.
+
+    Per the 2026-04-22 audit (89% of LLM calls were running in silent fallback —
+    primary model failed but heartbeat still returned HEARTBEAT_OK because the
+    fallback delivered something). Now we log each failure to a dedicated JSONL
+    that's easy to grep + queryable for daily summary."""
+    try:
+        from datetime import datetime
+        log_path = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "llm-fallback-events.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "route": route,
+                "primary": f"{primary[0]}:{primary[1]}",
+                "failed": [f"{p}:{m}" for p, m in refs_failed],
+                "n_failed": len(refs_failed),
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def generate_route_with_fallbacks(
     route: str,
     prompt: str,
@@ -851,15 +874,22 @@ def generate_route_with_fallbacks(
 
     notes: list[str] = []
     refs = [(primary_provider, primary_model), *route_fallback_refs(route, primary_provider, primary_model)]
+    failed_refs: list[tuple[str, str]] = []
 
     for index, (provider, model) in enumerate(refs):
         live = run_live_generation(provider, model, route, prompt)
         if live and live.text.strip():
             if index > 0:
                 notes.append(f"route_fallback_used={provider}:{model}")
+                # Primary failed but a fallback caught it — surface the silent
+                # failure so daily ops can grep llm-fallback-events.jsonl.
+                _emit_silent_failure_event(route, failed_refs, (primary_provider, primary_model))
             return finalize(route, model, live.runner, "live", prompt, live.text, live.provider, usage=live.usage, notes=notes)
         notes.append(f"live_failed={provider}:{model}")
+        failed_refs.append((provider, model))
 
+    # All refs failed — fully silent fallback. Loud log.
+    _emit_silent_failure_event(route, failed_refs, (primary_provider, primary_model))
     return finalize(route, primary_model, "fallback", "fallback", prompt, fallback, primary_provider, notes=notes)
 
 
