@@ -1,0 +1,1 @@
+/Users/rickthebot/clawd/scripts/pattern-miner.py

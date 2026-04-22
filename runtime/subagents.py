@@ -317,6 +317,44 @@ def _heartbeat_finish(
             pass
 
 
+def _circuit_open(kind: str, threshold: int = 3, window_min: int = 60) -> tuple[bool, int]:
+    """Per-subagent-type circuit breaker.
+
+    Returns (open, recent_fail_count). Counts both status='failed' AND
+    completed-but-refusal (e.g. Iris refusing phantom-customer workflows on
+    Opus, ~$1.58 each). When threshold fails inside window_min, dispatch is
+    halted for that kind. Override with RICK_SUBAGENT_CIRCUIT_DISABLED=1.
+    """
+    if os.getenv("RICK_SUBAGENT_CIRCUIT_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return False, 0
+    conn = _open_runtime_db()
+    if conn is None:
+        return False, 0
+    try:
+        cutoff = (datetime.now() - timedelta(minutes=window_min)).isoformat(timespec="seconds")
+        n = conn.execute(
+            """
+            SELECT COUNT(*) FROM subagent_heartbeat
+             WHERE kind = ?
+               AND started_at > ?
+               AND (
+                     status = 'failed'
+                  OR status = 'ghosted'
+                  OR (status = 'completed' AND COALESCE(error,'') LIKE 'agent returned status=ok with no visible payload%')
+               )
+            """,
+            (kind, cutoff),
+        ).fetchone()[0] or 0
+        return (n >= threshold, int(n))
+    except Exception:
+        return False, 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def dispatch_openclaw(
     spec: SubagentSpec,
     task: str,
@@ -334,12 +372,27 @@ def dispatch_openclaw(
 
     SUBAGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Circuit breaker — halt this subagent kind if it just failed 3× in the
+    # last hour. Stops Iris-on-Opus refusal loops (~$1.58/refusal observed).
+    kind_lower = spec.name.lower()
+    is_open, recent_fails = _circuit_open(kind_lower)
+    if is_open:
+        return DelegationResult(
+            run_id=run_id,
+            subagent=kind_lower,
+            task=task,
+            status="failed",
+            error=f"circuit_open: {kind_lower} had {recent_fails} fails/refusals in last 60min — dispatch halted (override: RICK_SUBAGENT_CIRCUIT_DISABLED=1)",
+            started_at=started_at,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
     # Spend limit enforcement
     daily_spend = _subagent_daily_spend()
     if daily_spend >= spec.max_spend_usd:
         return DelegationResult(
             run_id=run_id,
-            subagent=spec.name.lower(),
+            subagent=kind_lower,
             task=task,
             status="failed",
             error=f"Daily spend limit reached: ${daily_spend:.2f} >= ${spec.max_spend_usd:.2f}",
