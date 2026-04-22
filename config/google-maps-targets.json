@@ -1,0 +1,40 @@
+{
+  "_comment": "Per-vertical Google Maps query batches. The maps scraper rotates through these on each run. Add cities × verticals here without changing code. Each batch runs at most max_per_run queries to stay polite to Google. Rotate weekly so the same query isn't repeated daily.",
+  "_default_port": 9222,
+  "max_per_run": 8,
+  "batches": [
+    {
+      "id": "med-spa-tx",
+      "vertical": "med-spa",
+      "queries": [
+        "med spa austin tx",
+        "med spa houston tx",
+        "med spa dallas tx",
+        "med spa san antonio tx",
+        "botox clinic austin tx"
+      ]
+    },
+    {
+      "id": "agencies-nyc",
+      "vertical": "agency",
+      "queries": [
+        "marketing agency new york ny",
+        "branding agency manhattan",
+        "growth agency brooklyn",
+        "performance marketing agency nyc",
+        "ad agency soho nyc"
+      ]
+    },
+    {
+      "id": "dtc-ecom-la",
+      "vertical": "dtc-ecom",
+      "queries": [
+        "ecommerce brand los angeles",
+        "skincare brand los angeles",
+        "apparel dtc los angeles",
+        "supplement brand los angeles",
+        "food and beverage dtc los angeles"
+      ]
+    }
+  ]
+}
