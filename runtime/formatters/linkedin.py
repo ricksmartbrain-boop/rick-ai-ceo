@@ -22,8 +22,12 @@ from runtime.outbound_dispatcher import AuthFailure, PermanentError, TransientEr
 from runtime.utm import stamp_urls_in_text
 
 SCRIPTS_DIR = Path.home() / "clawd" / "scripts"
-POST_SCRIPT = SCRIPTS_DIR / "post_linkedin_publish.js"
-DM_SCRIPT = SCRIPTS_DIR / "open_linkedin_composer.js"
+# DM + invite → new linkedin-dm-cdp.js (2026-04-22 sprint)
+DM_SCRIPT = SCRIPTS_DIR / "linkedin-dm-cdp.js"
+# Post script: fall back to Rick-Brain's working linkedin-post-v3.js since
+# post_linkedin_publish.js was never written. Update when post-v4 ships.
+POST_SCRIPT = Path.home() / "Documents" / "Rick-Brain" / "scripts" / "linkedin-post-v3.js"
+DEFAULT_PORT = int(os.getenv("RICK_LINKEDIN_CDP_PORT", "9225"))
 LOG_FILE = Path.home() / "rick-vault" / "operations" / "formatter-linkedin.jsonl"
 
 
@@ -57,14 +61,20 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     if not live:
         return {"status": "observed-only", "reason": "RICK_OUTBOUND_LINKEDIN_LIVE!=1"}
 
+    # DM + invite both use linkedin-dm-cdp.js; post uses linkedin-post-v3.js
     script = POST_SCRIPT if kind == "post" else DM_SCRIPT
     if not script.exists():
         raise PermanentError(f"script missing: {script}")
 
     cmd = ["node", str(script)]
-    if kind == "dm":
-        cmd.extend(["--target", target, "--body", body])
-    else:
+    if kind in ("dm", "invite"):
+        cmd.extend([
+            "--port", str(DEFAULT_PORT),
+            "--target", target,
+            "--body", body,
+            "--kind", kind,
+        ])
+    else:  # post
         cmd.extend(["--body", body])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)

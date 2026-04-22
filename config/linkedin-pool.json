@@ -1,0 +1,20 @@
+{
+  "_notes": [
+    "LinkedIn account pool for outbound DM + invite rotation.",
+    "Each account = its own Chrome profile + its own CDP port.",
+    "Sticky routing: dispatcher hashes lead_id into a slot so same prospect never sees two accounts.",
+    "Per-account daily_cap respected by kill_switches.record_send / record_auth_failure.",
+    "Add burner accounts by: 1) new Chrome profile dir, 2) new LaunchAgent on fresh port, 3) append here."
+  ],
+  "accounts": [
+    {
+      "name": "vlad-main",
+      "cdp_port": 9225,
+      "persona": "founder",
+      "daily_cap_dm": 20,
+      "daily_cap_invite": 20,
+      "active": true,
+      "notes": "Vladislav's primary LinkedIn — use for high-value warm DMs, not cold volume"
+    }
+  ]
+}
