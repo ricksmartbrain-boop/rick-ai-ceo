@@ -100,6 +100,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("outbound_jobs", "id TEXT PRIMARY KEY"),
         ("channel_state", "channel TEXT PRIMARY KEY"),
         ("analytics_snapshots", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("lead_aliases", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -620,6 +621,27 @@ def init_db(connection: sqlite3.Connection) -> None:
             ON outbound_jobs(channel, status, created_at);
         CREATE INDEX IF NOT EXISTS idx_outbound_lead
             ON outbound_jobs(lead_id, created_at);
+
+        -- Lead aliases — cross-channel attribution (2026-04-22).
+        -- Same human shows up as info@acme.co (email), @acmeco (twitter),
+        -- linkedin.com/in/founder (linkedin), reddit.com/u/acme_founder (reddit).
+        -- All these aliases map back to ONE prospect_pipeline.id so when a
+        -- reply lands via email, Rick knows the original lead came from Reddit.
+        CREATE TABLE IF NOT EXISTS lead_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prospect_id TEXT NOT NULL,
+            alias_value TEXT NOT NULL,
+            alias_type TEXT NOT NULL,
+            source_channel TEXT NOT NULL DEFAULT '',
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            UNIQUE(alias_value, alias_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lead_aliases_prospect
+            ON lead_aliases(prospect_id);
+        CREATE INDEX IF NOT EXISTS idx_lead_aliases_lookup
+            ON lead_aliases(alias_value, alias_type);
 
         -- Analytics snapshots — daily ingest from GA4 / GSC / Ahrefs / Lighthouse.
         -- Source is one of ga4|gsc|ahrefs|ahrefs_audit|lighthouse. metric_value

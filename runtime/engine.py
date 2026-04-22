@@ -1366,6 +1366,36 @@ def notify_operator(
     logger = get_logger("rick.engine")
     logger.info("operator notification: %s", text[:200])
 
+    # Quiet-hours guard (2026-04-22). Between 22:00–07:00 local, batch
+    # non-urgent notifications into a digest file instead of pinging Vlad.
+    # Always-through purposes (urgent + ops + revenue) bypass the guard.
+    URGENT_PURPOSES = {"urgent", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
+    URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
+    try:
+        _hour = datetime.now().hour
+        in_quiet = _hour >= 22 or _hour < 7
+        is_urgent = (
+            (purpose or "").lower() in URGENT_PURPOSES
+            or any(kw in text for kw in URGENT_KEYWORDS)
+        )
+        if in_quiet and not is_urgent and os.getenv("RICK_QUIET_HOURS_ENABLED", "1") == "1":
+            digest_path = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / f"quiet-hours-digest-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+            try:
+                digest_path.parent.mkdir(parents=True, exist_ok=True)
+                with digest_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "purpose": purpose, "lane": lane,
+                        "workflow_id": workflow_id,
+                        "text": text[:500],
+                    }) + "\n")
+                logger.info("quiet-hours: deferred to digest %s", digest_path.name)
+                return
+            except OSError:
+                pass  # Fall through to live send rather than swallow on disk error
+    except Exception:
+        pass  # Never let the quiet-hours guard break notification delivery
+
     binary = os.getenv("RICK_OPENCLAW_EVENT_BIN", "openclaw").strip()
     if not binary:
         _fallback_notification(text, workflow_id=workflow_id, error="no binary configured")

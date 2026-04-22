@@ -33,6 +33,12 @@
         "action": "queue_workflow",
         "workflow": "testimonial_collect",
         "description": "Customer milestone triggers testimonial request"
+      },
+      {
+        "action": "delegate",
+        "agent": "teagan",
+        "task_template": "Customer milestone: {milestone_text}. Compose 1 short celebration post in Rick's founder voice (proof-first, real numbers, dry humor — no corporate-speak). Output goes to ~/rick-vault/content/milestones/{customer_id}-{ts}.md. Channels: pick the 2 best fits from moltbook/reddit/linkedin/threads — match where similar past wins got engagement. Single sentence per channel. NO PII (no real customer names — use callsign or first name only with permission). Wired 2026-04-22 — the unfair-advantage compound: live receipts no competitor can fake.",
+        "description": "Auto-celebration post via Teagan when a real customer hits a milestone (the Rick Scoreboard Meme cornerstone — 8x engagement vs generic post per swarm analysis)"
       }
     ],
     "hot_lead_detected": [
