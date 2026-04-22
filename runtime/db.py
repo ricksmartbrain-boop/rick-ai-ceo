@@ -101,6 +101,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("channel_state", "channel TEXT PRIMARY KEY"),
         ("analytics_snapshots", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("lead_aliases", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("prospect_graph_edges", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -642,6 +643,28 @@ def init_db(connection: sqlite3.Connection) -> None:
             ON lead_aliases(prospect_id);
         CREATE INDEX IF NOT EXISTS idx_lead_aliases_lookup
             ON lead_aliases(alias_value, alias_type);
+
+        -- Founder graph edges — who-discovered-whom + cross-source signals
+        -- (2026-04-22 cornerstone-2). Each edge says "prospect A and prospect B
+        -- co-occur in the same context" (HN front-page same day, mutual GitHub
+        -- follows, IndieHackers product collab). Compounds: every new edge
+        -- raises the confidence that A and B are real founders worth pitching.
+        CREATE TABLE IF NOT EXISTS prospect_graph_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_prospect_id TEXT NOT NULL,
+            dst_prospect_id TEXT NOT NULL,
+            edge_kind TEXT NOT NULL,        -- 'cooccur_hn' | 'cooccur_ih' | 'github_follow' | 'mention' | 'comment'
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL,           -- 'hn' | 'ih' | 'github' | 'whois'
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            UNIQUE(src_prospect_id, dst_prospect_id, edge_kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_prospect_graph_edges_src
+            ON prospect_graph_edges(src_prospect_id, edge_kind);
+        CREATE INDEX IF NOT EXISTS idx_prospect_graph_edges_dst
+            ON prospect_graph_edges(dst_prospect_id, edge_kind);
 
         -- Analytics snapshots — daily ingest from GA4 / GSC / Ahrefs / Lighthouse.
         -- Source is one of ga4|gsc|ahrefs|ahrefs_audit|lighthouse. metric_value
