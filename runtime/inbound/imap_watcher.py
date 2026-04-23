@@ -347,16 +347,17 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
             "received_at": received_at,
             "ingested_at": _now_iso(),
         }
-        triage_rows.append(row)
-
         # Signature extraction + enrichment
         sig = extract_signature(body_text or body_html)
         if sig:
             summary["signatures_found"] += 1
+            row["signature"] = {k: sig[k] for k in ("name", "title", "company", "phone",
+                                                      "linkedin", "twitter") if k in sig}
             if not dry_run and from_email:
                 action = _enrich_prospect(conn, from_email, sig)
                 if action == "updated":
                     summary["enriched"] += 1
+        triage_rows.append(row)
 
         if not dry_run:
             try:
