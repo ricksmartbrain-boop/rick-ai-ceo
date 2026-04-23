@@ -340,8 +340,18 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
             continue
     routed = 0
     summary_by_action = {}
+    self_sends_skipped = 0
     for row in rows:
         if row.get("router_ran_at"):
+            continue
+        # TIER-A wave-6 — defense in depth against self-send mis-classification.
+        # IMAP watcher already skips these for new ingestion; this catches any
+        # rows already in older triage files before the watcher patch landed.
+        sender = (row.get("from") or "").strip().lower()
+        if sender and (sender.endswith("@meetrick.ai") or sender == "vladislav@belkins.io"):
+            self_sends_skipped += 1
+            row["router_ran_at"] = now_iso()
+            row["router_result"] = {"action": "skip-self-send", "sender": sender}
             continue
         label = row.get("classification")
         if not label or label not in DISPATCHERS:
@@ -354,24 +364,30 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
         summary_by_action[result.get("action", "unknown")] = summary_by_action.get(result.get("action", "unknown"), 0) + 1
         routed += 1
         log_event({"file": path.name, "label": label, **result})
-    if routed and not dry_run:
+    # Persist the file when ANY row was mutated (routed OR self-send-skipped),
+    # so we don't re-process self-sends every cycle.
+    if (routed or self_sends_skipped) and not dry_run:
         try:
             path.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n", encoding="utf-8")
         except OSError:
             pass
-    return {"file": str(path), "routed": routed, "by_action": summary_by_action}
+    out = {"file": str(path), "routed": routed, "by_action": summary_by_action}
+    if self_sends_skipped:
+        out["self_sends_skipped"] = self_sends_skipped
+    return out
 
 
 def drain(dry_run: bool, batch_cap: int) -> dict:
     TRIAGE_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(TRIAGE_DIR.glob("inbound-*.jsonl"))
     conn = db_connect()
-    totals = {"files": 0, "routed": 0, "by_action": {}}
+    totals = {"files": 0, "routed": 0, "by_action": {}, "self_sends_skipped": 0}
     try:
         for f in files:
             r = process_file(conn, f, dry_run, batch_cap - totals["routed"])
             totals["files"] += 1
             totals["routed"] += r["routed"]
+            totals["self_sends_skipped"] += r.get("self_sends_skipped", 0)
             for k, v in (r.get("by_action") or {}).items():
                 totals["by_action"][k] = totals["by_action"].get(k, 0) + v
             if totals["routed"] >= batch_cap:

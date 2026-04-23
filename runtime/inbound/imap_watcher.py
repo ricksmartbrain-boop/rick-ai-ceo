@@ -50,6 +50,16 @@ LOG_FILE = DATA_ROOT / "operations" / "imap-watcher.jsonl"
 # the canonical credential source when env vars are unset (TIER-3.5 #A7).
 HIMALAYA_PASSWORD_FILE = Path.home() / ".config" / "himalaya" / "app-password"
 HIMALAYA_DEFAULT_USER = "rick@meetrick.ai"
+# Self-sent addresses to skip in inbound processing — prevents Rick's own
+# outbound (newsletter/flash-sale/transactional) from being mis-classified
+# as inbound deal_close workflows. Plus a wildcard match on @meetrick.ai
+# below catches future aliases (hello@, sales@, etc.).
+SELF_SEND_ADDRESSES = {
+    "rick@meetrick.ai",
+    "hello@meetrick.ai",
+    "vlad@meetrick.ai",
+    "vladislav@belkins.io",
+}
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
@@ -310,6 +320,20 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
         from_ = msg.get("From", "") or ""
         from_email = _extract_addr(from_)
         from_name = _extract_name(from_)
+        # TIER-A wave-6 — skip self-sent emails (Rick's own outbound landing
+        # in inbox via Sent->Inbox mirror, broadcast bouncebacks, or aliases).
+        # Without this guard, the classifier turns Rick's marketing copy into
+        # phantom deal_close workflows targeting Rick himself.
+        if from_email:
+            low = from_email.strip().lower()
+            if low in SELF_SEND_ADDRESSES or low.endswith("@meetrick.ai"):
+                summary["self_sends_skipped"] = summary.get("self_sends_skipped", 0) + 1
+                if not dry_run:
+                    try:
+                        mail.store(uid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                continue
         subject = msg.get("Subject", "") or ""
         # Strip < > wrappers consistently (Gmail returns "<id@gmail.com>")
         msgid_raw = (msg.get("Message-ID", "") or "").strip()
