@@ -66,17 +66,76 @@ def append_suppression(email: str, reason: str):
         return False
 
 
+SMS_DRAFTS_DIR = DATA_ROOT / "mailbox" / "drafts" / "sms"
+
+
+def _maybe_queue_sms_draft(row: dict, label: str, dry_run: bool) -> dict | None:
+    """Side-effect: when inbound has a phone in its parsed signature AND
+    the bucket is warm-intent (sales_inquiry / pricing_question /
+    scheduling_request), queue an SMS draft for Vlad review.
+
+    NEVER auto-sends. Files land in ~/rick-vault/mailbox/drafts/sms/.
+    Returns None if no draft was created (no phone, DNC, etc.).
+    """
+    sig = row.get("signature") or {}
+    phone = (sig.get("phone") or "").strip()
+    if not phone:
+        return None
+    try:
+        from runtime.integrations.twilio_sms import _normalize_e164, check_dnc
+    except Exception:
+        return None
+    e164 = _normalize_e164(phone)
+    if not e164:
+        return {"action": "sms-skipped", "reason": "phone-not-e164", "phone": phone[:20]}
+    if check_dnc(e164):
+        return {"action": "sms-skipped", "reason": "dnc-list", "phone": e164}
+
+    name = (sig.get("name") or row.get("from_name") or "there").split()[0][:30]
+    body_map = {
+        "sales_inquiry":      f"Hey {name} — Rick here (autonomous AI CEO at meetrick.ai). Saw your reply just now. Quick q: 15 min this week to see what I'd actually do for you? — Vlad",
+        "pricing_question":   f"Hey {name} — Rick. Got your pricing q via email. Faster to walk through over text or 15 min? — Vlad",
+        "scheduling_request": f"Hey {name} — Rick here. Got your scheduling note. What 30-min window this week works for you? — Vlad",
+    }
+    sms_body = body_map.get(label, f"Hey {name} — Rick. Got your message. — Vlad")[:300]
+
+    if dry_run:
+        return {"action": "would-draft-sms", "phone": e164, "body_chars": len(sms_body)}
+
+    try:
+        SMS_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+        thread_id = row.get("thread_id") or row.get("message_id") or now_iso().replace(":", "")
+        safe = re.sub(r"[^a-zA-Z0-9._-]", "_", thread_id)[:50]
+        path = SMS_DRAFTS_DIR / f"{safe}-{label}.json"
+        path.write_text(json.dumps({
+            "to": e164, "from_email": row.get("from", ""),
+            "name_hint": name, "label": label, "body": sms_body,
+            "thread_id": row.get("thread_id", ""),
+            "created_at": now_iso(),
+            "review_required": True,
+        }, indent=2), encoding="utf-8")
+        return {"action": "drafted-sms", "path": str(path), "phone": e164}
+    except OSError as exc:
+        return {"action": "sms-error", "error": str(exc)[:200]}
+
+
+import re  # noqa: E402  — used by _maybe_queue_sms_draft
+
+
 def dispatch_sales_inquiry(conn, row: dict, dry_run: bool) -> dict:
     email = row.get("from", "").strip()
     body = (row.get("body") or "")[:500]
+    sms_extra = _maybe_queue_sms_draft(row, "sales_inquiry", dry_run)
     if dry_run:
-        return {"action": "would-queue-deal_close", "email": email}
+        return {"action": "would-queue-deal_close", "email": email,
+                **({"sms": sms_extra} if sms_extra else {})}
     try:
         wf_id = queue_deal_close_workflow(
             conn, email=email, name=row.get("from_name", ""),
             source="reply", message=body,
         )
-        return {"action": "queued", "workflow_id": wf_id, "email": email}
+        return {"action": "queued", "workflow_id": wf_id, "email": email,
+                **({"sms": sms_extra} if sms_extra else {})}
     except Exception as exc:
         return {"action": "error", "error": str(exc)[:200], "email": email}
 
@@ -221,7 +280,12 @@ def _alert_vlad(label: str, conn, row: dict, dry_run: bool, *,
             )
     except Exception:
         pass
-    return {"action": "alerted-vlad", "label": label, "email": email}
+    out = {"action": "alerted-vlad", "label": label, "email": email}
+    if label in ("pricing_question", "scheduling_request"):
+        sms = _maybe_queue_sms_draft(row, label, dry_run)
+        if sms:
+            out["sms"] = sms
+    return out
 
 
 def dispatch_support_request(conn, row, dry_run):
