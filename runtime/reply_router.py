@@ -183,12 +183,78 @@ def dispatch_objection_with_counter(conn, row: dict, dry_run: bool) -> dict:
         return {"action": "drafter-exception", "error": str(exc)[:200]}
 
 
+def _alert_vlad(label: str, conn, row: dict, dry_run: bool, *,
+                area: str = "customer", urgent: bool = False) -> dict:
+    """Generic alert dispatcher — log + execution_ledger entry + Telegram ping.
+    Never sends an email or auto-replies. Used for buckets that need Vlad-touch:
+    support_request, question, pricing_question, scheduling_request, referral_request.
+    """
+    email = (row.get("from") or "").strip()
+    body_preview = (row.get("body") or "")[:300]
+    subject = (row.get("subject") or "")[:120]
+    if dry_run:
+        return {"action": f"would-alert-vlad", "label": label, "email": email}
+
+    try:
+        append_execution_ledger(
+            "decision",
+            f"{label} from {email}",
+            status="open",
+            area=area,
+            project="replies",
+            route="ops",
+            notes=f"Subject: {subject} | Body: {body_preview}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "ledger-error", "error": str(exc)[:200]}
+
+    # Telegram ping — best-effort, isolated subprocess so router never blocks
+    try:
+        import subprocess  # noqa: WPS433
+        tg_script = Path(__file__).resolve().parents[1] / "scripts" / "tg-topic.sh"
+        if tg_script.is_file():
+            prefix = "🚨 " if urgent else ""
+            text = f"{prefix}*{label}* from `{email}`\n_{subject}_\n\n{body_preview[:240]}"
+            subprocess.run(
+                ["bash", str(tg_script), "customer", text],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+    except Exception:
+        pass
+    return {"action": "alerted-vlad", "label": label, "email": email}
+
+
+def dispatch_support_request(conn, row, dry_run):
+    return _alert_vlad("support_request", conn, row, dry_run, area="customer", urgent=True)
+
+
+def dispatch_question(conn, row, dry_run):
+    return _alert_vlad("question", conn, row, dry_run, area="sales")
+
+
+def dispatch_pricing_question(conn, row, dry_run):
+    return _alert_vlad("pricing_question", conn, row, dry_run, area="sales", urgent=True)
+
+
+def dispatch_scheduling_request(conn, row, dry_run):
+    return _alert_vlad("scheduling_request", conn, row, dry_run, area="sales", urgent=True)
+
+
+def dispatch_referral_request(conn, row, dry_run):
+    return _alert_vlad("referral_request", conn, row, dry_run, area="sales")
+
+
 DISPATCHERS = {
     "sales_inquiry": dispatch_sales_inquiry,
     "objection": dispatch_objection,
     "objection_with_counter": dispatch_objection_with_counter,
     "not_interested": dispatch_not_interested,
     "unsubscribe": dispatch_unsubscribe,
+    "support_request": dispatch_support_request,
+    "question": dispatch_question,
+    "pricing_question": dispatch_pricing_question,
+    "scheduling_request": dispatch_scheduling_request,
+    "referral_request": dispatch_referral_request,
 }
 
 
