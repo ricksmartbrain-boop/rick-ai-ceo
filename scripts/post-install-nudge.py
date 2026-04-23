@@ -406,6 +406,31 @@ def main():
             "sent": sent, "skipped": skipped})
     print(f"done. mode={mode} sent={sent} skipped={skipped}")
 
+    # Wave-6 — alert Vlad when free installs are skipped due to missing emails.
+    # Without this the post-install nudge silently leaks every fresh free user.
+    _emap = load_email_map()
+    no_email_skips = [c for c in candidates if not _emap.get(c.get("callsign", ""))]
+    if len(no_email_skips) >= 2:
+        try:
+            import subprocess  # noqa: WPS433
+            tg_script = HOME / "clawd" / "scripts" / "tg-topic.sh"
+            if tg_script.is_file():
+                names = ", ".join(c.get("callsign", "?") for c in no_email_skips[:8])
+                msg = (
+                    f"📭 Post-install nudge: {len(no_email_skips)} free installs in 48-72h "
+                    f"window have NO email known.\n\n"
+                    f"Callsigns: {names}\n\n"
+                    f"Fix: add to ~/rick-vault/data/callsign-emails.json — "
+                    f"`{{\"Mochi\": \"founder@example.com\", ...}}` — "
+                    f"then next 06:00 PT cron will email them the day-2 nudge."
+                )
+                subprocess.run(
+                    ["bash", str(tg_script), "customer", msg],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     try:
