@@ -50,6 +50,57 @@ def print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2))
 
 
+def work_dispatch(connection: sqlite3.Connection, limit: int) -> list:
+    """TIER-2 #B3 (2026-04-23) — concurrency-aware work dispatcher.
+
+    Default RICK_CONCURRENCY=1 → falls through to existing serial work().
+    Set RICK_CONCURRENCY=2+ to enable ThreadPoolExecutor; each worker calls
+    connect() itself (sqlite3.Connection is NOT thread-safe to share).
+
+    SAFETY: this wrapper ships in this commit but RICK_CONCURRENCY default is
+    1 — zero behavior change today. Phase 2 (next session, after 7-day clean
+    burn-in) flips to RICK_CONCURRENCY=2.
+
+    Disable concurrency entirely: RICK_CONCURRENCY_DISABLED=1 (force serial).
+    """
+    if os.getenv("RICK_CONCURRENCY_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return work(connection, limit=limit)
+    try:
+        max_workers = max(1, int(os.getenv("RICK_CONCURRENCY", "1")))
+    except ValueError:
+        max_workers = 1
+    if max_workers <= 1:
+        return work(connection, limit=limit)
+
+    # Concurrent path — each worker owns its connection
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _worker_one_job():
+        # IMPORTANT: never share the parent connection across threads.
+        # sqlite3.connect() with default check_same_thread=True would raise.
+        worker_conn = connect()
+        try:
+            from runtime.engine import process_one_job
+            return process_one_job(worker_conn)
+        finally:
+            try:
+                worker_conn.close()
+            except Exception:
+                pass
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_worker_one_job) for _ in range(limit)]
+        for f in as_completed(futures):
+            try:
+                r = f.result(timeout=400)
+                if r is not None:
+                    results.append(r)
+            except Exception as exc:  # noqa: BLE001
+                results.append({"error": str(exc)[:200], "status": "worker_exception"})
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Rick v6 runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -165,13 +216,13 @@ def _run(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "work":
-        print_json(work(connection, limit=args.limit))
+        print_json(work_dispatch(connection, limit=args.limit))
         return 0
 
     if args.command == "heartbeat":
         summary = heartbeat(connection)
         if args.work_limit > 0:
-            summary["work_results"] = work(connection, limit=args.work_limit)
+            summary["work_results"] = work_dispatch(connection, limit=args.work_limit)
         print_json(summary)
         return 0
 

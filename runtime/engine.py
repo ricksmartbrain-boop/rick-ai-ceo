@@ -1409,6 +1409,11 @@ def _fallback_notification(text: str, *, workflow_id: str | None = None, error: 
         pass  # Last resort — nothing else we can do
 
 
+_NOTIFY_RATE_LOCK = __import__("threading").Lock()
+_NOTIFY_LAST_SENT_AT = 0.0
+_NOTIFY_RATE_WINDOW_S = 5.0
+
+
 def notify_operator(
     connection: sqlite3.Connection,
     text: str,
@@ -1430,6 +1435,25 @@ def notify_operator(
     # Always-through purposes (urgent + ops + revenue) bypass the guard.
     URGENT_PURPOSES = {"urgent", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
     URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
+
+    # TIER-2 #B4 (2026-04-23) — concurrency rate limit.
+    # When ≥2 workers are running concurrently they may notify simultaneously.
+    # Telegram allows ~30 msgs/sec but we want to be polite + dedupe noise.
+    # Hard cap: 1 notification per 5 seconds globally. URGENT bypasses.
+    # Disable: RICK_NOTIFY_RATE_LIMIT_DISABLED=1.
+    global _NOTIFY_LAST_SENT_AT
+    is_urgent_for_rate = (
+        (purpose or "").lower() in URGENT_PURPOSES
+        or any(kw in text for kw in URGENT_KEYWORDS)
+    )
+    if not is_urgent_for_rate and os.getenv("RICK_NOTIFY_RATE_LIMIT_DISABLED", "").strip().lower() not in ("1", "true", "yes"):
+        with _NOTIFY_RATE_LOCK:
+            now_ts = time.time()
+            since_last = now_ts - _NOTIFY_LAST_SENT_AT
+            if since_last < _NOTIFY_RATE_WINDOW_S:
+                logger.debug("notify_operator rate-limited (%.1fs since last)", since_last)
+                return
+            _NOTIFY_LAST_SENT_AT = now_ts
     try:
         _hour = datetime.now().hour
         in_quiet = _hour >= 22 or _hour < 7
@@ -5044,16 +5068,28 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                 from runtime.log import get_logger
                 get_logger("rick.engine").warning("Delegation failed for agent=%s job=%s: %s", agent_key, job["id"], exc, exc_info=True)
 
+        # TIER-2 #B2 (2026-04-23) — concurrency-safe timeout.
+        # SIGALRM is process-wide; concurrent worker threads would corrupt
+        # each other's handlers. Solution: only use SIGALRM when we're in
+        # the main thread (serial mode = today's behavior unchanged).
+        # Concurrent path relies on ThreadPoolExecutor.future.result(timeout=)
+        # in runtime/runner.py:work_dispatch as the safety net.
         import signal as _signal
-        def _job_timeout(signum, frame):
-            raise TimeoutError(f"Job {job['id']} ({job['step_name']}) timed out after 300s")
-        _old_handler = _signal.signal(_signal.SIGALRM, _job_timeout)
-        _signal.alarm(300)
+        import threading as _threading
+        _is_main_thread = _threading.current_thread() is _threading.main_thread()
+        _old_handler = None
+        if _is_main_thread:
+            def _job_timeout(signum, frame):
+                raise TimeoutError(f"Job {job['id']} ({job['step_name']}) timed out after 300s")
+            _old_handler = _signal.signal(_signal.SIGALRM, _job_timeout)
+            _signal.alarm(300)
         try:
             outcome = execute_step(connection, workflow, job)
         finally:
-            _signal.alarm(0)
-            _signal.signal(_signal.SIGALRM, _old_handler)
+            if _is_main_thread:
+                _signal.alarm(0)
+                if _old_handler is not None:
+                    _signal.signal(_signal.SIGALRM, _old_handler)
     except TimeoutError as exc:
         mark_job(connection, job["id"], "queued", blocked_reason=str(exc))
         update_workflow(connection, workflow["id"], status="active", stage=job["step_name"])

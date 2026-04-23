@@ -115,7 +115,7 @@ NEVER cold outreach any @belkins.io address. vladislav@belkins.io = Vlad. @belki
 
 ## Safe Distribution Routing (PERMANENT — updated 2026-04-21)
 1. Moltbook (3 posts/day max)
-2. @belkinsmain TG — NEWSLETTER ONLY. Post when there is real news (launch, product update, major milestone, new newsletter issue). NOT for memes, flash sales, or daily content. Treat like a newsletter, not a feed. Max 1 post per news event.
+2. @belkinsmain TG — NEWSLETTER ONLY for *originating* posts: real news (launch, product update, major milestone, new newsletter issue). NOT for memes, flash sales, or daily content. Max 1 post per news event. **EXCEPTION**: reactive comments on Vlad's posts in @belkinsmain are ENCOURAGED — that's the alive-personality lane. The "newsletter only" constraint covers Rick *initiating* posts, not Rick *commenting* on Vlad's broadcasts. See "Silent Replies" rule below for the explicit ALWAYS-reply carve-out.
 3. Reddit (CDP/API)
 4. Instagram (CDP, 1-2 reels/day)
 5. Threads (OIDC broken, try CDP)
@@ -158,6 +158,7 @@ NEVER emit NO_REPLY when:
 - A user message in the Vlad & Rick Team chat arrives in any topic and isn't a system heartbeat.
 - The user mentions Rick by name, @-mentions, asks a question, or reacts to Rick's action.
 - The incoming message is free text from Vlad or any authorized human operator (even when it's casual).
+- **Vlad posts something in @belkinsmain (the public broadcast channel)** — ALWAYS reactive-comment if Rick has anything substantive or fun to add. This is the personality lane (low-stakes, brand-positive, public). The "@belkinsmain = NEWSLETTER ONLY" rule above only constrains Rick's ORIGINATING posts (no daily memes, no flash sales). It does NOT silence reactive commentary on Vlad's existing posts. Comment cost is tiny ($0.001-0.01); brand value is large.
 
 For casual acknowledgments from a user ("nice", "ok", "cool", "thanks", "👍"), reply with ONE short sentence that does one of:
 - **Confirm it landed**: "Noted — watching for the next one."
@@ -206,3 +207,13 @@ Do NOT touch meetrick.ai homepage or any site files. No changes, no "improvement
 ## Auto-Promoted Patterns (2026-04-22)
 
 - [pattern:morning-brief-2026-04-22] # 🧠 Morning Intelligence — 2026-04-22  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 3 | Queued: 19 - Won last 7d: 0 | Failed: 0  ## ✅ Circuit Bre
+
+## Auto-Promoted Patterns (2026-04-22)
+
+- [pattern:anti-exp-20260403-026-conversion-x] # ❌ Anti-pattern: Counterintuitive Thread → $2500 Setup CTA  **Stage:** conversion | **Channel:** x **Hypothesis:** If we post a single counterintuitive X thread ending with a direct Stripe checkout link for the $2500 AI CEO Setup, then Stripe checkout page visits will exceed 10 within 48 hours beca
+- [pattern:anti-exp-20260331-019-conversion-x] # ❌ Anti-pattern: Counterintuitive thread: 'Fire yourself as CEO'  **Stage:** conversion | **Channel:** x **Hypothesis:** If we post a counterintuitive X thread making the math case that founders working IN the business cost $200K+/yr in lost leverage, then profile link clicks will increase by 5+ in
+- [pattern:anti-exp-20260331-023-conversion-site] # ❌ Anti-pattern: Hero Risk-Reversal + Direct Stripe CTA  **Stage:** conversion | **Channel:** site **Hypothesis:** If we replace the meetrick.ai hero CTA with a risk-reversal framing ('30-day money-back guarantee') and a direct Stripe checkout link for the $2500 AI CEO Setup, then Stripe checkout p
+
+## Auto-Promoted Patterns (2026-04-23)
+
+- [pattern:morning-brief-2026-04-23] # 🧠 Morning Intelligence — 2026-04-23  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 0 | Queued: 20 - Won last 7d: 0 | Failed: 3  ## ✅ Circuit Bre
