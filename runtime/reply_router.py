@@ -145,9 +145,48 @@ def dispatch_unsubscribe(conn, row: dict, dry_run: bool) -> dict:
         return {"action": "error", "error": str(exc)[:200], "email": email}
 
 
+def dispatch_objection_with_counter(conn, row: dict, dry_run: bool) -> dict:
+    """TIER-3.5 #A4 (2026-04-23) — fire-and-forget counter-pitch drafter.
+
+    Subprocess invocation keeps the router lightweight + isolates failures.
+    Drafts land in ~/rick-vault/mailbox/drafts/counter-pitch/. NEVER auto-sends.
+    """
+    import subprocess  # noqa: WPS433
+    thread_id = row.get("thread_id") or row.get("message_id") or ""
+    objection_text = (row.get("body") or "")[:2000]
+    prospect_id = row.get("prospect_id") or ""
+    if dry_run:
+        return {"action": "would-draft-counter-pitch", "thread_id": thread_id}
+    if not thread_id:
+        return {"action": "skip-no-thread-id"}
+    script = Path(__file__).resolve().parents[1] / "skills" / "counter-pitch" / "scripts" / "draft-counter.py"
+    if not script.is_file():
+        return {"action": "skip-script-missing", "path": str(script)}
+    try:
+        proc = subprocess.run(
+            ["python3", str(script),
+             "--thread-id", thread_id,
+             "--objection-text", objection_text]
+            + (["--prospect-id", prospect_id] if prospect_id else []),
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if proc.returncode == 0:
+            try:
+                payload = json.loads(proc.stdout.strip().splitlines()[-1])
+                return {"action": "drafted", **payload}
+            except (json.JSONDecodeError, IndexError):
+                return {"action": "drafted-no-payload", "stdout": proc.stdout[:200]}
+        return {"action": "drafter-failed", "exit": proc.returncode, "stderr": proc.stderr[:200]}
+    except subprocess.TimeoutExpired:
+        return {"action": "drafter-timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "drafter-exception", "error": str(exc)[:200]}
+
+
 DISPATCHERS = {
     "sales_inquiry": dispatch_sales_inquiry,
     "objection": dispatch_objection,
+    "objection_with_counter": dispatch_objection_with_counter,
     "not_interested": dispatch_not_interested,
     "unsubscribe": dispatch_unsubscribe,
 }
