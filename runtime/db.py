@@ -103,6 +103,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("lead_aliases", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("prospect_graph_edges", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("cost_attribution", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("experiments", "id TEXT PRIMARY KEY"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -333,6 +334,28 @@ def init_db(connection: sqlite3.Connection) -> None:
             ON cost_attribution(workflow_kind, terminal_status, attributed_at);
         CREATE INDEX IF NOT EXISTS idx_cost_attribution_revenue
             ON cost_attribution(converted_to_revenue, attributed_at);
+
+        -- Experiments table (TIER-1 #3, 2026-04-23) — hypothesis-generation
+        -- + outcome loop. experiment-engine.py reads/writes this. Without
+        -- the table, the script silently fails to dispatch.
+        CREATE TABLE IF NOT EXISTS experiments (
+            id TEXT PRIMARY KEY,
+            skill_name TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            measure_at TEXT,
+            outcome_json TEXT NOT NULL DEFAULT '{}',
+            cost_usd REAL NOT NULL DEFAULT 0.0,
+            quality_score REAL,
+            created_at TEXT NOT NULL,
+            launched_at TEXT,
+            measured_at TEXT,
+            promoted_pattern_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_experiments_status
+            ON experiments(status, measure_at);
+        CREATE INDEX IF NOT EXISTS idx_experiments_skill
+            ON experiments(skill_name, created_at);
 
         CREATE INDEX IF NOT EXISTS idx_approvals_workflow
         ON approvals(workflow_id);
