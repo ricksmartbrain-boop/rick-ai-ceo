@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase G classifier — reads inbound email triage JSONL + classifies into 4 buckets.
+"""Phase G classifier — reads inbound email triage JSONL + classifies into 10 buckets.
 
 Input: ~/rick-vault/mailbox/triage/inbound-YYYY-MM-DD.jsonl
        (populated by imap_watcher.py OR manual drop OR future Resend inbound webhook)
@@ -7,7 +7,17 @@ Each line: {"id": "...", "from": "...", "subject": "...", "body": "...", "receiv
 
 Output: same file, rewrites with added `classification` + `classified_at` fields.
 
-Labels: sales_inquiry | objection | not_interested | unsubscribe
+Labels (TIER-3.5 #A3 — extended 4 → 10 on 2026-04-23):
+  sales_inquiry         person curious / wants demo / pricing
+  objection             pushes back, raises concerns we can rebut
+  objection_with_counter  objection BUT engaged — ready for counter-pitch
+  not_interested        polite decline / "not now" / "thanks but no"
+  unsubscribe           explicit opt-out
+  question              info request, no buying intent (yet)
+  scheduling_request    wants to book a call
+  pricing_question      asks for price specifically
+  referral_request      "do you know anyone who…" / "would you intro me to…"
+  support_request       existing customer asking for help
 
 Runs every 10min via ai.rick.reply-router.plist alongside reply_router.py.
 """
@@ -30,14 +40,23 @@ DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 TRIAGE_DIR = DATA_ROOT / "mailbox" / "triage"
 LOG_FILE = DATA_ROOT / "operations" / "reply-classifier.jsonl"
 
-LABELS = {"sales_inquiry", "objection", "not_interested", "unsubscribe"}
+LABELS = {
+    "sales_inquiry", "objection", "objection_with_counter", "not_interested", "unsubscribe",
+    "question", "scheduling_request", "pricing_question", "referral_request", "support_request",
+}
 
-CLASSIFIER_PROMPT = """You are a reply-classifier. Read this inbound email and return EXACTLY ONE of these four labels (no other text):
+CLASSIFIER_PROMPT = """You are a reply-classifier. Read this inbound email and return EXACTLY ONE of these ten labels (no other text):
 
-- sales_inquiry: person is curious, asking questions, wants to learn more, wants a demo, wants pricing
-- objection: person pushes back, raises concerns, has objections we can rebut
+- sales_inquiry: person is curious about the product, wants demo, wants more info to evaluate buying
+- objection: pushes back hard, lists concerns, leans negative
+- objection_with_counter: raises an objection BUT stays engaged — open to a thoughtful counter-pitch
 - not_interested: polite decline, "not right now", "thanks but no", "maybe later"
-- unsubscribe: explicit request to stop emailing, "unsubscribe", "remove me", "stop"
+- unsubscribe: explicit opt-out, "unsubscribe", "remove me", "stop emailing"
+- question: asking for info but NOT a purchase signal (e.g. how does this work, what about X)
+- scheduling_request: wants to book a call/meeting/demo at a specific time
+- pricing_question: asks specifically about cost/price/discount/billing
+- referral_request: "do you know anyone who…" / "would you intro me to…" / "I have a friend who…"
+- support_request: existing customer asking for help with the product (bug, feature, account)
 
 Email:
 FROM: {from_addr}

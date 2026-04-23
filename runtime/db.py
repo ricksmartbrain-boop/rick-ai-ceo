@@ -104,6 +104,8 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("prospect_graph_edges", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("cost_attribution", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("experiments", "id TEXT PRIMARY KEY"),
+        ("email_threads", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("follow_up_queue", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -356,6 +358,53 @@ def init_db(connection: sqlite3.Connection) -> None:
             ON experiments(status, measure_at);
         CREATE INDEX IF NOT EXISTS idx_experiments_skill
             ON experiments(skill_name, created_at);
+
+        -- Email threads (TIER-3.5 #A1, 2026-04-23) — preserves Gmail thread
+        -- context across inbound/outbound so Rick replies hit the right
+        -- conversation. Without this, every Resend send is orphaned in Gmail.
+        CREATE TABLE IF NOT EXISTS email_threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            gmail_thread_id TEXT,
+            prospect_id TEXT,
+            root_message_id TEXT,
+            subject TEXT NOT NULL DEFAULT '',
+            participants_json TEXT NOT NULL DEFAULT '[]',
+            last_inbound_at TEXT,
+            last_outbound_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            intent_class TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(thread_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_threads_gmail
+            ON email_threads(gmail_thread_id);
+        CREATE INDEX IF NOT EXISTS idx_email_threads_prospect
+            ON email_threads(prospect_id);
+        CREATE INDEX IF NOT EXISTS idx_email_threads_status
+            ON email_threads(status, last_inbound_at DESC);
+
+        -- Follow-up queue (TIER-3.5 #A2, 2026-04-23) — adaptive cadence by
+        -- intent (cold=7d, warm=4d, hot=2d, engaged-then-silent=24h). Hard
+        -- cap 4 follow-ups per thread before status='closed_lost'.
+        CREATE TABLE IF NOT EXISTS follow_up_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prospect_id TEXT,
+            thread_id TEXT NOT NULL,
+            follow_up_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 4,
+            last_intent TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            draft_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_follow_up_queue_due
+            ON follow_up_queue(status, follow_up_at);
+        CREATE INDEX IF NOT EXISTS idx_follow_up_queue_thread
+            ON follow_up_queue(thread_id);
 
         CREATE INDEX IF NOT EXISTS idx_approvals_workflow
         ON approvals(workflow_id);

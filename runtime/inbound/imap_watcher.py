@@ -45,10 +45,17 @@ TRIAGE_DIR = DATA_ROOT / "mailbox" / "triage"
 STATE_FILE = DATA_ROOT / "mailbox" / "imap-watcher-state.json"
 LOG_FILE = DATA_ROOT / "operations" / "imap-watcher.jsonl"
 
+# Himalaya CLI fallback — Vlad has Gmail app password configured for Himalaya
+# (~/.config/himalaya/app-password + config.toml for rick@meetrick.ai). Use as
+# the canonical credential source when env vars are unset (TIER-3.5 #A7).
+HIMALAYA_PASSWORD_FILE = Path.home() / ".config" / "himalaya" / "app-password"
+HIMALAYA_DEFAULT_USER = "rick@meetrick.ai"
+
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 MAX_MESSAGES_PER_RUN = 200
 EMAIL_ADDR_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+MSGID_HEADER_RE = re.compile(r"<([^>]+)>")
 
 
 def _load_env():
@@ -168,6 +175,91 @@ def _write_triage(rows: list[dict]):
             f.write(json.dumps(r, sort_keys=True) + "\n")
 
 
+def _resolve_credentials() -> tuple[str | None, str | None, str]:
+    """Try env first, fall through to Himalaya app-password (TIER-3.5 #A7).
+
+    Returns (user, password, source). source ∈ {'env', 'himalaya', 'none'}.
+    """
+    env_user = (os.getenv("GMAIL_IMAP_USER") or os.getenv("IMAP_USER") or "").strip()
+    env_pass = (os.getenv("GMAIL_APP_PASSWORD") or os.getenv("IMAP_PASSWORD") or "").strip()
+    if env_user and env_pass:
+        return env_user, env_pass, "env"
+    if HIMALAYA_PASSWORD_FILE.is_file():
+        try:
+            pw = HIMALAYA_PASSWORD_FILE.read_text(encoding="utf-8").strip()
+            if pw:
+                user = env_user or HIMALAYA_DEFAULT_USER
+                return user, pw, "himalaya"
+        except OSError:
+            pass
+    return None, None, "none"
+
+
+def _extract_msgids(header_val: str) -> list[str]:
+    """Pull all <message-id> tokens from In-Reply-To / References header."""
+    if not header_val:
+        return []
+    return [m.strip() for m in MSGID_HEADER_RE.findall(header_val) if m.strip()]
+
+
+def _upsert_thread(
+    conn: sqlite3.Connection,
+    *,
+    message_id: str,
+    in_reply_to: str,
+    references: list[str],
+    from_email: str,
+    subject: str,
+    received_iso: str,
+) -> str | None:
+    """UPSERT email_threads row from inbound message headers (TIER-3.5 #A6).
+
+    Thread identity strategy: first try existing row whose root_message_id is
+    in this message's References list (we're a reply within an existing
+    thread). Else try in_reply_to. Else this is the root of a new thread.
+    Returns the thread_id (== root_message_id) or None on DB error.
+    """
+    if not message_id:
+        return None
+    try:
+        # Check if any of the chained ancestors match an existing root
+        existing = None
+        for ancestor in references + ([in_reply_to] if in_reply_to else []):
+            row = conn.execute(
+                "SELECT id, thread_id, root_message_id, last_inbound_at "
+                "FROM email_threads WHERE root_message_id = ? LIMIT 1",
+                (ancestor,),
+            ).fetchone()
+            if row:
+                existing = row
+                break
+        now = _now_iso()
+        if existing:
+            conn.execute(
+                "UPDATE email_threads SET last_inbound_at = ?, updated_at = ?, "
+                "subject = COALESCE(NULLIF(subject,''), ?) WHERE id = ?",
+                (received_iso or now, now, subject[:200], existing["id"]),
+            )
+            return existing["thread_id"]
+        # No ancestor matched — this becomes a new root
+        thread_id = message_id  # use root Message-ID as canonical thread id
+        conn.execute(
+            "INSERT OR IGNORE INTO email_threads "
+            "(thread_id, gmail_thread_id, root_message_id, subject, "
+            " participants_json, last_inbound_at, status, created_at, updated_at) "
+            "VALUES (?, NULL, ?, ?, ?, ?, 'active', ?, ?)",
+            (thread_id, message_id, subject[:200],
+             json.dumps([from_email] if from_email else []),
+             received_iso or now, now, now),
+        )
+        return thread_id
+    except sqlite3.OperationalError:
+        # email_threads table may not exist on older instances — non-fatal
+        return None
+    except Exception:
+        return None
+
+
 def _enrich_prospect(conn: sqlite3.Connection, email: str, enrichment: dict) -> str:
     """UPSERT into prospect_pipeline with signature-derived enrichment."""
     if not email:
@@ -219,13 +311,34 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
         from_email = _extract_addr(from_)
         from_name = _extract_name(from_)
         subject = msg.get("Subject", "") or ""
-        message_id = msg.get("Message-ID", "") or ""
+        # Strip < > wrappers consistently (Gmail returns "<id@gmail.com>")
+        msgid_raw = (msg.get("Message-ID", "") or "").strip()
+        message_id = _extract_msgids(msgid_raw)[0] if "<" in msgid_raw else msgid_raw
+        in_reply_to_raw = (msg.get("In-Reply-To", "") or "").strip()
+        in_reply_to = _extract_msgids(in_reply_to_raw)[0] if in_reply_to_raw else ""
+        references = _extract_msgids(msg.get("References", "") or "")
         received_at = msg.get("Date", "") or ""
         body_text, body_html = _message_body(msg)
+
+        # TIER-3.5 #A6 — preserve thread context
+        thread_id = None
+        if not dry_run:
+            thread_id = _upsert_thread(
+                conn,
+                message_id=message_id,
+                in_reply_to=in_reply_to,
+                references=references,
+                from_email=from_email,
+                subject=subject,
+                received_iso=received_at,
+            )
 
         row = {
             "id": _msg_hash(message_id, from_email, subject),
             "message_id": message_id,
+            "in_reply_to": in_reply_to,
+            "references": references,
+            "thread_id": thread_id,
             "from": from_email,
             "from_name": from_name,
             "subject": subject[:200],
@@ -259,10 +372,12 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
 
 
 def run_watcher(dry_run: bool, backfill_days: int = 0) -> dict:
-    imap_user = os.getenv("GMAIL_IMAP_USER") or os.getenv("IMAP_USER")
-    imap_pass = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("IMAP_PASSWORD")
+    imap_user, imap_pass, cred_source = _resolve_credentials()
     if not imap_user or not imap_pass:
-        result = {"status": "skip-no-credentials", "hint": "Set GMAIL_IMAP_USER + GMAIL_APP_PASSWORD in ~/clawd/config/rick.env"}
+        result = {
+            "status": "skip-no-credentials",
+            "hint": "Set GMAIL_IMAP_USER + GMAIL_APP_PASSWORD in ~/clawd/config/rick.env, OR ensure ~/.config/himalaya/app-password exists",
+        }
         _log(result)
         return result
 
@@ -300,6 +415,8 @@ def run_watcher(dry_run: bool, backfill_days: int = 0) -> dict:
     result = {
         "status": "ok",
         "dry_run": dry_run,
+        "cred_source": cred_source,
+        "imap_user": imap_user,
         "unseen": unseen,
         "backfill": backfill,
         "ran_at": _now_iso(),
