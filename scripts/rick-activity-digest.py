@@ -161,12 +161,24 @@ def render(s: dict) -> str:
     cost_usd = total_cost.get("sum_usd", 0)
     outcomes_n = total_cost.get("outcomes", 0)
 
+    # TIER-C #7 — cancellation-rate alarm. Surfaces silent issues like the
+    # 2026-04-23 self-send classifier bug (100% deal_close cancel rate hid
+    # a misclassification, not a healthy filter).
+    finished = done + cancelled
+    cancel_rate_alarm = ""
+    if finished >= 5 and cancelled / finished >= 0.80:
+        cancel_rate_alarm = f"🚨 *Cancellation rate {int(100*cancelled/finished)}%* (≥80% triggers alarm)\n"
+
     lines = [
         f"📊 *Rick daily* — {datetime.now().strftime('%a %b %d')}",
         "",
+    ]
+    if cancel_rate_alarm:
+        lines.append(cancel_rate_alarm)
+    lines.extend([
         f"*Workflows 24h*: {done}✅ · {cancelled}❌ · {active}🔄",
         f"*Cost*: ${cost_usd:.3f} across {outcomes_n} outcomes",
-    ]
+    ])
 
     top = s.get("top_cost_steps") or []
     if top:
