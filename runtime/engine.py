@@ -6024,7 +6024,9 @@ def parse_telegram_text(
             "/fleet-analyze — Run fleet intelligence workflow\n"
             "/map — Link to the live Rick swarm map\n"
             "/peers <skill> — Find other Ricks offering this skill\n"
-            "/onboard <email> <business_name> [industry]"
+            "/onboard <email> <business_name> [industry]\n"
+            "--- Inbox UI (draft review) ---\n"
+            "/inbox-help — list /inbox /thread /drafts /draft /send /skip"
         )
 
     if command in {"/overnight", "overnight"}:
@@ -6740,5 +6742,61 @@ def parse_telegram_text(
         industry = parts[3] if len(parts) > 3 else ""
         wf_id = queue_managed_onboarding_workflow(connection, email=email, business_name=biz, industry=industry)
         return f"Managed onboarding queued: {wf_id}"
+
+    # --- TIER-3.5 #A12 — Inbox UI for Vlad's draft review ----------------
+    if command in {"/inbox", "inbox"}:
+        try:
+            from runtime.inbox_ui import cmd_inbox
+            return cmd_inbox(connection, chat_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"/inbox failed: {str(exc)[:200]}"
+
+    if command in {"/thread", "thread"}:
+        try:
+            from runtime.inbox_ui import cmd_thread
+            n_arg = parts[1] if len(parts) > 1 else None
+            return cmd_thread(connection, chat_id, n_arg)
+        except Exception as exc:  # noqa: BLE001
+            return f"/thread failed: {str(exc)[:200]}"
+
+    if command in {"/drafts", "drafts"}:
+        try:
+            from runtime.inbox_ui import cmd_drafts
+            return cmd_drafts(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"/drafts failed: {str(exc)[:200]}"
+
+    if command in {"/draft", "draft"}:
+        try:
+            from runtime.inbox_ui import cmd_draft
+            n_arg = parts[1] if len(parts) > 1 else None
+            return cmd_draft(chat_id, n_arg)
+        except Exception as exc:  # noqa: BLE001
+            return f"/draft failed: {str(exc)[:200]}"
+
+    if command in {"/send", "send"}:
+        try:
+            from runtime.inbox_ui import cmd_send
+            n_arg = parts[1] if len(parts) > 1 else None
+            tail = " ".join(parts[2:]) if len(parts) > 2 else ""
+            return cmd_send(chat_id, n_arg, tail)
+        except Exception as exc:  # noqa: BLE001
+            return f"/send failed: {str(exc)[:200]}"
+
+    if command in {"/skip", "skip"}:
+        try:
+            from runtime.inbox_ui import cmd_skip
+            n_arg = parts[1] if len(parts) > 1 else None
+            tail = " ".join(parts[2:]) if len(parts) > 2 else ""
+            return cmd_skip(chat_id, n_arg, tail)
+        except Exception as exc:  # noqa: BLE001
+            return f"/skip failed: {str(exc)[:200]}"
+
+    if command in {"/inbox-help", "inbox-help"}:
+        try:
+            from runtime.inbox_ui import cmd_inbox_help
+            return cmd_inbox_help()
+        except Exception as exc:  # noqa: BLE001
+            return f"/inbox-help failed: {str(exc)[:200]}"
 
     return f"Unknown command: {command}"
