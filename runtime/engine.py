@@ -614,6 +614,65 @@ def load_approval_policy() -> dict:
     return result
 
 
+_workflow_budgets_cache: tuple[float, dict] | None = None
+
+
+def load_workflow_budgets() -> dict:
+    """Load per-workflow daily $ caps from config/workflow-budgets.json. Cached on mtime."""
+    global _workflow_budgets_cache  # noqa: PLW0603
+    path_value = os.getenv("RICK_WORKFLOW_BUDGETS_FILE", "").strip()
+    if not path_value:
+        path_value = str(ROOT_DIR / "config" / "workflow-budgets.json")
+    path = Path(os.path.expanduser(path_value))
+    if not path.exists():
+        return {}
+    mtime = path.stat().st_mtime
+    if _workflow_budgets_cache is not None and _workflow_budgets_cache[0] == mtime:
+        return _workflow_budgets_cache[1]
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    _workflow_budgets_cache = (mtime, result)
+    return result
+
+
+def _check_workflow_budget(connection: sqlite3.Connection, kind: str) -> tuple[bool, float, float]:
+    """Pre-flight gate: returns (allowed, spent_today_usd, cap_usd).
+
+    `allowed=False` means today's spend on this workflow kind has hit its cap.
+    Override globally with RICK_BUDGET_FORCE=1. Initial caps are conservative
+    (5x observed daily spend per kind) — adjust in config/workflow-budgets.json.
+
+    Fail-OPEN on any error (cache miss, malformed JSON, missing column) — we
+    never want a budget bug to halt the daemon.
+    """
+    if os.getenv("RICK_BUDGET_FORCE", "").strip().lower() in ("1", "true", "yes"):
+        return True, 0.0, 0.0
+    try:
+        budgets = load_workflow_budgets()
+        caps = budgets.get("caps_usd_per_day", {})
+        cap = float(caps.get(kind, caps.get("_default", 5.0)))
+        if cap <= 0:
+            # Explicit 0 = hard-disabled (e.g. initiative kind).
+            return False, 0.0, 0.0
+        # Sum cost over today across this kind via outcomes JOIN workflows
+        row = connection.execute(
+            """
+            SELECT COALESCE(SUM(o.cost_usd), 0)
+              FROM outcomes o
+              JOIN workflows w ON w.id = o.workflow_id
+             WHERE w.kind = ?
+               AND o.created_at >= datetime('now', 'start of day')
+            """,
+            (kind,),
+        ).fetchone()
+        spent = float(row[0]) if row else 0.0
+        return spent < cap, spent, cap
+    except Exception:
+        return True, 0.0, 0.0  # Fail-open
+
+
 def is_overnight_mode_active() -> bool:
     """Check if overnight autonomous mode is currently enabled.
 
@@ -4896,6 +4955,35 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
         return None
 
     workflow = get_workflow(connection, job["workflow_id"])
+
+    # TIER-0 #3 budget pre-flight gate (2026-04-23). Block the job from
+    # consuming LLM tokens if today's spend on this workflow kind has hit
+    # its cap. Fail-open on any error — never halt the daemon on a bug.
+    _budget_allowed, _budget_spent, _budget_cap = _check_workflow_budget(
+        connection, workflow["kind"] if workflow and "kind" in workflow.keys() else ""
+    )
+    if not _budget_allowed:
+        # Skip the job; queue it back for tomorrow with explicit reason.
+        # Telegram alert at every breach so Vlad can flip RICK_BUDGET_FORCE
+        # if a legitimate workflow legitimately needs the headroom today.
+        mark_job(connection, job["id"], "queued",
+                 last_error=f"budget_exceeded: {workflow['kind']} ${_budget_spent:.2f}/{_budget_cap:.2f} today")
+        connection.execute(
+            "UPDATE jobs SET run_after = datetime('now', '+1 day') WHERE id = ?",
+            (job["id"],),
+        )
+        connection.commit()
+        try:
+            notify_operator(
+                connection,
+                f"💸 Budget gate fired: workflow kind '{workflow['kind']}' hit ${_budget_spent:.2f}/{_budget_cap:.2f}/day cap. "
+                f"Job '{job['step_name']}' queued back for tomorrow. Override: RICK_BUDGET_FORCE=1.",
+                workflow_id=workflow["id"], lane=workflow["lane"], purpose="ops",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"job_id": job["id"], "status": "budget_exceeded", "spent": _budget_spent, "cap": _budget_cap}
+
     mark_job(connection, job["id"], "running")
 
     # Begin per-job cost tracking. Every generate_text call inside the step
@@ -5089,8 +5177,8 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                 connection.execute(
                     """
                     INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
-                                          created_at, cost_usd, model_used, duration_seconds)
-                    VALUES (?, ?, ?, ?, 'escalation', ?, ?, ?, ?)
+                                          created_at, cost_usd, model_used, duration_seconds, quality_score)
+                    VALUES (?, ?, ?, ?, 'escalation', ?, ?, ?, ?, 0.0)
                     """,
                     (
                         workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
@@ -5157,8 +5245,8 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
             connection.execute(
                 """
                 INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
-                                      created_at, cost_usd, model_used, duration_seconds)
-                VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?)
+                                      created_at, cost_usd, model_used, duration_seconds, quality_score)
+                VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?, 0.0)
                 """,
                 (
                     workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
@@ -5213,17 +5301,23 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
     try:
         _succ_cost = _llm_track.get_and_clear_job_cost(job["id"])
         _succ_duration = (datetime.now() - _job_started_at).total_seconds()
+        # quality_score: success defaults 1.0; StepOutcome can override via outcome.quality_score
+        # (handlers like handle_pitch_draft compute heuristic 0-1 score and pass it through).
+        _quality = getattr(outcome, "quality_score", None)
+        if _quality is None:
+            _quality = 1.0
         connection.execute(
             """
             INSERT INTO outcomes (workflow_id, job_id, step_name, route, outcome_type,
-                                  created_at, cost_usd, model_used, duration_seconds)
-            VALUES (?, ?, ?, ?, 'success', ?, ?, ?, ?)
+                                  created_at, cost_usd, model_used, duration_seconds, quality_score)
+            VALUES (?, ?, ?, ?, 'success', ?, ?, ?, ?, ?)
             """,
             (
                 workflow["id"], job["id"], job["step_name"], job["route"], now_iso(),
                 float(_succ_cost.get("cost_usd") or 0.0),
                 str(_succ_cost.get("model") or ""),
                 float(_succ_duration),
+                float(_quality),
             ),
         )
     except Exception as exc:

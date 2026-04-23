@@ -1,0 +1,20 @@
+{
+  "_version": 1,
+  "_comment": "Per-workflow daily $ ceilings. TIER-0 #3 (2026-04-23). Initial caps = 5x observed daily spend per kind. Override globally via RICK_BUDGET_FORCE=1. Telegram alert at 80% used.",
+  "_alert_threshold_pct": 0.80,
+  "_strategy_panel_daily_usd_cap": 15.00,
+  "caps_usd_per_day": {
+    "deal_close": 5.00,
+    "signal_hunt": 3.00,
+    "content_gen": 4.00,
+    "info_product_launch": 6.00,
+    "lead_intake": 2.00,
+    "tenant_retention": 3.00,
+    "post_purchase_fulfillment": 2.00,
+    "initiative": 0.00,
+    "fiverr": 2.00,
+    "upwork": 2.00,
+    "experiment": 3.00,
+    "_default": 5.00
+  }
+}

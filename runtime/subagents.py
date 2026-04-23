@@ -607,6 +607,42 @@ def dispatch_openclaw(
         model=winner_model,
     )
 
+    # TIER-0 #4 OpenClaw boundary cost-logger (2026-04-23). Mirror the
+    # subagent's real spend into outcomes table so daily ROI digest +
+    # self-funding telemetry see TRUE burn (was undercounting 5-10x because
+    # subagent_heartbeat was siloed from outcomes).
+    # Wrapped try/except — never block the dispatch return on a logger bug.
+    # Disable via RICK_COSTLOG_OPENCLAW_DISABLED=1.
+    if os.getenv("RICK_COSTLOG_OPENCLAW_DISABLED", "").strip().lower() not in ("1", "true", "yes"):
+        try:
+            _log_conn = _open_runtime_db()
+            if _log_conn is not None:
+                quality = 1.0 if status == "completed" else 0.0
+                _log_conn.execute(
+                    """
+                    INSERT INTO outcomes
+                        (workflow_id, job_id, step_name, route, outcome_type,
+                         created_at, cost_usd, model_used, duration_seconds, quality_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        parent_workflow_id or "",
+                        parent_job_id or "",
+                        f"subagent_{spec.name.lower()}",
+                        f"subagent_{spec.lane}",
+                        "success" if status == "completed" else "failure",
+                        datetime.now().isoformat(timespec="seconds"),
+                        float(cost_usd),
+                        winner_model,
+                        0.0,  # duration_seconds — could be added; subagent times itself via started_at→finished_at
+                        float(quality),
+                    ),
+                )
+                _log_conn.commit()
+                _log_conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     return delegation
 
 

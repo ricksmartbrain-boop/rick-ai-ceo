@@ -102,6 +102,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("analytics_snapshots", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("lead_aliases", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("prospect_graph_edges", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("cost_attribution", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -308,6 +309,30 @@ def init_db(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_outcomes_type
         ON outcomes(outcome_type, created_at);
+
+        -- Cost attribution table (TIER-0 #1, 2026-04-23) — links every
+        -- outcome row to its eventual workflow terminal status + revenue
+        -- attribution. Lets daily ROI digest answer: "$ spent on workflows
+        -- that produced revenue vs $ spent on workflows that died."
+        -- Pure additive table; no FK cascade so reverting is safe.
+        CREATE TABLE IF NOT EXISTS cost_attribution (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            outcome_id INTEGER NOT NULL,
+            workflow_id TEXT NOT NULL DEFAULT '',
+            workflow_kind TEXT NOT NULL DEFAULT '',
+            terminal_status TEXT NOT NULL DEFAULT 'pending',
+            converted_to_revenue INTEGER NOT NULL DEFAULT 0,
+            revenue_usd REAL NOT NULL DEFAULT 0.0,
+            attributed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(outcome_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cost_attribution_workflow
+            ON cost_attribution(workflow_id);
+        CREATE INDEX IF NOT EXISTS idx_cost_attribution_kind_status
+            ON cost_attribution(workflow_kind, terminal_status, attributed_at);
+        CREATE INDEX IF NOT EXISTS idx_cost_attribution_revenue
+            ON cost_attribution(converted_to_revenue, attributed_at);
 
         CREATE INDEX IF NOT EXISTS idx_approvals_workflow
         ON approvals(workflow_id);
