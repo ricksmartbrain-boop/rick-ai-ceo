@@ -81,6 +81,49 @@ def _suppression_count() -> int:
         return 0
 
 
+def _funnel_24h() -> dict:
+    """Inbound → classified → routed → drafted funnel for last 24h.
+    Reads today's triage JSONL since that's where router persists state.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    triage_file = DATA_ROOT / "mailbox" / "triage" / f"inbound-{today}.jsonl"
+    funnel = {"inbound": 0, "classified": 0, "warm_class": 0,
+              "routed": 0, "drafted": 0, "suppressed": 0, "self_send_skipped": 0}
+    if not triage_file.is_file():
+        return funnel
+    warm = {"sales_inquiry", "objection_with_counter", "pricing_question",
+            "scheduling_request", "referral_request"}
+    try:
+        for line in triage_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            funnel["inbound"] += 1
+            cls = row.get("classification")
+            if cls and cls != "unknown":
+                funnel["classified"] += 1
+            if cls in warm:
+                funnel["warm_class"] += 1
+            if row.get("router_ran_at"):
+                rr = row.get("router_result") or {}
+                action = rr.get("action", "")
+                if action == "skip-self-send":
+                    funnel["self_send_skipped"] += 1
+                elif action in ("unsubscribed", "marked-lost"):
+                    funnel["suppressed"] += 1
+                elif action == "drafted":
+                    funnel["drafted"] += 1
+                    funnel["routed"] += 1
+                else:
+                    funnel["routed"] += 1
+    except OSError:
+        pass
+    return funnel
+
+
 def gather() -> dict:
     cutoff_24h = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
     summary = {"since": cutoff_24h, "ts": _now_iso()}
@@ -148,6 +191,7 @@ def gather() -> dict:
 
     summary["drafts_pending"] = _count_drafts()
     summary["suppression_total"] = _suppression_count()
+    summary["funnel"] = _funnel_24h()
     return summary
 
 
@@ -192,6 +236,17 @@ def render(s: dict) -> str:
 
     threads = s.get("active_email_threads", 0)
     lines.append(f"*Active email threads*: {threads}")
+
+    f = s.get("funnel") or {}
+    if f.get("inbound"):
+        lines.append("")
+        lines.append(
+            f"*Inbox funnel*: {f.get('inbound', 0)} in → {f.get('classified', 0)} classified "
+            f"→ {f.get('warm_class', 0)} warm → {f.get('drafted', 0)} drafted "
+            f"({f.get('suppressed', 0)} suppressed, {f.get('self_send_skipped', 0)} self-send)"
+        )
+        if f.get("warm_class", 0) > 0 and f.get("drafted", 0) == 0:
+            lines.append(f"  ⚠️ {f.get('warm_class')} warm classifications, 0 drafts produced — funnel break")
 
     drafts = s.get("drafts_pending", {})
     if drafts.get("total", 0) > 0:
