@@ -1192,8 +1192,51 @@ def generate_text(route: str, prompt: str, fallback: str) -> GenerationResult:
         # Pre-check: panels cost ~4x a single call. If budget is tight, skip panel.
         spent = daily_spend_usd()
         cap = _get_daily_cap()
+        # TIER-0 #7 (2026-04-23) — explicit per-day strategy-panel ceiling on
+        # top of the global cap. Loaded from config/workflow-budgets.json
+        # (_strategy_panel_daily_usd_cap, default $15). Override:
+        # RICK_STRATEGY_PANEL_FORCE=1 or RICK_STRATEGY_PANEL_DAILY_CAP_USD=N.
+        # Reason: agent finding panel was the biggest $/insight waster at
+        # ~$25/call × multiple/day with no quality measurement.
+        try:
+            panel_cap_env = os.getenv("RICK_STRATEGY_PANEL_DAILY_CAP_USD", "").strip()
+            if panel_cap_env:
+                panel_cap = float(panel_cap_env)
+            else:
+                # Lazy-import to avoid circular deps + keep this hot-path cheap.
+                import json as _json, pathlib as _pl
+                _bp = _pl.Path(os.getenv("RICK_WORKFLOW_BUDGETS_FILE",
+                              str(_pl.Path(__file__).resolve().parent.parent / "config" / "workflow-budgets.json")))
+                if _bp.exists():
+                    panel_cap = float(_json.loads(_bp.read_text(encoding="utf-8")).get("_strategy_panel_daily_usd_cap", 15.0))
+                else:
+                    panel_cap = 15.0
+        except Exception:  # noqa: BLE001 — fail open to default cap
+            panel_cap = 15.0
+        panel_force = os.getenv("RICK_STRATEGY_PANEL_FORCE", "").strip().lower() in ("1", "true", "yes")
+        # Compute today's strategy-panel spend specifically (daily_spend_usd is
+        # all routes; we want the strategy slice). Conservative: assume each
+        # historical strategy call = panel call (overcounts by ~25% — that's
+        # fine for a hard ceiling).
+        panel_spent_today = 0.0
+        try:
+            from runtime.db import connect as _conn
+            _c = _conn()
+            row = _c.execute(
+                "SELECT COALESCE(SUM(cost_usd),0) FROM outcomes "
+                "WHERE route = 'strategy' AND created_at >= datetime('now','start of day')"
+            ).fetchone()
+            panel_spent_today = float(row[0]) if row else 0.0
+            _c.close()
+        except Exception:  # noqa: BLE001
+            pass
+        panel_blocked_by_cap = (not panel_force) and (panel_cap > 0) and (panel_spent_today >= panel_cap)
+
         if cap > 0 and spent >= cap * 0.95:
-            # Budget >75% consumed — degrade to single-model strategy
+            # Global daily cap nearly hit — degrade to single-model strategy
+            pass
+        elif panel_blocked_by_cap:
+            # Per-panel daily cap hit — degrade. Telegram alert via finalize notes.
             pass
         else:
             return generate_strategy_panel(route, prompt, fallback)

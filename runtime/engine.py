@@ -5500,6 +5500,74 @@ def sweep_stale_running_jobs(connection: sqlite3.Connection) -> int:
     return len(stale)
 
 
+def escalate_stuck_workflows(connection: sqlite3.Connection, days: int = 3) -> int:
+    """TIER-0 #5 (2026-04-23). ESCALATE workflows stuck active/blocked >N days
+    with same last_error across all jobs.
+
+    DESIGN CHOICE per E3 risk audit: escalate, do NOT auto-cancel. Auto-cancel
+    risks killing legitimate dependency-blocked work (e.g. "The Agent Memory
+    Playbook" stuck 18d on LinkedIn auth). The cancel path waits for a
+    `cancellable_error_patterns` config which we don't have yet.
+
+    Disabled via RICK_STUCK_ESCALATE_DISABLED=1.
+    """
+    if os.getenv("RICK_STUCK_ESCALATE_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return 0
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, kind, title, project, lane, stage, status, updated_at
+              FROM workflows
+             WHERE status IN ('active','blocked')
+               AND kind != 'initiative'
+               AND updated_at < ?
+             LIMIT 20
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return 0
+    escalated_n = 0
+    for w in rows:
+        # Has Rick already been alerted about this workflow stalling? Only one
+        # alert per workflow per week. Use execution_ledger to dedupe.
+        try:
+            already = connection.execute(
+                "SELECT COUNT(*) FROM ledger_entries "
+                "WHERE entry_kind = 'escalated' "
+                "  AND entry_notes LIKE ? "
+                "  AND created_at > datetime('now','-7 days')",
+                (f"%stuck_workflow:{w['id']}%",),
+            ).fetchone()
+            if already and already[0] > 0:
+                continue
+        except sqlite3.OperationalError:
+            # ledger_entries table may not exist on older instances — fall through
+            pass
+        try:
+            notify_operator(
+                connection,
+                f"⏳ Workflow stuck >{days}d — needs your eyes: '{w['title']}' (kind={w['kind']}, "
+                f"stage={w['stage']}, status={w['status']}). Last touched {w['updated_at']}. "
+                f"Override + cancel via UPDATE workflows SET status='cancelled' WHERE id='{w['id']}'.",
+                workflow_id=w["id"], lane=w["lane"], purpose="escalation",
+            )
+            append_execution_ledger(
+                "escalated",
+                f"Stuck workflow needs human review: {w['title']}",
+                status="escalated",
+                area="runtime",
+                project=w["project"],
+                route="heartbeat",
+                notes=f"stuck_workflow:{w['id']} kind={w['kind']} stage={w['stage']} stuck_days>={days}",
+            )
+            escalated_n += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return escalated_n
+
+
 def reap_stuck_subagents(connection: sqlite3.Connection, grace_min: int = 20) -> int:
     """Flip subagent_heartbeat rows that missed their lease to status='ghosted'.
 
@@ -5618,6 +5686,14 @@ def heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     except Exception as exc:
         from runtime.log import get_logger
         get_logger("rick.engine").error("Subagent reap/merge failed: %s", exc)
+    # TIER-0 #5 (2026-04-23) — escalate workflows stuck >3 days. Never cancel
+    # automatically (per E3 risk audit: would kill legitimate dependency-blocked
+    # work). Telegram alert + ledger entry; Vlad decides cancel vs unblock.
+    try:
+        escalate_stuck_workflows(connection)
+    except Exception as exc:
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning("Stuck-workflow escalator failed: %s", exc)
     open_approvals = connection.execute("SELECT COUNT(*) AS count FROM approvals WHERE status = 'open'").fetchone()["count"]
     queued_jobs = connection.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()["count"]
     blocked_jobs = connection.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'blocked'").fetchone()["count"]
