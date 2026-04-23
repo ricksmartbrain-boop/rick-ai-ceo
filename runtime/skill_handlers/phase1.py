@@ -152,20 +152,95 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         except json.JSONDecodeError:
             pass
 
-    prompt = (
-        "You are Rick, an AI CEO scoring a lead.\n\n"
-        f"Lead dossier: {json.dumps(dossier)}\n\n"
+    # === Wave 3 Thompson variants — lead_qualify (2026-04-23) ===
+    # Three scoring philosophies compete: strict (default reject), balanced
+    # (benefit of doubt on inbound), warm_friendly (bar lowered while Rick is
+    # early-stage and every conversation matters). All produce the same JSON
+    # schema — only the SCORING DISCIPLINE differs.
+    qualify_strict = (
+        "You are Rick, an AI CEO scoring a lead — STRICT MODE. Default to skepticism: "
+        "if signals are weak or ambiguous, score LOW and lean toward disqualification. "
+        "We protect founder time; only clearly-strong leads get through.\n\n"
+        "Lead dossier: {{DOSSIER}}\n\n"
         "Score this lead 1-10 on:\n"
-        "- intent_score: How strong is their purchase intent?\n"
-        "- fit_score: How well do they match our ICP (founders, operators, builders)?\n"
-        "- budget_score: Can they afford the recommended product?\n"
-        "- urgency_score: How soon will they buy?\n\n"
-        "Output JSON with: intent_score, fit_score, budget_score, urgency_score, total_score (average),\n"
-        "qualification: 'hot' (8+), 'warm' (5-7), or 'cold' (<5),\n"
-        "recommended_product: best product match with price,\n"
-        "disqualify_reason: null or string if they shouldn't be pitched.\n"
+        "- intent_score: How strong is their purchase intent? (vague interest = 3-4, explicit ask = 7+)\n"
+        "- fit_score: How well do they match our ICP (founders, operators, builders)? "
+        "(no signal = 3-4, named role match = 7+)\n"
+        "- budget_score: Can they afford the recommended product? (no budget signal = 3-4, "
+        "explicit budget mention = 7+)\n"
+        "- urgency_score: How soon will they buy? (no timeline = 3, 'someday' = 4-5, "
+        "'this month' = 8+)\n\n"
+        "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
+        "total_score (average rounded to 1 decimal),\n"
+        "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
+        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
+        "managed-499, enterprise-2500),\n"
+        "disqualify_reason: string explanation if total_score < 5 OR clear vendor pitch / spam / "
+        "off-ICP, else null.\n"
         "Output ONLY valid JSON."
     )
+    qualify_balanced = (
+        "You are Rick, an AI CEO scoring a lead — BALANCED MODE. Inbound replies get the benefit "
+        "of the doubt — they took the time to write. Reject only on CLEAR signals: vendor pitch, "
+        "off-ICP, or explicit 'not interested'. When ambiguous, score in the middle and let the "
+        "pitch stage qualify further.\n\n"
+        "Lead dossier: {{DOSSIER}}\n\n"
+        "Score this lead 1-10 on:\n"
+        "- intent_score: How strong is their purchase intent? (replied at all = 5+, asked a "
+        "question = 6+, explicit buy signal = 8+)\n"
+        "- fit_score: How well do they match our ICP (founders, operators, builders)? "
+        "(unknown = 5, plausible = 6-7, confirmed = 8+)\n"
+        "- budget_score: Can they afford the recommended product? (unknown = 5 — most can afford "
+        "$9-29; only score below 5 if explicit budget objection)\n"
+        "- urgency_score: How soon will they buy? (engaged in conversation = 5+, "
+        "asked about pricing/timing = 7+)\n\n"
+        "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
+        "total_score (average rounded to 1 decimal),\n"
+        "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
+        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
+        "managed-499, enterprise-2500),\n"
+        "disqualify_reason: string ONLY if vendor pitch / spam / explicit off-fit; otherwise null "
+        "even when total_score < 5 (let the pitch stage decide).\n"
+        "Output ONLY valid JSON."
+    )
+    qualify_warm = (
+        "You are Rick, an AI CEO scoring a lead — WARM MODE. Rick is early-stage; every real human "
+        "conversation has option value. Default to 'warm' unless there is an EXPLICIT disqualify "
+        "signal (vendor pitch, spam, abuse, explicit 'remove me'). Lower the bar — a $9 starter-kit "
+        "buyer today is data and a future testimonial.\n\n"
+        "Lead dossier: {{DOSSIER}}\n\n"
+        "Score this lead 1-10 on (be generous, but stay honest about the schema):\n"
+        "- intent_score: How strong is their purchase intent? (any engagement = 6+, "
+        "any question = 7+)\n"
+        "- fit_score: How well do they match our ICP? (unknown = 6, anyone building or running "
+        "anything = 7+)\n"
+        "- budget_score: Can they afford the recommended product? (unknown = 6 — recommend the $9 "
+        "or $29 tier when in doubt; never go below 5 unless explicit no-budget)\n"
+        "- urgency_score: How soon will they buy? (engaged = 6, asked anything specific = 7+)\n\n"
+        "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
+        "total_score (average rounded to 1 decimal),\n"
+        "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5 — should be RARE in this mode),\n"
+        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
+        "managed-499, enterprise-2500). Default to starter-kit-9 or playbook-29 unless clear "
+        "signal for higher tier.\n"
+        "disqualify_reason: string ONLY for explicit disqualify signals (vendor / spam / abuse / "
+        "explicit opt-out); null otherwise.\n"
+        "Output ONLY valid JSON."
+    )
+
+    try:
+        from runtime import variants as _variants
+        _variants.register_variant(connection, "lead_qualify", qualify_strict, variant_id="strict")
+        _variants.register_variant(connection, "lead_qualify", qualify_balanced, variant_id="balanced")
+        _variants.register_variant(connection, "lead_qualify", qualify_warm, variant_id="warm_friendly")
+        picked = _variants.pick_variant(connection, "lead_qualify")
+        prompt_template = picked["prompt_text"] if picked else qualify_strict
+        active_variant_id = picked["variant_id"] if picked else "strict"
+    except Exception:
+        prompt_template = qualify_strict
+        active_variant_id = "strict"
+
+    prompt = prompt_template.replace("{{DOSSIER}}", json.dumps(dossier))
     fallback = json.dumps({
         "intent_score": 5, "fit_score": 5, "budget_score": 5, "urgency_score": 5,
         "total_score": 5, "qualification": "warm",
@@ -188,13 +263,52 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
 
     path = write_file(deal_dir / "qualification.json", json.dumps(qualification, indent=2))
 
+    # Variant outcome — quality computed from result fidelity, not human judgement.
+    # 1.0 = passed qualification AND sub-scores internally consistent.
+    # 0.5 = disqualified WITH a reason (still useful — Rick learned to filter).
+    # 0.0 = disqualified with no reason OR schema invalid.
+    quality_score = 0.0
+    try:
+        qual_str = qualification.get("qualification", "")
+        sub_scores = [
+            float(qualification.get("intent_score", 0)),
+            float(qualification.get("fit_score", 0)),
+            float(qualification.get("budget_score", 0)),
+            float(qualification.get("urgency_score", 0)),
+        ]
+        total = float(qualification.get("total_score", 0))
+        sub_avg = sum(sub_scores) / 4.0 if sub_scores else 0.0
+        schema_valid = all(qualification.get(k) is not None for k in (
+            "intent_score", "fit_score", "budget_score", "urgency_score",
+            "total_score", "qualification", "recommended_product",
+        ))
+        if not schema_valid:
+            quality_score = 0.0
+        elif qual_str == "disqualified":
+            disq_reason = qualification.get("disqualify_reason")
+            quality_score = 0.5 if (disq_reason and str(disq_reason).strip()) else 0.0
+        else:
+            # Internally consistent if sub-scores avg matches total within ±1
+            quality_score = 1.0 if abs(sub_avg - total) <= 1.0 else 0.5
+    except (TypeError, ValueError):
+        quality_score = 0.0
+
+    try:
+        from runtime import variants as _variants_record
+        _variants_record.record_variant_outcome(
+            connection, "lead_qualify", active_variant_id,
+            won=quality_score >= 0.7, quality=quality_score, cost_usd=0.0,
+        )
+    except Exception:
+        pass
+
     notify_text = None
     if total_score >= 8:
         notify_text = f"HOT LEAD: {dossier.get('name', lead_id)} scored {total_score}/10 — {qualification.get('recommended_product')}"
 
     return StepOutcome(
-        summary=f"Lead qualified: {qualification.get('qualification')} (score {total_score}/10)",
-        artifacts=[{"kind": "lead-qualification", "title": "Lead Qualification", "path": path, "metadata": qualification}],
+        summary=f"Lead qualified: {qualification.get('qualification')} (score {total_score}/10) [variant={active_variant_id} q={quality_score:.2f}]",
+        artifacts=[{"kind": "lead-qualification", "title": "Lead Qualification", "path": path, "metadata": {**qualification, "variant": active_variant_id, "quality_proxy": quality_score}}],
         workflow_stage="qualified",
         notify_text=notify_text,
     )
@@ -257,10 +371,40 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "No fluff. No 'I hope this finds you well'. First line: '**Subject:**' + 6-8 word subject.\n"
         "Total length: under 600 characters."
     )
+    pitch_style_proof_led = (
+        "You are Rick, an AI CEO. Lead with PROOF before pitch — this prospect has seen too many promises.\n"
+        "Structure (in this exact order):\n"
+        "1. Subject line on first line: '**Subject:**' + a metric-driven 6-10 word subject (e.g., '7 days, 412 drafts, $0.0023 each').\n"
+        "2. Opening paragraph (2-3 sentences): cite ONE specific Rick operational metric from the recent_ops "
+        "block (drafts produced, $/action, workflows completed, etc.) — actual numbers only, no hand-waving.\n"
+        "3. Bridge paragraph (1-2 sentences): connect that metric to THIS prospect's specific pain from the dossier "
+        "(name the pain explicitly).\n"
+        "4. Product paragraph (1-2 sentences): name the product + price + the one outcome they get.\n"
+        "5. CTA: a single sentence ending in {{checkout_url}}.\n"
+        "Tone: confident, factual, zero hype. The metric IS the credibility — don't oversell."
+    )
+    pitch_style_question_led = (
+        "You are Rick, an AI CEO. This is a QUESTION-FIRST pitch — you do NOT pitch in this message. "
+        "You earn the right to pitch by asking ONE specific question.\n"
+        "Structure:\n"
+        "1. Subject on first line: '**Subject:**' + a curious 5-8 word subject framed as a question or hook "
+        "tied to the prospect's intent from the dossier.\n"
+        "2. One-sentence personalized opener that names the prospect's intent (from dossier.intent) and shows "
+        "you actually read about them.\n"
+        "3. ONE specific, pointed question about their pain — must reference a concrete detail from the dossier "
+        "(not generic 'how's business?'). Examples: 'Are you still routing inbound leads manually, or have you "
+        "automated the qualify step yet?'\n"
+        "4. Closing line, EXACTLY: 'If yes — I have a 4-sentence pitch ready. Reply 'go'.'\n"
+        "5. Sign off as '— Rick'.\n"
+        "Total length: under 400 characters. Do NOT include {{checkout_url}}, do NOT mention price, do NOT pitch the product. "
+        "The whole point is to test whether question-first beats pitch-first — so RESIST the urge to sell."
+    )
     try:
         from runtime import variants as _variants
         _variants.register_variant(connection, "pitch_draft", pitch_style_default, variant_id="baseline")
         _variants.register_variant(connection, "pitch_draft", pitch_style_punchy, variant_id="punchy_v1")
+        _variants.register_variant(connection, "pitch_draft", pitch_style_proof_led, variant_id="proof_led")
+        _variants.register_variant(connection, "pitch_draft", pitch_style_question_led, variant_id="question_led")
         picked = _variants.pick_variant(connection, "pitch_draft")
         prompt_style = picked["prompt_text"] if picked else pitch_style_default
         active_variant_id = picked["variant_id"] if picked else "baseline"
