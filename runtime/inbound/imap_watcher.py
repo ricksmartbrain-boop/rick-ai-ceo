@@ -364,6 +364,12 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
                 mail.store(uid, "+FLAGS", "\\Seen")
             except Exception:
                 pass
+            if os.getenv("RICK_GMAIL_LABEL_LIVE", "0").strip().lower() in ("1", "true", "yes"):
+                try:
+                    mail.store(uid, "+X-GM-LABELS", "\"Rick/Seen\"")
+                    summary["labels_applied"] = summary.get("labels_applied", 0) + 1
+                except Exception:
+                    pass
 
     if not dry_run and triage_rows:
         _write_triage(triage_rows)
