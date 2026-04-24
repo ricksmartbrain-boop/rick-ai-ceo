@@ -5131,7 +5131,7 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
             notes=exc.impact_text,
         )
         connection.commit()
-        notify_operator(connection, f"Rick needs approval: {exc.request_text} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approvals")
+        notify_operator(connection, f"Rick needs approval: {exc.request_text} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approval")
         return {"job_id": job["id"], "status": "blocked", "reason": exc.request_text, "approval_id": approval_id}
     except DependencyBlocked as exc:
         mark_job(connection, job["id"], "blocked", blocked_reason=exc.reason)
@@ -5442,11 +5442,11 @@ def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision:
                 workflow_lane=workflow["lane"],
             )
         update_workflow(connection, workflow["id"], status="active", stage="approval-cleared")
-        notify_operator(connection, f"Approval accepted for {workflow['title']} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approvals")
+        notify_operator(connection, f"Approval accepted for {workflow['title']} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approval")
     else:
         mark_job(connection, job["id"], "cancelled", blocked_reason=note or "denied by founder")
         update_workflow(connection, workflow["id"], status="denied", stage="approval-denied", finished_at=stamp)
-        notify_operator(connection, f"Approval denied for {workflow['title']} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approvals")
+        notify_operator(connection, f"Approval denied for {workflow['title']} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approval")
 
     record_event(connection, workflow["id"], job["id"], "approval_resolved", {"approval_id": approval_id, "decision": decision})
     append_execution_ledger(
