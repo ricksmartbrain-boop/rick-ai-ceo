@@ -4,11 +4,46 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
+import signal
 from pathlib import Path
 import sqlite3
 import sys
+
+# 2026-04-24: faulthandler — segfault visibility. Pre-existing daemon
+# segfaults (pid 53429 exit code 11 in run-daemon.sh logs) had ZERO
+# diagnostic info because Python-level handlers can't catch SIGSEGV.
+# Now: faulthandler dumps the C-level traceback to a dedicated log
+# BEFORE the process dies. Also registers SIGUSR1 → dump current state
+# (manual diagnostic without restarting). Override: RICK_FAULTHANDLER_DISABLED=1.
+def _setup_faulthandler() -> None:
+    if os.getenv("RICK_FAULTHANDLER_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        # Dedicated faulthandler log — survives even when daemon log is rotated
+        log_dir = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh_path = log_dir / "daemon-faulthandler.log"
+        # Open in append mode + line-buffered so partial writes survive a crash
+        fh = open(fh_path, "a", buffering=1)
+        # Also dump to stderr so log-tail watchers see it live
+        faulthandler.enable(file=fh, all_threads=True)
+        try:
+            faulthandler.enable(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        # SIGUSR1 → manual state dump (kill -USR1 <pid>)
+        try:
+            faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True)
+        except (AttributeError, ValueError):
+            pass  # SIGUSR1 not available on this platform
+    except Exception as exc:
+        # Never let faulthandler setup itself break the daemon
+        sys.stderr.write(f"[faulthandler-setup] failed: {exc}\n")
+
+_setup_faulthandler()
 
 # Sentry error tracking — init before everything else
 import sentry_sdk

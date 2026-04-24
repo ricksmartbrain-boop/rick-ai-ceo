@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -30,11 +31,38 @@ VELOCITY_LOG = REVENUE_DIR / "velocity.json"
 # Day 1 = launch date
 LAUNCH_DATE = date(2026, 3, 13)  # meetrick.ai live date
 
-# RICK_REVENUE_VELOCITY_LIVE gates the phantom-prone Stripe sum + escalations.
-# Default OFF (dry-run) until the Stripe MRR query is rewritten to filter
-# phantom subs (100%-discount Credits Booster etc.). See
-# rick-vault/revenue/reconciliation-2026-04-20.md for the canonical $9 MRR.
-LIVE = os.getenv("RICK_REVENUE_VELOCITY_LIVE", "0").strip() in ("1", "true", "True", "yes", "on")
+# 2026-04-24: Stripe phantom filter shipped in get_stripe_mrr (_is_phantom).
+# Order of trust:
+#   1. Live Stripe (with filter) — primary
+#   2. Reconciliation file — fallback (Stripe outage / all-filtered)
+#   3. 0.0 — final fallback
+# RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts (recon-first).
+USE_RECON_PRIMARY = os.getenv("RICK_USE_RECONCILIATION_AS_PRIMARY", "0").strip() in ("1", "true", "True", "yes", "on")
+LIVE = True  # legacy flag kept for backward-compat (no-op now)
+
+
+def _is_phantom(sub: dict, now_ts: int) -> tuple[bool, str]:
+    """Same _is_phantom as morning-intelligence.py — kept inline to avoid
+    cross-script import path issues. Filters: non-active status, ≥100%
+    discount coupon, zero-paid+zero-due invoice, expired-but-active subs."""
+    status = sub.get("status", "")
+    if status not in ("active", "trialing"):
+        return True, f"status={status}"
+    discount = sub.get("discount") or {}
+    coupon = (discount.get("coupon") or {}) if isinstance(discount, dict) else {}
+    if coupon.get("percent_off", 0) >= 100:
+        return True, "100% discount coupon"
+    inv = sub.get("latest_invoice") or {}
+    if isinstance(inv, dict):
+        amount_paid = int(inv.get("amount_paid", 0) or 0)
+        amount_due = int(inv.get("amount_due", 0) or 0)
+        if amount_paid == 0 and amount_due == 0:
+            return True, "zero-paid + zero-due invoice"
+    if sub.get("cancel_at_period_end"):
+        period_end = int(sub.get("current_period_end", 0) or 0)
+        if period_end and period_end < now_ts:
+            return True, "cancel_at_period_end + period expired"
+    return False, ""
 
 def days_since_launch() -> int:
     return (TODAY - LAUNCH_DATE).days
@@ -59,40 +87,49 @@ def _mrr_from_reconciliation() -> float | None:
     except (ValueError, TypeError):
         return None
 
-def get_stripe_mrr() -> float:
-    """Return current MRR.
+def _stripe_key() -> str:
+    """Resolve STRIPE_SECRET_KEY from env or rick.env (handles `export ` prefix)."""
+    key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+    if key:
+        return key
+    env_file = Path.home() / ".openclaw" / "workspace" / "config" / "rick.env"
+    if not env_file.exists():
+        env_file = Path.home() / "clawd" / "config" / "rick.env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):].lstrip()
+            if stripped.startswith("STRIPE_SECRET_KEY="):
+                return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
 
-    Order of trust:
-      1. Latest reconciliation-*.md file (hand-curated truth, filters phantom subs)
-      2. If LIVE=1: raw Stripe sum (KNOWN BUGGY — includes 100%-discount phantom subs)
-      3. $0 (graceful fallback — never use stale snapshot.json which contains $547)
-    """
-    real = _mrr_from_reconciliation()
-    if real is not None:
-        return real
 
-    if not LIVE:
-        # Without reconciliation truth + without LIVE flag, refuse to emit a number.
-        # Better to report $0 than to re-introduce the phantom $547.
-        return 0.0
-
-    # LIVE=1 path: hit Stripe directly. NOTE: this still includes phantom
-    # Credits Booster subs (100% discount, $0 actually paid). Fix is to
-    # filter by latest_invoice.amount_paid > 0 — TODO before flipping LIVE on.
-    import urllib.request
-    api_key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+def _stripe_mrr_filtered() -> float | None:
+    """Live Stripe MRR with phantom filter. Returns None on fetch failure."""
+    api_key = _stripe_key()
     if not api_key:
-        return 0.0
+        return None
     try:
-        url = "https://api.stripe.com/v1/subscriptions?status=active&limit=100"
+        import urllib.request, base64, time as _time
+        url = "https://api.stripe.com/v1/subscriptions?status=active&limit=100&expand[]=data.latest_invoice"
         req = urllib.request.Request(url)
-        import base64
         creds = base64.b64encode(f"{api_key}:".encode()).decode()
         req.add_header("Authorization", f"Basic {creds}")
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
+        now_ts = int(_time.time())
         mrr = 0.0
+        included = 0
+        filtered = 0
         for sub in data.get("data", []):
+            is_phantom, reason = _is_phantom(sub, now_ts)
+            sub_id = sub.get("id", "?")
+            if is_phantom:
+                print(f"[revenue-velocity] FILTERED sub={sub_id} reason={reason}", file=sys.stderr)
+                filtered += 1
+                continue
+            included += 1
             for item in sub.get("items", {}).get("data", []):
                 price = item.get("price", {})
                 amt = price.get("unit_amount", 0) or 0
@@ -101,9 +138,38 @@ def get_stripe_mrr() -> float:
                     mrr += amt / 100
                 elif interval == "year":
                     mrr += amt / 100 / 12
+        print(f"[revenue-velocity] Stripe MRR=${mrr:.2f} (included {included}, filtered {filtered})", file=sys.stderr)
         return mrr
-    except Exception:
-        return 0.0
+    except Exception as exc:
+        print(f"[revenue-velocity] Stripe fetch failed: {exc}", file=sys.stderr)
+        return None
+
+
+def get_stripe_mrr() -> float:
+    """Return current MRR.
+
+    Order of trust (2026-04-24):
+      1. Live Stripe (filtered for phantoms via _is_phantom)
+      2. Reconciliation file (Stripe outage / all-filtered fallback)
+      3. 0.0 (final fallback)
+
+    RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts (recon-first).
+    """
+    if USE_RECON_PRIMARY:
+        real = _mrr_from_reconciliation()
+        if real is not None:
+            return real
+        live_mrr = _stripe_mrr_filtered()
+        return live_mrr if live_mrr is not None else 0.0
+
+    # Default: Stripe primary
+    live_mrr = _stripe_mrr_filtered()
+    if live_mrr is not None and live_mrr > 0:
+        return live_mrr
+    real = _mrr_from_reconciliation()
+    if real is not None:
+        return real
+    return 0.0
 
 def load_velocity_log() -> dict:
     if VELOCITY_LOG.exists():

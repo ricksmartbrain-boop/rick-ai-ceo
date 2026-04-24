@@ -21,11 +21,45 @@ WORKSPACE = Path(os.getenv("RICK_WORKSPACE_ROOT", str(Path.home() / ".openclaw/w
 TODAY = date.today().isoformat()
 YESTERDAY = (date.today() - timedelta(days=1)).isoformat()
 
-# RICK_REVENUE_VELOCITY_LIVE gates the phantom-prone Stripe sum.
-# Default OFF until the Stripe MRR query filters phantom subs (100%-discount
-# Credits Booster). Canonical truth lives in
-# rick-vault/revenue/reconciliation-*.md.
-LIVE = os.getenv("RICK_REVENUE_VELOCITY_LIVE", "0").strip() in ("1", "true", "True", "yes", "on")
+# 2026-04-24: Stripe is now phantom-filtered natively (see _is_phantom).
+# Order of trust:
+#   1. Live Stripe (with filter) — primary
+#   2. Reconciliation file — fallback (Stripe outage / all-filtered edge case)
+#   3. 0.0 — final fallback
+# RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts to old behavior (recon-first).
+USE_RECON_PRIMARY = os.getenv("RICK_USE_RECONCILIATION_AS_PRIMARY", "0").strip() in ("1", "true", "True", "yes", "on")
+# Legacy flag kept for backward-compat (no-op now — Stripe always tried)
+LIVE = True
+
+
+def _is_phantom(sub: dict, now_ts: int) -> tuple[bool, str]:
+    """Return (is_phantom, reason). Excludes sub from MRR computation when:
+      - status != active/trialing
+      - 100%-discount coupon (Credits Booster pattern)
+      - latest_invoice has $0 paid AND $0 due (free trial / fully discounted)
+      - cancel_at_period_end + period already expired
+
+    The 100%-discount filter is the primary fix — that was the $269×2 phantom.
+    """
+    status = sub.get("status", "")
+    if status not in ("active", "trialing"):
+        return True, f"status={status}"
+    discount = sub.get("discount") or {}
+    coupon = (discount.get("coupon") or {}) if isinstance(discount, dict) else {}
+    if coupon.get("percent_off", 0) >= 100:
+        return True, "100% discount coupon"
+    inv = sub.get("latest_invoice") or {}
+    if isinstance(inv, dict):
+        amount_paid = int(inv.get("amount_paid", 0) or 0)
+        amount_due = int(inv.get("amount_due", 0) or 0)
+        if amount_paid == 0 and amount_due == 0:
+            return True, "zero-paid + zero-due invoice"
+    if sub.get("cancel_at_period_end"):
+        period_end = int(sub.get("current_period_end", 0) or 0)
+        if period_end and period_end < now_ts:
+            return True, "cancel_at_period_end + period expired"
+    return False, ""
+
 
 # ── Stripe snapshot ───────────────────────────────────────────────────────────
 def _mrr_from_reconciliation() -> tuple[float, int] | None:
@@ -54,25 +88,27 @@ def _mrr_from_reconciliation() -> tuple[float, int] | None:
 def get_stripe_snapshot() -> dict:
     """Return MRR snapshot.
 
-    Order of trust:
-      1. Latest reconciliation-*.md file (canonical hand-curated truth)
-      2. If LIVE=1: raw Stripe sum (KNOWN BUGGY — includes phantom $269 subs)
-      3. None / 0 (graceful fallback — refuse to emit phantom $547)
+    Order of trust (2026-04-24 — Stripe primary after _is_phantom filter):
+      1. Live Stripe (filtered for 100%-discount + zero-paid phantoms)
+      2. Reconciliation file (Stripe outage / all-filtered fallback)
+      3. 0.0 (final graceful fallback)
+
+    RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts (recon-first, Stripe fallback).
     """
-    real = _mrr_from_reconciliation()
-    if real is not None:
-        mrr, customers = real
-        # Persist daily snapshot so downstream velocity readers see canonical $9.
-        snap_dir = DATA_ROOT / "revenue"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        today_snap = snap_dir / f"daily-{TODAY}.json"
-        today_snap.write_text(json.dumps({
-            "mrr": mrr,
-            "total_customers": customers,
-            "date": TODAY,
-            "source": "reconciliation",
-        }))
-        return {"mrr": mrr, "total_customers": customers, "new_today": 0}
+    if USE_RECON_PRIMARY:
+        real = _mrr_from_reconciliation()
+        if real is not None:
+            mrr, customers = real
+            snap_dir = DATA_ROOT / "revenue"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            today_snap = snap_dir / f"daily-{TODAY}.json"
+            today_snap.write_text(json.dumps({
+                "mrr": mrr,
+                "total_customers": customers,
+                "date": TODAY,
+                "source": "reconciliation_primary",
+            }))
+            return {"mrr": mrr, "total_customers": customers, "new_today": 0}
 
     if not LIVE:
         # Without reconciliation + without LIVE, refuse to emit. Don't write
@@ -80,33 +116,50 @@ def get_stripe_snapshot() -> dict:
         print("[morning-intelligence] No reconciliation file and RICK_REVENUE_VELOCITY_LIVE=0; skipping snapshot.", file=sys.stderr)
         return {"mrr": None, "total_customers": 0, "new_today": 0, "error": "no_reconciliation_and_live_flag_off"}
 
-    # LIVE=1 path — raw Stripe (still buggy). Kept for parity until rewritten.
+    # Stripe primary path (filtered for phantom subs since 2026-04-24).
     stripe_key = os.getenv("STRIPE_SECRET_KEY", "")
     if not stripe_key:
         env_file = WORKSPACE / "config" / "rick.env"
         if env_file.exists():
             for line in env_file.read_text().splitlines():
-                if line.startswith("STRIPE_SECRET_KEY="):
-                    stripe_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                # Handle both "STRIPE_SECRET_KEY=" and "export STRIPE_SECRET_KEY="
+                stripped = line.strip()
+                if stripped.startswith("export "):
+                    stripped = stripped[len("export "):].lstrip()
+                if stripped.startswith("STRIPE_SECRET_KEY="):
+                    stripe_key = stripped.split("=", 1)[1].strip().strip('"').strip("'")
                     break
     if not stripe_key:
         print("[morning-intelligence] ERROR: STRIPE_SECRET_KEY not found — MRR will be wrong", file=sys.stderr)
         return {"mrr": None, "total_customers": 0, "new_today": 0, "error": "missing_key"}
     try:
-        import urllib.request, base64
+        import urllib.request, base64, time
         creds = base64.b64encode(f"{stripe_key}:".encode()).decode()
+        # 2026-04-24: expand[]=data.latest_invoice so amount_paid filter works inline
         req = urllib.request.Request(
-            "https://api.stripe.com/v1/subscriptions?status=active&limit=100",
+            "https://api.stripe.com/v1/subscriptions?status=active&limit=100&expand[]=data.latest_invoice",
             headers={"Authorization": f"Basic {creds}"}
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
         subs = data.get("data", [])
-        mrr = sum(
-            s.get("plan", {}).get("amount", 0) * s.get("quantity", 1)
-            for s in subs
-        ) / 100
-        customer_ids = set(s.get("customer") for s in subs)
+        # 2026-04-24: filter Credits Booster phantoms (100%-discount + zero-paid).
+        # Pre-fix: $9 + $269 + $269 = $547 phantom. Post-fix: $9 real.
+        now_ts = int(time.time())
+        real_subs = []
+        for sub in subs:
+            is_phantom, reason = _is_phantom(sub, now_ts)
+            sub_id = sub.get("id", "?")
+            cust = sub.get("customer", "?")
+            amount = (sub.get("plan", {}).get("amount", 0) or 0) / 100
+            if is_phantom:
+                print(f"[morning-intelligence] FILTERED sub={sub_id} cust={cust} amount=${amount:.2f} reason={reason}", file=sys.stderr)
+                continue
+            real_subs.append(sub)
+            print(f"[morning-intelligence] INCLUDED sub={sub_id} cust={cust} amount=${amount:.2f}", file=sys.stderr)
+        mrr_cents = sum(int(s.get("plan", {}).get("amount", 0) or 0) * int(s.get("quantity", 1) or 1) for s in real_subs)
+        mrr = mrr_cents / 100.0
+        customer_ids = set(s.get("customer") for s in real_subs)
         snap_dir = DATA_ROOT / "revenue"
         snap_dir.mkdir(parents=True, exist_ok=True)
         today_snap = snap_dir / f"daily-{TODAY}.json"
@@ -114,12 +167,25 @@ def get_stripe_snapshot() -> dict:
             "mrr": mrr,
             "total_customers": len(customer_ids),
             "date": TODAY,
-            "source": "stripe_raw_unfiltered",
+            "source": "stripe_filtered",
+            "phantoms_filtered": len(subs) - len(real_subs),
         }))
         return {"mrr": mrr, "total_customers": len(customer_ids), "new_today": 0}
     except Exception as e:
         print(f"[morning-intelligence] ERROR: Stripe API call failed: {e}", file=sys.stderr)
-        # Refuse to fall back to snapshot.json (still contains stale $547).
+        # 2026-04-24: graceful fallback to reconciliation file if Stripe fetch fails.
+        real = _mrr_from_reconciliation()
+        if real is not None:
+            mrr, customers = real
+            print(f"[morning-intelligence] Recovered via reconciliation: ${mrr} / {customers} customers", file=sys.stderr)
+            snap_dir = DATA_ROOT / "revenue"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            today_snap = snap_dir / f"daily-{TODAY}.json"
+            today_snap.write_text(json.dumps({
+                "mrr": mrr, "total_customers": customers, "date": TODAY,
+                "source": "reconciliation_fallback", "stripe_error": str(e)[:200],
+            }))
+            return {"mrr": mrr, "total_customers": customers, "new_today": 0}
         return {"mrr": None, "total_customers": 0, "new_today": 0, "error": str(e)}
 
 # ── X signal summary ─────────────────────────────────────────────────────────
