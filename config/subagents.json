@@ -106,8 +106,8 @@
       "approval_required": [],
       "auto_actions": ["export_winner_to_hive", "import_global_best", "vet_imported_variant"],
       "max_spend_usd": 1.0,
-      "active": false,
-      "_note": "Activate after Rick Prime registration on Railway is fixed (currently rick.env creds map to Newton — would corrupt customer record). Then this persona owns hive-sync.py."
+      "active": true,
+      "_note": "Activated 2026-04-24 after Rick Prime registration fix (railway pg UPDATE synced rick_secret to local rick.env; /heartbeat returns ok:true). This Mac IS Newton's rick — hive sync now ships local effective_patterns + skill_variants wins to peer Ricks (PII-scrubbed) and pulls global-best back. Sable owns hive-sync.py."
     }
   },
   "delegation_rules": {
