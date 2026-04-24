@@ -2,6 +2,16 @@
 # Usage: bash tg-topic.sh <topic-name> "message"
 # Maps friendly names to thread IDs for both groups
 
+if [ -z "${RICK_TELEGRAM_BOT_TOKEN:-}" ]; then
+  for ENV_FILE in "$HOME/.openclaw/workspace/config/rick.env" "$HOME/clawd/config/rick.env"; do
+    if [ -f "$ENV_FILE" ]; then
+      # shellcheck disable=SC1090
+      source "$ENV_FILE"
+      break
+    fi
+  done
+fi
+
 BOT_TOKEN="${RICK_TELEGRAM_BOT_TOKEN:?Set RICK_TELEGRAM_BOT_TOKEN}"
 TEAM_CHAT="${RICK_TEAM_CHAT_ID:--1003781085932}"
 WAR_ROOM="${RICK_WAR_ROOM_CHAT_ID:--1003817549117}"
