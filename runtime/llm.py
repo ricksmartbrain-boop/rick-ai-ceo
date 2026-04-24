@@ -91,7 +91,7 @@ ROUTES = {
     },
     "review": {
         "env": "RICK_MODEL_ANTHROPIC_STRATEGIC",
-        "default": "claude-opus-4-6",
+        "default": "claude-opus-4-7",
         "provider": "anthropic",
     },
     "analysis": {
@@ -151,7 +151,7 @@ ROUTE_REASONING_EFFORT: dict[str, str] = {
 }
 STRATEGY_PANEL_DEFAULTS = (
     ("openai", "RICK_MODEL_OPENAI_STRATEGIC_PRO", "gpt-5.4"),
-    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-6"),
+    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-7"),
     ("google", "RICK_MODEL_GOOGLE_WORKHORSE", "gemini-3.1-pro-preview"),
 )
 ROUTE_FALLBACK_DEFAULTS = {
@@ -159,12 +159,12 @@ ROUTE_FALLBACK_DEFAULTS = {
         ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
         ("openai", "gpt-5.3-codex"),
-        ("anthropic", "claude-opus-4-6"),
+        ("anthropic", "claude-opus-4-7"),
     ),
     "writing": (
         ("openai", "gpt-5.4"),
         ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-opus-4-6"),
+        ("anthropic", "claude-opus-4-7"),
     ),
     "review": (
         ("google", "gemini-3.1-pro-preview"),
