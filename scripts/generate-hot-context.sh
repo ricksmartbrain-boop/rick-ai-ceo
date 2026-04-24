@@ -97,10 +97,17 @@ else:
 echo ""
 
 echo "## Recent Wins (last 48h)"
+# Filter the phantom $547 MRR / 538-velocity that legacy daily-note emitters keep
+# surfacing. Real MRR is on the dedicated MRR line above. Tier-2 follow-up:
+# patch the upstream emitter (velocity/Stripe-poll cron writing $547 into notes).
 if [ -f "$DAILY" ]; then
-    grep -i "shipped\|won\|launched\|paid\|revenue\|completed\|✅" "$DAILY" 2>/dev/null | head -3 | sed 's/^/- /' || echo "- None logged today"
+    grep -i "shipped\|won\|launched\|paid\|revenue\|completed\|✅" "$DAILY" 2>/dev/null \
+        | grep -ivE 'MRR[ =:]*\$?547|velocity.*538' \
+        | head -3 | sed 's/^/- /' || echo "- None logged today"
 elif [ -f "$YESTERDAY" ]; then
-    grep -i "shipped\|won\|launched\|paid\|revenue\|completed\|✅" "$YESTERDAY" 2>/dev/null | head -3 | sed 's/^/- /' || echo "- None logged yesterday"
+    grep -i "shipped\|won\|launched\|paid\|revenue\|completed\|✅" "$YESTERDAY" 2>/dev/null \
+        | grep -ivE 'MRR[ =:]*\$?547|velocity.*538' \
+        | head -3 | sed 's/^/- /' || echo "- None logged yesterday"
 else
     echo "- No daily notes found"
 fi
