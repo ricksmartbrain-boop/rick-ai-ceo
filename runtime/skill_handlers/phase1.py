@@ -38,6 +38,27 @@ from runtime.llm import generate_text
 # Skill 1: deal-closer — Autonomous Inbound-to-Close Pipeline
 # ---------------------------------------------------------------------------
 
+def _resolve_deal_dir(slug: str) -> Path:
+    """Resolve a deal directory, preferring `~/rick-vault/deals/<slug>/` (the
+    handler-native path) but falling back to `~/rick-vault/projects/deals/<slug>/`
+    (where Iris and other subagents write qualify.md / intake.md).
+
+    Two parallel deal trees exist by historical accident. Without this fallback,
+    handler reads return empty even when Iris has produced rich qualification
+    artifacts — verified live with virtueofvague.com (wf_dcf90a9e7847) where
+    pitch_send shipped a "Pitch not found." placeholder despite Iris having
+    written a thorough qualify.md elsewhere.
+    """
+    primary = DATA_ROOT / "deals" / slug
+    fallback = DATA_ROOT / "projects" / "deals" / slug
+    if primary.is_dir() and any(primary.iterdir()):
+        return primary
+    if fallback.is_dir() and any(fallback.iterdir()):
+        return fallback
+    # Default to primary path even if empty (callers may write into it)
+    return primary
+
+
 def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, job: sqlite3.Row) -> StepOutcome:
     """Ingest lead from any source (email, X DM, Fiverr, PH, website) and build profile."""
     context = json_loads(workflow["context_json"])
@@ -144,7 +165,7 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
 
     # Load dossier from previous step
     lead_id = trigger.get("email", trigger.get("name", "unknown"))
-    deal_dir = DATA_ROOT / "deals" / slugify(lead_id)
+    deal_dir = _resolve_deal_dir(slugify(lead_id))
     dossier_path = deal_dir / "lead-dossier.json"
     dossier = {}
     if dossier_path.exists():
@@ -152,6 +173,17 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
             dossier = json.loads(dossier_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
+    # Fallback: parse Iris's intake.md (markdown not JSON) — no schema match
+    # but extract enough signal so downstream steps aren't running blind.
+    if not dossier:
+        intake_md = deal_dir / "intake.md"
+        if intake_md.exists():
+            try:
+                txt = intake_md.read_text(encoding="utf-8", errors="replace")
+                dossier = {"name": lead_id, "summary": txt[:600],
+                           "source": "iris-intake", "best_product_match": "playbook-29"}
+            except OSError:
+                pass
 
     # === Wave 3 Thompson variants — lead_qualify (2026-04-23) ===
     # Three scoring philosophies compete: strict (default reject), balanced
@@ -320,7 +352,7 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     context = json_loads(workflow["context_json"])
     trigger = context.get("trigger_payload", {})
     lead_id = trigger.get("email", trigger.get("name", "unknown"))
-    deal_dir = DATA_ROOT / "deals" / slugify(lead_id)
+    deal_dir = _resolve_deal_dir(slugify(lead_id))
 
     dossier = {}
     qualification = {}
@@ -467,7 +499,7 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
     context = json_loads(workflow["context_json"])
     trigger = context.get("trigger_payload", {})
     lead_id = trigger.get("email", trigger.get("name", "unknown"))
-    deal_dir = DATA_ROOT / "deals" / slugify(lead_id)
+    deal_dir = _resolve_deal_dir(slugify(lead_id))
 
     qualification = {}
     qpath = deal_dir / "qualification.json"
@@ -567,7 +599,7 @@ def handle_followup_sequence(connection: sqlite3.Connection, workflow: sqlite3.R
     context = json_loads(workflow["context_json"])
     trigger = context.get("trigger_payload", {})
     lead_id = trigger.get("email", trigger.get("name", "unknown"))
-    deal_dir = DATA_ROOT / "deals" / slugify(lead_id)
+    deal_dir = _resolve_deal_dir(slugify(lead_id))
 
     dossier = {}
     dp = deal_dir / "lead-dossier.json"
@@ -637,7 +669,7 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
     context = json_loads(workflow["context_json"])
     trigger = context.get("trigger_payload", {})
     lead_id = trigger.get("email", trigger.get("name", "unknown"))
-    deal_dir = DATA_ROOT / "deals" / slugify(lead_id)
+    deal_dir = _resolve_deal_dir(slugify(lead_id))
 
     # Gather all deal artifacts
     deal_files = {}
