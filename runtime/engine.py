@@ -6032,6 +6032,26 @@ def get_cross_topic_context(connection: sqlite3.Connection, chat_id: str, limit:
         return []
 
 
+def _require_authorized_chat(chat_id: str, command: str) -> str:
+    """Defense-in-depth allowlist gate for mutating /commands.
+
+    Returns "" when authorized, "(unauthorized)" otherwise. Each mutating
+    branch in parse_telegram_text calls this before doing real work so
+    in-process callers, empty chat_id, or any future entry path that
+    bypasses the dispatcher-level check still cannot trigger writes.
+    """
+    if not chat_id or not authorized_telegram_chat(chat_id):
+        try:
+            from runtime.log import get_logger
+            get_logger("rick.engine").warning(
+                "Blocked unauthorized %s from chat_id=%r", command, chat_id
+            )
+        except Exception:
+            pass
+        return "(unauthorized)"
+    return ""
+
+
 def parse_telegram_text(
     connection: sqlite3.Connection,
     text: str,
@@ -6041,6 +6061,10 @@ def parse_telegram_text(
     is_forum: bool = False,
 ) -> str:
     del message_id, is_forum
+    # Tightened gate: previously only checked when chat_id was truthy, leaving
+    # an empty chat_id (in-process callers, future code paths) un-gated.
+    # Now an empty chat_id falls through to per-mutator _require_authorized_chat
+    # checks which always reject when chat_id is missing.
     if chat_id and not authorized_telegram_chat(chat_id):
         return "Unauthorized chat."
 
@@ -6132,6 +6156,10 @@ def parse_telegram_text(
         )
 
     if command in {"/overnight", "overnight"}:
+        if len(parts) >= 2 and parts[1] in {"on", "off"}:
+            denied = _require_authorized_chat(chat_id, "/overnight")
+            if denied:
+                return denied
         if len(parts) < 2:
             mode_status = "ACTIVE" if is_overnight_mode_active() else "INACTIVE"
             return f"Overnight mode: {mode_status}\nUsage: /overnight on|off|status|tier"
@@ -6182,6 +6210,9 @@ def parse_telegram_text(
         return "\n".join(lines)
 
     if command in {"/delegate", "delegate"}:
+        denied = _require_authorized_chat(chat_id, "/delegate")
+        if denied:
+            return denied
         if len(parts) < 3:
             return "Usage: /delegate <agent_key> <task description>"
         from runtime.subagents import load_subagents, dispatch_openclaw
@@ -6201,6 +6232,9 @@ def parse_telegram_text(
         return status_line
 
     if command in {"/queue", "queue"}:
+        denied = _require_authorized_chat(chat_id, "/queue")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /queue <idea> [--price 29] [--type guide]"
         idea_parts = []
@@ -6228,6 +6262,9 @@ def parse_telegram_text(
         return f"Queued info product workflow {workflow_id} for '{idea}'.{topic_note}"
 
     if command in {"/work", "work"}:
+        denied = _require_authorized_chat(chat_id, "/work")
+        if denied:
+            return denied
         try:
             limit = int(parts[1]) if len(parts) > 1 else 1
         except ValueError:
@@ -6236,6 +6273,9 @@ def parse_telegram_text(
         return json.dumps(results, indent=2)
 
     if command in {"/approve", "approve"}:
+        denied = _require_authorized_chat(chat_id, "/approve")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /approve <approval_id> [note]"
         note = " ".join(parts[2:]) if len(parts) > 2 else ""
@@ -6243,6 +6283,9 @@ def parse_telegram_text(
         return json.dumps(result, indent=2)
 
     if command in {"/deny", "deny"}:
+        denied = _require_authorized_chat(chat_id, "/deny")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /deny <approval_id> [note]"
         note = " ".join(parts[2:]) if len(parts) > 2 else ""
@@ -6250,6 +6293,9 @@ def parse_telegram_text(
         return json.dumps(result, indent=2)
 
     if command in {"/publish", "publish"}:
+        denied = _require_authorized_chat(chat_id, "/publish")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /publish <workflow_id> [channels]"
         channels = ["newsletter", "linkedin", "x"]
@@ -6259,6 +6305,9 @@ def parse_telegram_text(
         return json.dumps(result, indent=2)
 
     if command in {"/bind", "bind"}:
+        denied = _require_authorized_chat(chat_id, "/bind")
+        if denied:
+            return denied
         if len(parts) < 3 or parts[1] != "here":
             return "Usage: /bind here <workflow_id>"
         if not chat_id or thread_id is None:
@@ -6291,6 +6340,9 @@ def parse_telegram_text(
         return reply
 
     if command in {"/unbind", "unbind"}:
+        denied = _require_authorized_chat(chat_id, "/unbind")
+        if denied:
+            return denied
         if len(parts) < 2 or parts[1] != "here":
             return "Usage: /unbind here"
         if not chat_id or thread_id is None:
@@ -6328,6 +6380,9 @@ def parse_telegram_text(
         return "\n".join(lines) if lines else "No conversation history."
 
     if command in {"/cancel", "cancel"}:
+        denied = _require_authorized_chat(chat_id, "/cancel")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /cancel <workflow_id>"
         target_wf_id = parts[1]
@@ -6344,6 +6399,9 @@ def parse_telegram_text(
         return f"Cancelled workflow {target_wf_id} ({wf['title']}). All queued/running/blocked jobs cancelled."
 
     if command in {"/retry", "retry"}:
+        denied = _require_authorized_chat(chat_id, "/retry")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /retry <workflow_id|job_id>"
         target_id = parts[1]
@@ -6527,6 +6585,9 @@ def parse_telegram_text(
             )
 
         if sub == "gig":
+            denied = _require_authorized_chat(chat_id, "/fiverr gig")
+            if denied:
+                return denied
             if len(parts) < 3:
                 return "Usage: /fiverr gig <idea>"
             idea = " ".join(parts[2:])
@@ -6593,6 +6654,9 @@ def parse_telegram_text(
             )
 
         if sub == "deliver":
+            denied = _require_authorized_chat(chat_id, "/fiverr deliver")
+            if denied:
+                return denied
             if len(parts) < 3:
                 return "Usage: /fiverr deliver <workflow_id>"
             target_wf_id = parts[2]
@@ -6646,6 +6710,9 @@ def parse_telegram_text(
             )
 
         if sub == "bid":
+            denied = _require_authorized_chat(chat_id, "/upwork bid")
+            if denied:
+                return denied
             if len(parts) < 3:
                 return "Usage: /upwork bid <job-title-or-url>"
             job_input = " ".join(parts[2:])
@@ -6736,6 +6803,9 @@ def parse_telegram_text(
             )
 
         if sub == "deliver":
+            denied = _require_authorized_chat(chat_id, "/upwork deliver")
+            if denied:
+                return denied
             if len(parts) < 3:
                 return "Usage: /upwork deliver <workflow_id>"
             target_wf_id = parts[2]
@@ -6772,6 +6842,9 @@ def parse_telegram_text(
             return "Connects budget not configured. Edit ~/rick-vault/upwork/config/connects-budget.json"
 
         if sub == "analytics":
+            denied = _require_authorized_chat(chat_id, "/upwork analytics")
+            if denied:
+                return denied
             workflow_id = queue_upwork_analytics_workflow(connection)
             return f"Queued Upwork analytics workflow {workflow_id}."
 
@@ -6791,6 +6864,9 @@ def parse_telegram_text(
         return "\n".join(lines)
 
     if command in {"/deal", "deal"}:
+        denied = _require_authorized_chat(chat_id, "/deal")
+        if denied:
+            return denied
         if len(parts) < 2:
             return "Usage: /deal <email> [name] [source]"
         email = parts[1]
@@ -6800,15 +6876,24 @@ def parse_telegram_text(
         return f"Deal workflow queued: {wf_id}"
 
     if command in {"/hunt", "hunt"}:
+        denied = _require_authorized_chat(chat_id, "/hunt")
+        if denied:
+            return denied
         wf_id = queue_signal_hunt_workflow(connection)
         return f"Signal hunt queued: {wf_id}"
 
     if command in {"/proof", "proof"}:
+        denied = _require_authorized_chat(chat_id, "/proof")
+        if denied:
+            return denied
         proof_type = parts[1] if len(parts) > 1 else "daily"
         wf_id = queue_proof_workflow(connection, proof_type=proof_type)
         return f"Proof workflow queued ({proof_type}): {wf_id}"
 
     if command in {"/seo", "seo"}:
+        denied = _require_authorized_chat(chat_id, "/seo")
+        if denied:
+            return denied
         wf_id = queue_seo_workflow(connection)
         return f"SEO page workflow queued: {wf_id}"
 
@@ -6825,18 +6910,30 @@ def parse_telegram_text(
         return "\n".join(lines)
 
     if command in {"/churn", "churn"}:
+        denied = _require_authorized_chat(chat_id, "/churn")
+        if denied:
+            return denied
         wf_id = queue_tenant_retention_workflow(connection)
         return f"Churn detection queued: {wf_id}"
 
     if command in {"/nurture", "nurture"}:
+        denied = _require_authorized_chat(chat_id, "/nurture")
+        if denied:
+            return denied
         wf_id = queue_email_nurture_workflow(connection)
         return f"Email nurture cycle queued: {wf_id}"
 
     if command in {"/fleet-analyze", "fleet-analyze"}:
+        denied = _require_authorized_chat(chat_id, "/fleet-analyze")
+        if denied:
+            return denied
         wf_id = queue_fleet_analyze_workflow(connection)
         return f"Fleet intelligence queued: {wf_id}"
 
     if command in {"/onboard", "onboard"}:
+        denied = _require_authorized_chat(chat_id, "/onboard")
+        if denied:
+            return denied
         if len(parts) < 3:
             return "Usage: /onboard <email> <business_name> [industry]"
         email = parts[1]
