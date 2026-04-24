@@ -50,22 +50,22 @@
       "approval_required": ["pr_merge", "secret_write", "force_push"],
       "auto_actions": ["draft_pr", "run_tests", "post_diff_to_telegram"],
       "max_spend_usd": 15.0,
-      "active": false,
-      "_note": "Activate after TIER-2 ThreadPoolExecutor + Sentry webhook wired. Default off to prevent unsupervised code mutations."
+      "active": true,
+      "_note": "Activated 2026-04-24. Engineering specialist on gpt-5.4-pro. SENTRY_DSN already in rick.env (loaded at runner.py boot). All PRs tagged 'archer-draft' + WAIT for human review — never auto-merge, never write secrets, never force-push."
     },
     "fenix": {
       "name": "Fenix",
       "role": "Compliance & Public-Brand Gate",
       "lane": "ops-lane",
-      "model": "claude-opus-4-6",
+      "model": "claude-opus-4-7",
       "persona": "You are Fenix, Rick's compliance and public-brand reviewer. Every public-facing artifact (blog, tweet, reddit reply, mass email blast) passes through you BEFORE going live IF it contains: customer names, prices, refund/legal language, or the founder's voice. You can say NO and block. You CANNOT say YES on irreversible commitments (money, contracts, legal). For those, escalate to Vlad.",
       "capabilities": ["pii-redaction", "brand-voice-check", "legal-flag", "claim-verification"],
       "triggers": ["outbound_preflight_public", "blog_publish_request", "legal_question_received", "press_inquiry"],
       "approval_required": ["customer_naming", "price_change", "refund_offer", "legal_response"],
       "auto_actions": ["flag_review", "redact_pii"],
       "max_spend_usd": 5.0,
-      "active": false,
-      "_note": "Activate when public-content volume exceeds 5 pieces/day — until then, low ROI to add the gate. Opus chosen for high judgment on edge cases."
+      "active": true,
+      "_note": "Activated 2026-04-24 per Vlad. Compliance/brand reviewer on opus-4-7 — gates customer-naming, price changes, refund offers, legal responses. CAN say NO. CANNOT auto-approve irreversible commits — escalates to Vlad."
     },
     "noa": {
       "name": "Noa",
@@ -78,8 +78,8 @@
       "approval_required": ["refund_offer", "discount_grant"],
       "auto_actions": ["send_welcome_email", "log_first_skill_run", "queue_day_3_check_in"],
       "max_spend_usd": 3.0,
-      "active": false,
-      "_note": "Activate AFTER pricing page coherence + 14-day trial ship (TIER-3 #2/#3). Splits activation work out of Iris so retention/support don't compete with first-touch."
+      "active": true,
+      "_note": "Activated 2026-04-24. 5-min post-purchase activation specialist on sonnet-4-6 (workhorse — right model for activation emails). Owns stripe_payment_succeeded / first_heartbeat_received / install_attempted / new_install. Splits first-touch out of Iris. Iris keeps purchase_completed (different event)."
     },
     "kade": {
       "name": "Kade",
@@ -92,8 +92,8 @@
       "approval_required": [],
       "auto_actions": ["write_insight_report", "flag_anomaly_to_telegram"],
       "max_spend_usd": 8.0,
-      "active": false,
-      "_note": "Activate after GA4 / GSC / Ahrefs MCP credentials fully wired (Ahrefs MCP already connected per project context). Reports insights only — never directly mutates campaigns or budgets."
+      "active": true,
+      "_note": "Activated 2026-04-24. Growth analytics on gemini-3.1-pro-preview (huge context window for log mining — opus would be cost without value-add for analytics). Reports INSIGHTS only — never mutates campaigns or budgets. Followup: add daily 09:00 PT daily_analytics_rollup cron event to fire Kade's first analysis cycle."
     },
     "sable": {
       "name": "Sable",
