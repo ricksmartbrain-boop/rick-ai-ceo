@@ -273,10 +273,12 @@ class LeadIntakeBlocklistTests(unittest.TestCase):
 # =============================================================================
 
 class FenixGateTests(unittest.TestCase):
-    def test_non_public_channel_bypasses_gate(self) -> None:
+    def test_non_gated_channel_bypasses(self) -> None:
         from runtime.fenix_gate import needs_fenix_review
-        # email is NOT in PUBLIC_CHANNELS — Iris/Noa workflows have own gates
-        needs, matches = needs_fenix_review("email", {"body": "Hi Newton, please refund"})
+        # Internal channels (telegram, sms, voice) bypass — those have own
+        # gates upstream. As of 2026-04-24 email channels ARE gated (added
+        # via Ship 3 — see FenixEmailChannelTests below).
+        needs, matches = needs_fenix_review("telegram", {"body": "Hi Newton, please refund"})
         self.assertFalse(needs)
         self.assertEqual([], matches)
 
