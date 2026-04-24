@@ -1527,10 +1527,12 @@ def notify_operator(
 # Rick. Wrap noisy alerts in this helper so the same normalized error never
 # pages more than once per dedup_window_hours. URGENT bypasses dedup.
 _DEDUP_NORMALIZE_PATTERNS = [
+    # Order matters: strip our own (suppressed xN in last Nh) prefix BEFORE
+    # the duration regex eats the "Nh" portion (test caught this 2026-04-24).
+    re.compile(r"\(suppressed x\d+ in last \d+h\)"),             # our own prefix
     re.compile(r"\b[a-z]+_[0-9a-f]{6,}\b"),                      # ULIDs / hex IDs
     re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"),  # ISO ts
     re.compile(r"\b\d+\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b", re.I),  # durations
-    re.compile(r"\(suppressed x\d+ in last \d+h\)"),             # our own prefix
     re.compile(r"\bworkflow [a-z0-9_-]{4,}\b", re.I),            # workflow IDs
 ]
 
@@ -1539,7 +1541,9 @@ def _dedup_hash(text: str, kind: str) -> str:
     normalized = (text or "").strip()
     for pat in _DEDUP_NORMALIZE_PATTERNS:
         normalized = pat.sub("", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).lower()
+    # Collapse whitespace AND strip leading/trailing — regex substitutions
+    # can leave stray spaces where the suppressed-prefix used to live.
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
     h = hashlib.sha1(f"{kind}|{normalized}".encode("utf-8")).hexdigest()[:16]
     return h
 
