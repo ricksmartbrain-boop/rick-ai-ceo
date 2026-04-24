@@ -251,11 +251,29 @@ def _get_thread_intent(connection: sqlite3.Connection, thread_id: str) -> str:
 def cmd_inbox(connection: sqlite3.Connection, chat_id: Any) -> str:
     try:
         threads = _list_active_threads(connection, limit=10)
+        # 2026-04-24: surface drafts breakdown by kind so Vlad sees pending
+        # workload at a glance without having to /drafts separately.
+        drafts = _list_drafts()
+        kind_counts: dict[str, int] = {}
+        for d in drafts:
+            kind_counts[d.get("kind", "unknown")] = kind_counts.get(d.get("kind", "unknown"), 0) + 1
+
+        lines = ["*Inbox*", ""]
+
+        if drafts:
+            badges = " · ".join(f"{KIND_LABEL.get(k, k)}={v}" for k, v in sorted(kind_counts.items()))
+            lines.append(f"📝 *Drafts pending*: {len(drafts)} ({badges})")
+            lines.append("Use `/drafts` to list, `/draft <n>` to view, `/send <n>` to ship.")
+            lines.append("")
+
         if not threads:
-            return "_No active email threads._ Try `/drafts` for pending drafts."
+            if not drafts:
+                return "_No active email threads + no pending drafts._\nTry `/queue` for upcoming auto-sends."
+            return _truncate("\n".join(lines))
+
         # Persist per-chat numbering so /thread <n> resolves consistently.
         _set_list(chat_id, "threads", threads)
-        lines = ["*Inbox — top active threads*", ""]
+        lines.append("*Active threads* (top 10)")
         for idx, t in enumerate(threads, start=1):
             subj = _short(t.get("subject", "(no subject)"), 60)
             last_in = _short(t.get("last_inbound_at", ""), 19)
@@ -266,11 +284,87 @@ def cmd_inbox(connection: sqlite3.Connection, chat_id: Any) -> str:
                 f"{_md_escape(intent)} · {_md_escape(last_in)}"
             )
         lines.append("")
-        lines.append("Use `/thread <n>` to drill in.")
+        lines.append("Use `/thread <n>` to drill in. `/q` for upcoming auto-sends.")
         return _truncate("\n".join(lines))
     except Exception as exc:  # noqa: BLE001
         _log({"event": "inbox-failed", "error": str(exc)[:200]})
         return f"_/inbox failed: {str(exc)[:200]}_"
+
+
+def cmd_queue(connection: sqlite3.Connection, chat_id: Any) -> str:
+    """Show what's about to ship in the next 30 minutes — outbound_jobs queued
+    + email-sequence drips ready to go. One-screen visibility into "what's
+    Rick about to do without me looking."
+    """
+    try:
+        from datetime import timedelta as _td
+        cutoff = (datetime.now() + _td(minutes=30)).isoformat(timespec="seconds")
+        lines = ["*Queue — next 30 min*", ""]
+
+        # 1) outbound_jobs scheduled within the window
+        try:
+            rows = connection.execute(
+                "SELECT id, channel, lead_id, scheduled_at "
+                "FROM outbound_jobs "
+                "WHERE status='queued' AND scheduled_at <= ? "
+                "ORDER BY scheduled_at ASC LIMIT 12",
+                (cutoff,),
+            ).fetchall()
+            if rows:
+                lines.append(f"📨 *Outbound jobs* ({len(rows)})")
+                for r in rows:
+                    lines.append(
+                        f"  • {_md_escape(r['channel'] or '?')} → "
+                        f"`{_md_escape(_short(r['lead_id'] or '—', 32))}` "
+                        f"at `{_md_escape(_short(r['scheduled_at'], 19))}`"
+                    )
+                lines.append("")
+            else:
+                lines.append("📨 *Outbound jobs*: 0 queued in next 30min")
+                lines.append("")
+        except Exception:
+            lines.append("📨 *Outbound jobs*: (table unavailable)")
+            lines.append("")
+
+        # 2) email drips ready to send (in outbox/)
+        try:
+            outbox_root = Path.home() / "rick-vault" / "mailbox" / "outbox"
+            email_count = 0
+            email_samples: list[str] = []
+            if outbox_root.exists():
+                for seq_dir in outbox_root.iterdir():
+                    if not seq_dir.is_dir():
+                        continue
+                    for md_path in seq_dir.glob("*.md"):
+                        email_count += 1
+                        if len(email_samples) < 5:
+                            email_samples.append(f"{seq_dir.name}/{md_path.name}")
+            if email_count > 0:
+                lines.append(f"📧 *Email drips* ({email_count} ready)")
+                for s in email_samples:
+                    lines.append(f"  • `{_md_escape(_short(s, 60))}`")
+                if email_count > 5:
+                    lines.append(f"  • _…and {email_count - 5} more_")
+                lines.append("")
+            else:
+                lines.append("📧 *Email drips*: 0 ready")
+                lines.append("")
+        except Exception:
+            pass
+
+        # 3) drafts pending review (not auto-shipping but visible)
+        drafts = _list_drafts()
+        if drafts:
+            kind_counts: dict[str, int] = {}
+            for d in drafts:
+                kind_counts[d.get("kind", "unknown")] = kind_counts.get(d.get("kind", "unknown"), 0) + 1
+            badges = " · ".join(f"{KIND_LABEL.get(k, k)}={v}" for k, v in sorted(kind_counts.items()))
+            lines.append(f"📝 *Drafts awaiting review*: {len(drafts)} ({badges}) — `/drafts` to act")
+
+        return _truncate("\n".join(lines))
+    except Exception as exc:  # noqa: BLE001
+        _log({"event": "queue-failed", "error": str(exc)[:200]})
+        return f"_/queue failed: {str(exc)[:200]}_"
 
 
 # ---------- /thread ----------------------------------------------------------
@@ -622,6 +716,7 @@ def cmd_skip(chat_id: Any, n_str: str | None, tail: str = "") -> str:
 def cmd_inbox_help() -> str:
     return (
         "*Inbox UI* — phone-friendly draft review (TIER-3.5 #A12)\n"
+        "Aliases: `/i` = `/inbox`, `/q` = `/queue`\n"
         "\n"
         "`/inbox` — top 10 active email threads\n"
         "`/thread <n>` — full subject + last 3 messages from triage\n"

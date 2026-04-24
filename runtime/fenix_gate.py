@@ -51,6 +51,16 @@ PUBLIC_CHANNELS = {
     "hackernews", "hn",
 }
 
+# 2026-04-24: email channels also gated. Separate set so future tuning
+# can adjust triggers per category (e.g. transactional emails may
+# legitimately mention prices; cold drips should not).
+EMAIL_CHANNELS = {
+    "email", "email_drip", "email_cold", "email_followup",
+    "email_nurture", "email_blast",
+}
+
+GATED_CHANNELS = PUBLIC_CHANNELS | EMAIL_CHANNELS
+
 # Heuristic triggers — if ANY match, the artifact gets Fenix review.
 # Tuned conservatively: rather have a few false-positives than a missed legal/PII.
 _TRIGGER_PATTERNS = [
@@ -105,9 +115,9 @@ def needs_fenix_review(channel: str, payload: dict) -> tuple[bool, list[str]]:
     """Decide whether this artifact needs Fenix's eye.
 
     Returns (needs_review, matched_pattern_summaries). Empty list when no
-    triggers fire. Channels not in PUBLIC_CHANNELS bypass the gate.
+    triggers fire. Channels not in GATED_CHANNELS (PUBLIC ∪ EMAIL) bypass.
     """
-    if (channel or "").lower() not in PUBLIC_CHANNELS:
+    if (channel or "").lower() not in GATED_CHANNELS:
         return False, []
     text = _extract_text(payload)
     if not text.strip():

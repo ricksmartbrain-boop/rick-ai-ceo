@@ -240,6 +240,33 @@ def gather() -> dict:
     summary["suppression_total"] = _suppression_count()
     summary["funnel"] = _funnel_24h()
 
+    # Lead-replay dry-run visibility — surfaces "would queue N leads" so Vlad
+    # can see what the dormant 607-lead pool looks like BEFORE flipping
+    # RICK_LEAD_REPLAY_LIVE=1. Counts entries from last 24h with action
+    # starting "would-" (dry-run signal) to avoid double-counting live runs.
+    try:
+        from datetime import timedelta as _td
+        replay_log = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "lead-replay.jsonl"
+        cutoff_dt = datetime.now() - _td(hours=24)
+        would_queue_count = 0
+        if replay_log.exists():
+            for line in replay_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("ran_at", "")
+                try:
+                    if datetime.fromisoformat(ts) < cutoff_dt:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if entry.get("dry_run") and str(entry.get("action", "")).startswith("would-"):
+                    would_queue_count += 1
+        summary["lead_replay_dryrun_24h"] = would_queue_count
+    except Exception:
+        summary["lead_replay_dryrun_24h"] = 0
+
     # Fenix observe-mode counts (would-have-been-blocked artifacts).
     # JSONL log written by runtime/fenix_gate.py preflight() in observe mode.
     try:
@@ -350,6 +377,13 @@ def render(s: dict) -> str:
     intake_supp = s.get("intake_suppressions_24h", 0) or 0
     if intake_supp > 0:
         lines.append(f"🛡 *Intake auto-suppressed*: {intake_supp} (vendor/self-send blocklist saved Iris spend)")
+
+    lead_replay_dry = s.get("lead_replay_dryrun_24h", 0) or 0
+    if lead_replay_dry > 0:
+        lines.append(
+            f"🚦 *Lead-replay (dry-run)*: would queue {lead_replay_dry} leads — "
+            f"flip `RICK_LEAD_REPLAY_LIVE=1` in rick.env to ship"
+        )
 
     fenix = s.get("fenix_observed_24h") or {}
     if fenix.get("would_have_blocked", 0) > 0:

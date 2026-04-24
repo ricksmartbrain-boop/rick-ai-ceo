@@ -316,5 +316,30 @@ class FenixGateTests(unittest.TestCase):
         self.assertGreater(len(result["matched_triggers"]), 0)
 
 
+# =============================================================================
+# Fenix gate — email channel coverage
+# =============================================================================
+
+class FenixEmailChannelTests(unittest.TestCase):
+    def test_email_drip_in_gated_channels(self) -> None:
+        from runtime.fenix_gate import GATED_CHANNELS, EMAIL_CHANNELS, PUBLIC_CHANNELS
+        self.assertIn("email_drip", GATED_CHANNELS)
+        self.assertIn("email_drip", EMAIL_CHANNELS)
+        # Email channels should NOT pollute the public set (different tuning later)
+        self.assertEqual(EMAIL_CHANNELS & PUBLIC_CHANNELS, set())
+
+    def test_email_drip_triggers_on_customer_naming(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("email_drip", {"body": "Hi Newton, paying $29/mo"})
+        self.assertTrue(needs)
+        self.assertGreater(len(matches), 0)
+
+    def test_unrelated_channel_still_bypasses(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        # Telegram messages aren't gated — they're internal/private
+        needs, _ = needs_fenix_review("telegram", {"body": "Newton paid $29/mo"})
+        self.assertFalse(needs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

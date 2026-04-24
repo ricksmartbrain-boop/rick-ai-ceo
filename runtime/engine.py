@@ -6955,12 +6955,20 @@ def parse_telegram_text(
         return f"Managed onboarding queued: {wf_id}"
 
     # --- TIER-3.5 #A12 — Inbox UI for Vlad's draft review ----------------
-    if command in {"/inbox", "inbox"}:
+    # /i is a quick alias for /inbox (most-used cmd from phone, save typing)
+    if command in {"/inbox", "inbox", "/i", "i"}:
         try:
             from runtime.inbox_ui import cmd_inbox
             return cmd_inbox(connection, chat_id)
         except Exception as exc:  # noqa: BLE001
             return f"/inbox failed: {str(exc)[:200]}"
+
+    if command in {"/queue", "queue", "/q", "q"}:
+        try:
+            from runtime.inbox_ui import cmd_queue
+            return cmd_queue(connection, chat_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"/queue failed: {str(exc)[:200]}"
 
     if command in {"/thread", "thread"}:
         try:
