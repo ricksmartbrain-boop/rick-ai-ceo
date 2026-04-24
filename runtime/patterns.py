@@ -167,13 +167,16 @@ def patterns_summary(connection: sqlite3.Connection, skill_name: str | None = No
     """Reporting helper for the activity digest / dashboard. Returns counts."""
     try:
         if skill_name:
+            # Match the same filter as pick_patterns (incl universal dream_insights)
             row = connection.execute(
                 """
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN sum_runs > 0 THEN 1 ELSE 0 END) AS used,
                        SUM(sum_wins) AS total_wins, SUM(sum_runs) AS total_runs
                   FROM effective_patterns
-                 WHERE applicable_skills LIKE ? OR pattern_kind = ?
+                 WHERE applicable_skills LIKE ?
+                    OR pattern_kind = ?
+                    OR (pattern_kind = 'dream_insight' AND (applicable_skills = '[]' OR applicable_skills IS NULL))
                 """,
                 (f'%"{skill_name}"%', skill_name),
             ).fetchone()
