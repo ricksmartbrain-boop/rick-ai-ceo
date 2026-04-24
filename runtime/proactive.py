@@ -268,27 +268,28 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
         ).fetchall()
         for apr in old_approvals:
             alert_key = f"approval:{apr['id']}"
-            already = connection.execute(
-                "SELECT 1 FROM notification_log WHERE purpose = ? AND created_at >= datetime('now', '-30 minutes') LIMIT 1",
-                (alert_key,),
-            ).fetchone()
-            if not already:
-                text = f"Approval {apr['id']} pending >1hr: {apr['request_text'][:100]}"
-                try:
-                    from runtime.engine import send_telegram_message
-                    from runtime.telegram_topics import resolve_notification_target
-                    target = resolve_notification_target(connection, topic_key="approvals")
-                    if target:
-                        send_telegram_message(
-                            connection, text,
-                            workflow_id=apr["workflow_id"],
-                            purpose=alert_key,
-                            chat_id=str(target.chat_id),
-                            thread_id=target.thread_id,
-                        )
-                        alerts.append(alert_key)
-                except Exception as exc:
-                    _log.error("Failed to send approval alert: %s", exc)
+            # 2026-04-24: switched 30-min notification_log lookback → 6h cross-job
+            # dedup. Per-approval ID is in `text`, so dedup hash naturally
+            # separates approvals. purpose='ops' (NOT 'approval' which is in
+            # URGENT_PURPOSES and would bypass dedup defeating the goal).
+            text = f"Approval {apr['id']} pending >1hr: {apr['request_text'][:100]}"
+            try:
+                from runtime.engine import notify_operator_deduped
+                from runtime.telegram_topics import resolve_notification_target
+                target = resolve_notification_target(connection, topic_key="approvals")
+                result = notify_operator_deduped(
+                    connection, text,
+                    kind="approval_reminder",
+                    dedup_window_hours=6,
+                    workflow_id=apr["workflow_id"],
+                    purpose="ops",
+                    chat_id=str(target.chat_id) if target else "",
+                    thread_id=target.thread_id if target else None,
+                )
+                if result in ("sent_first", "sent_with_count"):
+                    alerts.append(alert_key)
+            except Exception as exc:
+                _log.error("Failed to send approval alert: %s", exc)
     except Exception as exc:
         _log.error("Approval alert check failed: %s", exc)
 
@@ -304,12 +305,6 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
         ).fetchall()
         for order in fiverr_orders:
             alert_key = f"fiverr_deadline:{order['id']}"
-            already = connection.execute(
-                "SELECT 1 FROM notification_log WHERE purpose = ? AND created_at >= datetime('now', '-6 hours') LIMIT 1",
-                (alert_key,),
-            ).fetchone()
-            if already:
-                continue
             try:
                 import json as _json
                 ctx = _json.loads(order["context_json"]) if order["context_json"] else {}
@@ -320,17 +315,20 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
                 remaining = (deadline - now).total_seconds() / 3600
                 if 0 < remaining < 12:
                     text = f"Fiverr order {order['id']} due in {remaining:.1f}h: {order['title'][:60]}"
-                    from runtime.engine import send_telegram_message
+                    # 2026-04-24: switched manual 6h gate → 24h cross-job dedup.
+                    from runtime.engine import notify_operator_deduped
                     from runtime.telegram_topics import resolve_notification_target
                     target = resolve_notification_target(connection, topic_key="ops-alerts")
-                    if target:
-                        send_telegram_message(
-                            connection, text,
-                            workflow_id=order["id"],
-                            purpose=alert_key,
-                            chat_id=str(target.chat_id),
-                            thread_id=target.thread_id,
-                        )
+                    result = notify_operator_deduped(
+                        connection, text,
+                        kind="fiverr_deadline",
+                        dedup_window_hours=24,
+                        workflow_id=order["id"],
+                        purpose="ops",
+                        chat_id=str(target.chat_id) if target else "",
+                        thread_id=target.thread_id if target else None,
+                    )
+                    if result in ("sent_first", "sent_with_count"):
                         alerts.append(alert_key)
             except Exception as exc:
                 _log.error("Failed to check fiverr deadline for %s: %s", order["id"], exc)
@@ -349,12 +347,6 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
         ).fetchall()
         for contract in upwork_contracts:
             alert_key = f"upwork_deadline:{contract['id']}"
-            already = connection.execute(
-                "SELECT 1 FROM notification_log WHERE purpose = ? AND created_at >= datetime('now', '-6 hours') LIMIT 1",
-                (alert_key,),
-            ).fetchone()
-            if already:
-                continue
             try:
                 import json as _json
                 ctx = _json.loads(contract["context_json"]) if contract["context_json"] else {}
@@ -365,17 +357,20 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
                 remaining = (deadline - now).total_seconds() / 3600
                 if 0 < remaining < 24:
                     text = f"Upwork contract {contract['id']} due in {remaining:.1f}h: {contract['title'][:60]}"
-                    from runtime.engine import send_telegram_message
+                    # 2026-04-24: switched manual 6h gate → 24h cross-job dedup.
+                    from runtime.engine import notify_operator_deduped
                     from runtime.telegram_topics import resolve_notification_target
                     target = resolve_notification_target(connection, topic_key="ops-alerts")
-                    if target:
-                        send_telegram_message(
-                            connection, text,
-                            workflow_id=contract["id"],
-                            purpose=alert_key,
-                            chat_id=str(target.chat_id),
-                            thread_id=target.thread_id,
-                        )
+                    result = notify_operator_deduped(
+                        connection, text,
+                        kind="upwork_deadline",
+                        dedup_window_hours=24,
+                        workflow_id=contract["id"],
+                        purpose="ops",
+                        chat_id=str(target.chat_id) if target else "",
+                        thread_id=target.thread_id if target else None,
+                    )
+                    if result in ("sent_first", "sent_with_count"):
                         alerts.append(alert_key)
             except Exception as exc:
                 _log.error("Failed to check upwork deadline for %s: %s", contract["id"], exc)
@@ -409,17 +404,21 @@ def check_delegation_results(connection: sqlite3.Connection) -> list[str]:
 
         text = f"Delegation complete: {agent} finished '{task}'\n{output}" if output else f"Delegation complete: {agent} finished '{task}'"
 
+        # 2026-04-24: 1h cross-run dedup (different run_id → different text →
+        # different hash, so distinct delegations still get pinged; only
+        # spammy duplicates are suppressed).
         try:
-            from runtime.engine import send_telegram_message
+            from runtime.engine import notify_operator_deduped
             from runtime.telegram_topics import resolve_notification_target
             target = resolve_notification_target(connection, topic_key="ops-alerts")
-            if target:
-                send_telegram_message(
-                    connection, text,
-                    purpose=f"delegation:{run_id}",
-                    chat_id=str(target.chat_id),
-                    thread_id=target.thread_id,
-                )
+            notify_operator_deduped(
+                connection, text,
+                kind="delegation_result",
+                dedup_window_hours=1,
+                purpose="ops",
+                chat_id=str(target.chat_id) if target else "",
+                thread_id=target.thread_id if target else None,
+            )
         except Exception as exc:
             _log.error("Failed to relay delegation result %s: %s", run_id, exc)
             continue

@@ -122,6 +122,19 @@ def _draft(thread_id: str, objection_text: str, prospect_id: str | None) -> dict
     con = connect()
     try:
         ctx = _load_thread_context(con, thread_id)
+        # 2026-04-24: pattern READ side fanned out to counter_pitch.
+        # Surfaces top-3 most-effective patterns for this skill so the
+        # objection-handler benefits from accumulated wins. Shielded:
+        # any failure → empty list, draft still ships.
+        picked_patterns: list[dict] = []
+        pattern_context = ""
+        try:
+            from runtime.patterns import pick_patterns, format_pattern_context
+            picked_patterns = pick_patterns(con, "counter_pitch", top_n=3)
+            pattern_context = format_pattern_context(picked_patterns)
+        except Exception:
+            picked_patterns = []
+            pattern_context = ""
     finally:
         con.close()
 
@@ -148,7 +161,8 @@ def _draft(thread_id: str, objection_text: str, prospect_id: str | None) -> dict
         "- Real MRR is $9 / 1 paying customer (Newton). Don't claim metrics we don't have.\n"
         "- Em dashes OK.\n\n"
         f"PROSPECT'S OBJECTION:\n{objection_text}\n"
-        f"{case_str}\n\n"
+        f"{case_str}"
+        f"{pattern_context}\n"
         "Output: just the email body. No greeting line (I'll add 'Hi <name>,' separately).\n"
     )
     fallback = (
@@ -168,6 +182,30 @@ def _draft(thread_id: str, objection_text: str, prospect_id: str | None) -> dict
         body = fallback
         meta_extra = {"model": "fallback", "fallback_used": True, "error": str(e)[:200]}
 
+    # 2026-04-24: pattern CREDIT side. Heuristic for "won": Rick produced
+    # non-fallback content with reasonable length (≥100 chars) AND addressed
+    # the objection class (presence of objection-related word in body).
+    # Replace with reply-rate signal once Phase G inbound matures.
+    if picked_patterns:
+        try:
+            from runtime.patterns import record_pattern_outcome
+            won = (
+                not meta_extra.get("fallback_used", False)
+                and len(body or "") >= 100
+                and (objection_class.lower() in body.lower() or len(body or "") >= 300)
+            )
+            con2 = connect()
+            try:
+                record_pattern_outcome(
+                    con2,
+                    pattern_ids=[p["id"] for p in picked_patterns if p.get("id")],
+                    success=won,
+                )
+            finally:
+                con2.close()
+        except Exception:
+            pass
+
     return {
         "draft_id": f"cp_{uuid.uuid4().hex[:10]}",
         "thread_id": thread_id,
@@ -176,6 +214,7 @@ def _draft(thread_id: str, objection_text: str, prospect_id: str | None) -> dict
         "body": body,
         "objection_class": objection_class,
         "case_study_cited": case["slug"] if case else None,
+        "patterns_used": [p.get("id") for p in picked_patterns],
         "created_at": _now_iso(),
         **meta_extra,
     }

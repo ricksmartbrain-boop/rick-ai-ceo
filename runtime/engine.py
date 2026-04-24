@@ -5250,7 +5250,11 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
             notes=exc.reason,
         )
         connection.commit()
-        notify_operator(connection, f"Rick blocked on dependency: {exc.area} — {exc.reason}", workflow_id=workflow["id"], lane=workflow["lane"], purpose="ops")
+        # 2026-04-24: deduped — DependencyBlocked fires every retry attempt
+        # → would spam ops thread. Same area+reason → suppressed for 12h.
+        notify_operator_deduped(connection, f"Rick blocked on dependency: {exc.area} — {exc.reason}",
+                                kind="dependency_blocked", dedup_window_hours=12,
+                                workflow_id=workflow["id"], lane=workflow["lane"], purpose="ops")
         return {"job_id": job["id"], "status": "blocked", "reason": exc.reason}
     except Exception as exc:  # noqa: BLE001
         attempts = int(job["attempt_count"]) + 1
@@ -5407,7 +5411,11 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
         )
         connection.commit()
         safe_err = _sanitize_error_for_notification(exc)
-        notify_operator(connection, f"Rick workflow failed: {workflow['title']} at {job['step_name']} — {safe_err}", workflow_id=workflow["id"], lane=workflow["lane"], purpose="ops")
+        # 2026-04-24: deduped — repeated workflow_failed pings for the same
+        # error pattern get capped at 1/6h. URGENT keywords still bypass.
+        notify_operator_deduped(connection, f"Rick workflow failed: {workflow['title']} at {job['step_name']} — {safe_err}",
+                                kind="workflow_failed", dedup_window_hours=6,
+                                workflow_id=workflow["id"], lane=workflow["lane"], purpose="ops")
         return {"job_id": job["id"], "status": "failed", "error": str(exc)}
 
     mark_job(connection, job["id"], "done")
