@@ -229,28 +229,30 @@ def check_reactive_alerts(connection: sqlite3.Connection) -> list[str]:
         ).fetchall()
         for job in blocked:
             alert_key = f"blocked:{job['id']}"
-            # Deduplicate: check notification_log
-            already = connection.execute(
-                "SELECT 1 FROM notification_log WHERE purpose = ? AND created_at >= datetime('now', '-30 minutes') LIMIT 1",
-                (alert_key,),
-            ).fetchone()
-            if not already:
-                text = f"Job {job['id']} ({job['step_name']}) blocked for >30min in workflow {job['workflow_id']}"
-                try:
-                    from runtime.engine import send_telegram_message
-                    from runtime.telegram_topics import resolve_notification_target
-                    target = resolve_notification_target(connection, topic_key="ops-alerts")
-                    if target:
-                        send_telegram_message(
-                            connection, text,
-                            workflow_id=job["workflow_id"],
-                            purpose=alert_key,
-                            chat_id=str(target.chat_id),
-                            thread_id=target.thread_id,
-                        )
-                        alerts.append(alert_key)
-                except Exception as exc:
-                    _log.error("Failed to send stale-job alert: %s", exc)
+            # 2026-04-24: switched from 30-min notification_log lookback (which
+            # let the SAME stuck job page 48 times/day, then 450 times in a
+            # week → Vlad muted Rick) to 24h cross-job dedup via
+            # notify_operator_deduped. Same normalized error → 1 ping per 24h
+            # max, with "(suppressed xN in last 24h)" prefix on the next
+            # eligible send. URGENT bypasses dedup.
+            text = f"Job {job['id']} ({job['step_name']}) blocked for >30min in workflow {job['workflow_id']}"
+            try:
+                from runtime.engine import notify_operator_deduped
+                from runtime.telegram_topics import resolve_notification_target
+                target = resolve_notification_target(connection, topic_key="ops-alerts")
+                result = notify_operator_deduped(
+                    connection, text,
+                    kind="blocked_job",
+                    dedup_window_hours=24,
+                    workflow_id=job["workflow_id"],
+                    purpose="ops",
+                    chat_id=str(target.chat_id) if target else "",
+                    thread_id=target.thread_id if target else None,
+                )
+                if result in ("sent_first", "sent_with_count"):
+                    alerts.append(alert_key)
+            except Exception as exc:
+                _log.error("Failed to send stale-job alert: %s", exc)
     except Exception as exc:
         _log.error("Stale job alert check failed: %s", exc)
 

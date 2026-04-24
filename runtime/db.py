@@ -107,6 +107,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("email_threads", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("follow_up_queue", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("ledger_entries", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("notification_dedupe", "dedup_hash TEXT PRIMARY KEY"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -473,6 +474,19 @@ def init_db(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_notification_log_created
         ON notification_log(created_at);
+
+        CREATE TABLE IF NOT EXISTS notification_dedupe (
+            dedup_hash TEXT PRIMARY KEY,
+            kind TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_alerted_at TEXT NOT NULL,
+            count_since_alert INTEGER NOT NULL DEFAULT 0,
+            last_text TEXT NOT NULL DEFAULT '',
+            total_seen INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notification_dedupe_kind_alerted
+        ON notification_dedupe(kind, last_alerted_at);
 
         CREATE TABLE IF NOT EXISTS scheduled_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

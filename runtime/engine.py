@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1519,6 +1520,107 @@ def notify_operator(
     except Exception as tg_exc:
         logger.warning("notify_operator telegram fallback failed: %s", tg_exc)
     _fallback_notification(text, workflow_id=workflow_id, error=last_error)
+
+
+# 2026-04-24: per-error dedup helper. The blocked-job notifier in proactive.py
+# was sending 450 identical pings for ONE stuck job over 7 days → Vlad muted
+# Rick. Wrap noisy alerts in this helper so the same normalized error never
+# pages more than once per dedup_window_hours. URGENT bypasses dedup.
+_DEDUP_NORMALIZE_PATTERNS = [
+    re.compile(r"\b[a-z]+_[0-9a-f]{6,}\b"),                      # ULIDs / hex IDs
+    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"),  # ISO ts
+    re.compile(r"\b\d+\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b", re.I),  # durations
+    re.compile(r"\(suppressed x\d+ in last \d+h\)"),             # our own prefix
+    re.compile(r"\bworkflow [a-z0-9_-]{4,}\b", re.I),            # workflow IDs
+]
+
+
+def _dedup_hash(text: str, kind: str) -> str:
+    normalized = (text or "").strip()
+    for pat in _DEDUP_NORMALIZE_PATTERNS:
+        normalized = pat.sub("", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).lower()
+    h = hashlib.sha1(f"{kind}|{normalized}".encode("utf-8")).hexdigest()[:16]
+    return h
+
+
+def notify_operator_deduped(
+    connection: sqlite3.Connection,
+    text: str,
+    *,
+    kind: str,
+    dedup_window_hours: int = 24,
+    workflow_id: str | None = None,
+    lane: str = "",
+    purpose: str = "ops",
+    chat_id: str = "",
+    thread_id: int | None = None,
+) -> str:
+    """Sends notify_operator only if no equivalent alert in last dedup_window_hours.
+
+    Returns one of: 'sent_first', 'sent_with_count', 'suppressed'. URGENT_PURPOSES
+    + URGENT_KEYWORDS (defined in notify_operator) bypass dedup completely.
+    """
+    URGENT_PURPOSES = {"urgent", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
+    URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
+    is_urgent = (purpose or "").lower() in URGENT_PURPOSES or any(kw in text for kw in URGENT_KEYWORDS)
+    if is_urgent:
+        notify_operator(connection, text, workflow_id=workflow_id, lane=lane,
+                        purpose=purpose, chat_id=chat_id, thread_id=thread_id)
+        return "sent_first"
+
+    try:
+        h = _dedup_hash(text, kind)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        row = connection.execute(
+            "SELECT last_alerted_at, count_since_alert, total_seen FROM notification_dedupe WHERE dedup_hash = ?",
+            (h,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO notification_dedupe (dedup_hash, kind, first_seen_at, last_alerted_at, count_since_alert, last_text, total_seen) VALUES (?, ?, ?, ?, 0, ?, 1)",
+                (h, kind, now_iso, now_iso, text[:500]),
+            )
+            connection.commit()
+            notify_operator(connection, text, workflow_id=workflow_id, lane=lane,
+                            purpose=purpose, chat_id=chat_id, thread_id=thread_id)
+            return "sent_first"
+
+        # Determine if window has elapsed
+        try:
+            last_alerted_dt = datetime.fromisoformat(row["last_alerted_at"])
+        except (ValueError, TypeError):
+            last_alerted_dt = datetime.now() - timedelta(hours=dedup_window_hours + 1)
+        elapsed = datetime.now() - last_alerted_dt
+        if elapsed >= timedelta(hours=dedup_window_hours):
+            count_suppressed = int(row["count_since_alert"] or 0)
+            prefixed = (
+                f"(suppressed x{count_suppressed} in last {dedup_window_hours}h) {text}"
+                if count_suppressed > 0 else text
+            )
+            connection.execute(
+                "UPDATE notification_dedupe SET last_alerted_at=?, count_since_alert=0, last_text=?, total_seen=total_seen+1 WHERE dedup_hash=?",
+                (now_iso, text[:500], h),
+            )
+            connection.commit()
+            notify_operator(connection, prefixed, workflow_id=workflow_id, lane=lane,
+                            purpose=purpose, chat_id=chat_id, thread_id=thread_id)
+            return "sent_with_count"
+
+        # Inside window — bump counter + suppress
+        connection.execute(
+            "UPDATE notification_dedupe SET count_since_alert=count_since_alert+1, total_seen=total_seen+1, last_text=? WHERE dedup_hash=?",
+            (text[:500], h),
+        )
+        connection.commit()
+        return "suppressed"
+    except Exception as exc:
+        # Dedup must NEVER swallow a real alert — fall through to direct send.
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning("notify_operator_deduped failed (%s) — sending direct", exc)
+        notify_operator(connection, text, workflow_id=workflow_id, lane=lane,
+                        purpose=purpose, chat_id=chat_id, thread_id=thread_id)
+        return "sent_first"
 
 
 def lane_snapshot(connection: sqlite3.Connection) -> list[dict[str, Any]]:
