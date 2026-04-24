@@ -171,6 +171,11 @@ def _handle_checkout_completed(conn, payload: dict) -> str | None:
         source="stripe",
     )
     _dispatch_rick_event(conn, "purchase_completed", {**payload, "workflow_id": wf_id})
+    # 2026-04-24: ALSO fire stripe_payment_succeeded so Noa (5-min activation
+    # specialist) gets the event. Iris keeps purchase_completed (post-purchase
+    # fulfillment); Noa runs the welcome+first-skill walkthrough. Disjoint
+    # work — both should fire on every successful checkout.
+    _dispatch_rick_event(conn, "stripe_payment_succeeded", {**payload, "workflow_id": wf_id})
     return wf_id
 
 
