@@ -31,10 +31,12 @@ Env:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -294,6 +296,14 @@ def _build_receipt(target: date) -> dict:
     mrr = _real_mrr()
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+    # 2026-04-24: cryptographic chain anchor — each receipt carries the
+    # SHA-256 of yesterday's receipt file content (verifiable client-side
+    # without trusting git) PLUS the git commit SHA that introduced
+    # yesterday's receipt (extra anchor verifiable via `git show`).
+    # Modifying any past receipt would break the chain. This is the
+    # tamper-evident moat per master plan TIER-4.2 (3-4yr to fake).
+    chain = _previous_receipt_anchors(target)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "date": target.isoformat(),
@@ -301,6 +311,7 @@ def _build_receipt(target: date) -> dict:
         "generator": "receipts-publish.py",
         "tagline": "Rick's receipts. Daily. Including the bad days.",
         "db_status": db_status,
+        "chain": chain,  # NEW: prev_receipt_sha256 + prev_receipt_git_sha
         "mrr": mrr,
         "outcomes": outcomes,
         "workflows": workflows,
@@ -318,7 +329,119 @@ def _build_receipt(target: date) -> dict:
             "mrr_usd_per_mo": mrr["usd_per_mo"],
         },
         "pii_policy": "scrubbed: emails, api_keys, customer_names, prospect_names",
+        "verification": (
+            "anyone can verify the chain: clone meetrick-site, "
+            "run scripts/verify-receipts-chain.py — checks every "
+            "receipt's prev_receipt_sha256 matches the prior file's "
+            "actual SHA-256. Tamper detection is local + cryptographic."
+        ),
     }
+
+
+def _previous_receipt_anchors(target: date) -> dict:
+    """Compute SHA-256 of yesterday's receipt file + git commit SHA that
+    last touched it. Returns {prev_receipt_sha256, prev_receipt_git_sha,
+    prev_receipt_date}. All None for the first-ever receipt."""
+    yesterday = target - timedelta(days=1)
+    yest_path = RECEIPTS_DIR / f"{yesterday.isoformat()}.json"
+
+    sha256 = None
+    if yest_path.is_file():
+        try:
+            sha256 = hashlib.sha256(yest_path.read_bytes()).hexdigest()
+        except OSError:
+            sha256 = None
+
+    git_sha = None
+    try:
+        # Find the commit that last touched yesterday's receipt
+        proc = subprocess.run(
+            ["git", "-C", str(SITE_DIR), "log", "-1", "--format=%H",
+             "--", f"receipts/{yesterday.isoformat()}.json"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            git_sha = proc.stdout.strip()
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        git_sha = None
+
+    return {
+        "prev_receipt_date": yesterday.isoformat() if (sha256 or git_sha) else None,
+        "prev_receipt_sha256": sha256,
+        "prev_receipt_git_sha": git_sha,
+    }
+
+
+def _git_commit_receipt(target: date, receipt: dict) -> dict:
+    """Stage receipts/<date>.json + manifest.json + commit. Returns commit info.
+
+    Auto-push gated by RICK_RECEIPTS_AUTOPUSH=1 (default OFF — Vlad pushes
+    manually after reviewing). Always-safe: skips if not a git repo, skips
+    if nothing staged, skips on any git error.
+    """
+    info = {"committed": False, "commit_sha": None, "pushed": False, "reason": ""}
+    git_dir = SITE_DIR / ".git"
+    if not git_dir.exists():
+        info["reason"] = "site dir is not a git repo"
+        return info
+
+    totals = receipt.get("totals", {})
+    msg_subject = (
+        f"receipts: {target.isoformat()} "
+        f"(spent ${totals.get('combined_cost_usd', 0):.2f}, "
+        f"earned ${totals.get('stripe_gross_usd', 0):.2f}, "
+        f"MRR ${totals.get('mrr_usd_per_mo', 0):.0f})"
+    )
+    msg_body = (
+        f"Auto-published by receipts-publish.py.\n\n"
+        f"Chain anchor (SHA-256 of {receipt['chain']['prev_receipt_date'] or 'genesis'}.json): "
+        f"{receipt['chain']['prev_receipt_sha256'] or 'none'}\n"
+        f"Previous git SHA: {receipt['chain']['prev_receipt_git_sha'] or 'none'}\n\n"
+        f"Verify: scripts/verify-receipts-chain.py"
+    )
+
+    try:
+        subprocess.run(
+            ["git", "-C", str(SITE_DIR), "add",
+             f"receipts/{target.isoformat()}.json", "receipts/manifest.json"],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        # Skip if nothing staged (no changes)
+        diff = subprocess.run(
+            ["git", "-C", str(SITE_DIR), "diff", "--cached", "--name-only"],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        if not diff.stdout.strip():
+            info["reason"] = "no staged changes (receipt unchanged)"
+            return info
+
+        proc = subprocess.run(
+            ["git", "-C", str(SITE_DIR), "commit", "-m", msg_subject, "-m", msg_body],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        # Capture the new commit SHA
+        sha_proc = subprocess.run(
+            ["git", "-C", str(SITE_DIR), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        info["committed"] = True
+        info["commit_sha"] = sha_proc.stdout.strip()
+
+        if os.getenv("RICK_RECEIPTS_AUTOPUSH", "").strip().lower() in ("1", "true", "yes"):
+            push_proc = subprocess.run(
+                ["git", "-C", str(SITE_DIR), "push", "origin", "main"],
+                check=False, capture_output=True, text=True, timeout=30,
+            )
+            info["pushed"] = (push_proc.returncode == 0)
+            if not info["pushed"]:
+                info["reason"] = f"push failed: {push_proc.stderr.strip()[:200]}"
+        else:
+            info["reason"] = "RICK_RECEIPTS_AUTOPUSH not set — Vlad pushes manually"
+    except subprocess.CalledProcessError as exc:
+        info["reason"] = f"git error: {exc.stderr.strip()[:200] if exc.stderr else exc}"
+    except (subprocess.SubprocessError, OSError) as exc:
+        info["reason"] = f"subprocess error: {exc}"
+    return info
 
 
 def _update_manifest(manifest_path: Path, receipt: dict) -> dict:
@@ -416,6 +539,11 @@ def main() -> int:
         print(json.dumps({"status": "error", "reason": f"write manifest: {exc}"}))
         return 1
 
+    # 2026-04-24: git-anchor the published receipt. Single commit per
+    # daily receipt → tamper-evident chain via prev_receipt_sha256 +
+    # prev_receipt_git_sha embedded in each receipt's chain block.
+    git_info = _git_commit_receipt(target, receipt)
+
     print(json.dumps({
         "status": "ok",
         "date": target.isoformat(),
@@ -423,6 +551,8 @@ def main() -> int:
         "manifest_path": str(manifest_path),
         "entries_in_manifest": len(manifest.get("entries", [])),
         "totals": receipt.get("totals", {}),
+        "chain": receipt.get("chain", {}),
+        "git": git_info,
     }))
     return 0
 
