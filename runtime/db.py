@@ -106,6 +106,7 @@ def migrate_db(connection: sqlite3.Connection) -> None:
         ("experiments", "id TEXT PRIMARY KEY"),
         ("email_threads", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("follow_up_queue", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("ledger_entries", "id INTEGER PRIMARY KEY AUTOINCREMENT"),
     ]:
         table_name, _ = table_check
         existing = connection.execute(
@@ -801,6 +802,32 @@ def init_db(connection: sqlite3.Connection) -> None:
             auth_failure_streak INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
+
+        -- Ledger entries (TIER-0 #5, 2026-04-23) — SQL-side mirror of the
+        -- JSONL execution ledger. escalate_stuck_workflows() in engine.py
+        -- queries this table to dedupe per-workflow escalations within 7 days.
+        -- Without the table, the SELECT throws OperationalError (caught) and
+        -- the same stuck workflow gets re-alerted on every heartbeat tick.
+        -- Columns chosen to match engine.py:5573 SELECT (entry_kind, entry_notes,
+        -- created_at) plus the kwargs passed to append_execution_ledger() so
+        -- a future engine.py change can dual-write here without another migration.
+        CREATE TABLE IF NOT EXISTS ledger_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_kind TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            entry_status TEXT NOT NULL DEFAULT '',
+            area TEXT NOT NULL DEFAULT '',
+            project TEXT NOT NULL DEFAULT '',
+            route TEXT NOT NULL DEFAULT '',
+            entry_notes TEXT NOT NULL DEFAULT '',
+            impact TEXT NOT NULL DEFAULT '',
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_entries_kind_created
+            ON ledger_entries(entry_kind, created_at);
+        CREATE INDEX IF NOT EXISTS idx_ledger_entries_notes
+            ON ledger_entries(entry_notes);
         """
     )
     migrate_db(connection)
