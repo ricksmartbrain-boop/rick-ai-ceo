@@ -218,6 +218,19 @@ def gather() -> dict:
                 }
             except Exception:
                 summary["notification_dedup"] = {"unique_alerts": 0, "total_occurrences": 0, "currently_suppressed": 0}
+
+            # Lead-intake auto-suppressions 24h (Ship 5 — vendor/self-send blocklist)
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) AS c FROM jobs "
+                    "WHERE step_name='lead_intake' AND status='done' "
+                    "      AND result_json LIKE '%auto_suppressed%' "
+                    "      AND finished_at >= ?",
+                    (cutoff_24h,),
+                ).fetchone()
+                summary["intake_suppressions_24h"] = int(row["c"] or 0) if row else 0
+            except Exception:
+                summary["intake_suppressions_24h"] = 0
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001
@@ -226,6 +239,39 @@ def gather() -> dict:
     summary["drafts_pending"] = _count_drafts()
     summary["suppression_total"] = _suppression_count()
     summary["funnel"] = _funnel_24h()
+
+    # Fenix observe-mode counts (would-have-been-blocked artifacts).
+    # JSONL log written by runtime/fenix_gate.py preflight() in observe mode.
+    try:
+        from datetime import timedelta as _td
+        fenix_log = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "fenix-observed.jsonl"
+        cutoff_dt = datetime.now() - _td(hours=24)
+        observed_count = 0
+        triggers_seen: dict[str, int] = {}
+        if fenix_log.exists():
+            for line in fenix_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("ts", "")
+                try:
+                    if datetime.fromisoformat(ts) < cutoff_dt:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                observed_count += 1
+                for trig in entry.get("matched_triggers", []):
+                    # Trim trigger string to the matched-text portion for tally
+                    tail = trig.split("→", 1)[-1].strip()
+                    triggers_seen[tail[:40]] = triggers_seen.get(tail[:40], 0) + 1
+        summary["fenix_observed_24h"] = {
+            "would_have_blocked": observed_count,
+            "top_triggers": sorted(triggers_seen.items(), key=lambda kv: -kv[1])[:3],
+        }
+    except Exception:
+        summary["fenix_observed_24h"] = {"would_have_blocked": 0, "top_triggers": []}
+
     return summary
 
 
@@ -300,6 +346,18 @@ def render(s: dict) -> str:
         lines.append("*Cancelled breakdown*:")
         for r in cbk[:3]:
             lines.append(f"  • {r['kind']}: {r['c']}")
+
+    intake_supp = s.get("intake_suppressions_24h", 0) or 0
+    if intake_supp > 0:
+        lines.append(f"🛡 *Intake auto-suppressed*: {intake_supp} (vendor/self-send blocklist saved Iris spend)")
+
+    fenix = s.get("fenix_observed_24h") or {}
+    if fenix.get("would_have_blocked", 0) > 0:
+        lines.append("")
+        line = f"🛡️ *Fenix observed* (would-block in LIVE): {fenix['would_have_blocked']} artifact(s)"
+        lines.append(line)
+        for trigger, count in fenix.get("top_triggers", [])[:3]:
+            lines.append(f"  • {trigger} ×{count}")
 
     sl = s.get("self_learning") or {}
     if sl.get("patterns_total", 0) > 0:
