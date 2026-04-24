@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,9 @@ def log_event(event: dict):
         pass
 
 
+_UPGRADE_RE = re.compile(r"\bupgrade\b", re.IGNORECASE)
+
+
 def classify_one(row: dict) -> str:
     """Returns one of the 4 labels. Falls back to 'not_interested' on any error."""
     body = (row.get("body") or "")[:2000]
@@ -89,6 +93,13 @@ def classify_one(row: dict) -> str:
     body_low = body.lower()
     if any(k in body_low for k in ("unsubscribe", "remove me from", "stop emailing", "opt out", "take me off")):
         return "unsubscribe"
+    # Strategy-C #4 — newsletter Day-N drips end with "Reply UPGRADE for the
+    # install one-liner". Catch that explicit buy-intent keyword before the LLM
+    # call (cheaper, deterministic). Word-boundary match so "downgrade" /
+    # "upgraded my plan last week" don't false-trigger; route to pricing_question
+    # so Vlad gets the urgent ping with full thread context (existing dispatcher).
+    if _UPGRADE_RE.search(body) or _UPGRADE_RE.search(subject):
+        return "pricing_question"
     prompt = CLASSIFIER_PROMPT.format(from_addr=from_addr, subject=subject, body=body)
     try:
         result = generate_text("writing", prompt, fallback="not_interested")
