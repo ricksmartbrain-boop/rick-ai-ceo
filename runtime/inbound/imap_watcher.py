@@ -276,7 +276,7 @@ def _enrich_prospect(conn: sqlite3.Connection, email: str, enrichment: dict) -> 
         return "skip-no-email"
     try:
         row = conn.execute(
-            "SELECT id, notes_json FROM prospect_pipeline WHERE email = ? LIMIT 1",
+            "SELECT id, notes FROM prospect_pipeline WHERE username = ? LIMIT 1",
             (email,),
         ).fetchone()
     except sqlite3.OperationalError:
@@ -284,12 +284,12 @@ def _enrich_prospect(conn: sqlite3.Connection, email: str, enrichment: dict) -> 
         return "skip-no-table"
     if row:
         try:
-            existing = json.loads(row["notes_json"] or "{}")
+            existing = json.loads(row["notes"] or "{}")
         except (json.JSONDecodeError, TypeError):
             existing = {}
         existing.setdefault("imap_enrichments", []).append({**enrichment, "at": _now_iso()})
         conn.execute(
-            "UPDATE prospect_pipeline SET notes_json=?, updated_at=? WHERE id=?",
+            "UPDATE prospect_pipeline SET notes=?, updated_at=? WHERE id=?",
             (json.dumps(existing), _now_iso(), row["id"]),
         )
         return "updated"
