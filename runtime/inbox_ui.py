@@ -543,6 +543,13 @@ def _send_counter_pitch(draft: dict) -> tuple[bool, str]:
 
 def cmd_send(chat_id: Any, n_str: str | None, tail: str = "") -> str:
     try:
+        # Defense-in-depth chat_id allowlist gate. parse_telegram_text already
+        # checks but only when chat_id is truthy — guard the mutator directly
+        # so any future caller (or empty/missing chat_id) cannot fire emails.
+        from runtime.engine import authorized_telegram_chat
+        if not chat_id or not authorized_telegram_chat(chat_id):
+            _log({"event": "send-unauthorized", "chat_id": _safe_chat_id(chat_id)})
+            return "(unauthorized)"
         n, draft, err = _resolve_draft(chat_id, n_str)
         if err:
             return err
@@ -580,6 +587,11 @@ def cmd_send(chat_id: Any, n_str: str | None, tail: str = "") -> str:
 
 def cmd_skip(chat_id: Any, n_str: str | None, tail: str = "") -> str:
     try:
+        # Defense-in-depth chat_id allowlist gate (matches cmd_send).
+        from runtime.engine import authorized_telegram_chat
+        if not chat_id or not authorized_telegram_chat(chat_id):
+            _log({"event": "skip-unauthorized", "chat_id": _safe_chat_id(chat_id)})
+            return "(unauthorized)"
         n, draft, err = _resolve_draft(chat_id, n_str)
         if err:
             return err
