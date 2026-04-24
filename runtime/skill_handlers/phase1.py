@@ -115,6 +115,19 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
                 workflow_stage="auto-suppressed",
             )
 
+    # 2026-04-24: pattern READ side fanned out to lead_intake. Surfaces top-3
+    # most-effective patterns so the dossier-building LLM benefits from
+    # accumulated intake lessons. Same shielded shape as ship 6.
+    picked_patterns: list[dict] = []
+    pattern_context = ""
+    try:
+        from runtime import patterns as _patterns
+        picked_patterns = _patterns.pick_patterns(connection, "lead_intake", top_n=3)
+        pattern_context = _patterns.format_pattern_context(picked_patterns)
+    except Exception:
+        picked_patterns = []
+        pattern_context = ""
+
     # Build lead dossier via LLM
     prompt = (
         "You are Rick, an AI CEO qualifying an inbound lead.\n\n"
@@ -132,6 +145,7 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "- best_product_match: string (one of: starter-kit-9, playbook-29, toolkit-97, managed-499, enterprise-2500)\n"
         "- summary: 1-2 sentence lead summary\n"
         "Output ONLY valid JSON."
+        f"{pattern_context}"
     )
     fallback = json.dumps({
         "name": lead_name or "Unknown",
@@ -149,6 +163,25 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         dossier = json.loads(result.content)
     except json.JSONDecodeError:
         dossier = json.loads(fallback)
+
+    # 2026-04-24: pattern CREDIT side. Won = the LLM produced a parseable
+    # dossier matching schema (NOT the fallback). Bumps sum_runs always +
+    # sum_wins on success so picker's win_rate denominator stays honest.
+    if picked_patterns:
+        try:
+            from runtime import patterns as _patterns_record
+            won = (
+                isinstance(dossier, dict)
+                and all(dossier.get(k) for k in ("name", "intent", "best_product_match"))
+                and dossier.get("summary", "") != f"Inbound lead from {lead_source}."  # not the fallback
+            )
+            _patterns_record.record_pattern_outcome(
+                connection,
+                pattern_ids=[p["id"] for p in picked_patterns if p.get("id")],
+                success=won,
+            )
+        except Exception:
+            pass
 
     # Persist lead to prospect pipeline
     prospect_id = f"pr_{uuid.uuid4().hex[:12]}"
@@ -792,6 +825,19 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
     qualification = deal_files.get("qualification.json", {})
     total_score = qualification.get("total_score", 5)
 
+    # 2026-04-24: pattern READ side fanned to close_or_escalate. Strategy
+    # route is opus-4-7 (smart) — pattern context helps Rick make better
+    # close/escalate calls based on past wins on similar deals.
+    picked_patterns: list[dict] = []
+    pattern_context = ""
+    try:
+        from runtime import patterns as _patterns
+        picked_patterns = _patterns.pick_patterns(connection, "close_or_escalate", top_n=3)
+        pattern_context = _patterns.format_pattern_context(picked_patterns)
+    except Exception:
+        picked_patterns = []
+        pattern_context = ""
+
     prompt = (
         "You are Rick, evaluating whether to close a deal or escalate.\n\n"
         f"Lead: {json.dumps(deal_files.get('lead-dossier.json', {}))}\n"
@@ -802,6 +848,7 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
         "- next_action: what to do next\n"
         "- revenue_estimate: monthly revenue if closed\n"
         "Output ONLY valid JSON."
+        f"{pattern_context}"
     )
     fallback = json.dumps({
         "decision": "escalate_to_founder" if total_score >= 7 else "closed_lost",
@@ -815,6 +862,25 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
         decision = json.loads(result.content)
     except json.JSONDecodeError:
         decision = json.loads(fallback)
+
+    # 2026-04-24: pattern CREDIT side. Won = decision is one of the valid
+    # canonical labels AND has a non-trivial reason. The escalate_to_founder
+    # decision is a "win" if Rick correctly identified founder-attention
+    # cases (i.e., total_score >= 7). closed_won/lost wins iff reason ≥ 20 ch.
+    if picked_patterns:
+        try:
+            from runtime import patterns as _patterns_record
+            valid_labels = {"closed_won", "closed_lost", "escalate_to_founder"}
+            d_label = decision.get("decision", "")
+            d_reason = (decision.get("reason", "") or "").strip()
+            won = d_label in valid_labels and len(d_reason) >= 20
+            _patterns_record.record_pattern_outcome(
+                connection,
+                pattern_ids=[p["id"] for p in picked_patterns if p.get("id")],
+                success=won,
+            )
+        except Exception:
+            pass
 
     path = write_file(deal_dir / "close-decision.json", json.dumps(decision, indent=2))
 
