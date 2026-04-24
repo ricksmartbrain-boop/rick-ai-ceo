@@ -68,6 +68,53 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     lead_source = trigger.get("source", context.get("source", "unknown"))
     lead_message = trigger.get("message", trigger.get("body", ""))
 
+    # 2026-04-24: pre-LLM blocklist. Iris on Opus 4.7 was burning $0.20+ per
+    # call qualifying obvious garbage (Rick pitching himself, vendor cold pitches,
+    # newsletter sign-ups treated as leads). Auto-suppress before the LLM is
+    # invoked. Real warm prospects flow through unchanged. Override:
+    # RICK_LEAD_BLOCKLIST_DISABLED=1.
+    if os.getenv("RICK_LEAD_BLOCKLIST_DISABLED", "").strip().lower() not in ("1", "true", "yes"):
+        try:
+            from runtime.inbound.imap_watcher import SELF_SEND_ADDRESSES
+        except ImportError:
+            SELF_SEND_ADDRESSES = {
+                "rick@meetrick.ai", "hello@meetrick.ai",
+                "vlad@meetrick.ai", "vladislav@belkins.io",
+            }
+        VENDOR_BLOCKLIST_DOMAINS: set[str] = set()  # populate via observation
+        VENDOR_BLOCKLIST_KEYWORDS = (
+            "we help b2b", "schedule a demo with us", "our solution will",
+            "boost your revenue by", "newsletter", "unsubscribe to stop",
+            "no-reply", "noreply", "do not reply",
+        )
+        low_email = (lead_email or "").lower().strip()
+        low_domain = low_email.split("@", 1)[-1] if "@" in low_email else ""
+        # Self-send guard: Rick must never qualify Rick or Vlad as an inbound lead
+        if low_email in SELF_SEND_ADDRESSES or low_domain.endswith("meetrick.ai") or (low_domain and low_domain in VENDOR_BLOCKLIST_DOMAINS):
+            return StepOutcome(
+                summary=f"auto_suppressed: self-or-vendor sender ({low_email or 'no-email'}) — skipped LLM qualification",
+                artifacts=[{
+                    "kind": "suppression-record",
+                    "title": "Lead intake auto-suppressed",
+                    "metadata": {"reason": "self_or_vendor", "email": low_email, "source": lead_source},
+                }],
+                workflow_status="cancelled",
+                workflow_stage="auto-suppressed",
+            )
+        low_msg = (lead_message or "")[:2000].lower()
+        if any(kw in low_msg for kw in VENDOR_BLOCKLIST_KEYWORDS):
+            matched = next((kw for kw in VENDOR_BLOCKLIST_KEYWORDS if kw in low_msg), "")
+            return StepOutcome(
+                summary=f"auto_suppressed: vendor-pitch language matched '{matched}' — skipped LLM qualification",
+                artifacts=[{
+                    "kind": "suppression-record",
+                    "title": "Lead intake auto-suppressed (vendor pitch)",
+                    "metadata": {"reason": "vendor_pitch_keywords", "matched": matched, "email": low_email, "source": lead_source},
+                }],
+                workflow_status="cancelled",
+                workflow_stage="auto-suppressed",
+            )
+
     # Build lead dossier via LLM
     prompt = (
         "You are Rick, an AI CEO qualifying an inbound lead.\n\n"
@@ -445,12 +492,29 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         prompt_style = pitch_style_default
         active_variant_id = "baseline"
 
+    # 2026-04-24: Wave-3 self-learning READ side. The pattern miner has been
+    # writing distilled lessons into effective_patterns for days but NOTHING
+    # was reading them back out → entire learning loop dead. pick_patterns
+    # surfaces the top-3 most-effective snippets applicable to pitch_draft
+    # (own skill OR universal dream_insights). format_pattern_context returns
+    # "" when no patterns apply — handler degrades gracefully.
+    picked_patterns: list[dict] = []
+    pattern_context = ""
+    try:
+        from runtime import patterns as _patterns
+        picked_patterns = _patterns.pick_patterns(connection, "pitch_draft", top_n=3)
+        pattern_context = _patterns.format_pattern_context(picked_patterns)
+    except Exception:
+        picked_patterns = []
+        pattern_context = ""
+
     prompt = (
         f"{prompt_style}\n\n"
         f"Lead: {json.dumps(dossier)}\n"
         f"Qualification: {json.dumps(qualification)}\n"
         f"Product: {product_name} (${price})\n"
         f"{recent_ops}"
+        f"{pattern_context}"
     )
     fallback = (
         f"**Subject:** How Rick runs a business autonomously — and can run yours\n\n"
@@ -487,9 +551,24 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     except Exception:
         pass
 
+    # 2026-04-24: Wave-3 self-learning WRITE side. Credit the patterns that
+    # influenced this draft (positively if won, but always bump sum_runs so
+    # the picker's win_rate denominator stays honest). Closes the loop:
+    # pattern_miner WRITE → pick_patterns READ → record_pattern_outcome CREDIT.
+    if picked_patterns:
+        try:
+            from runtime import patterns as _patterns_record
+            _patterns_record.record_pattern_outcome(
+                connection,
+                pattern_ids=[p["id"] for p in picked_patterns if p.get("id")],
+                success=won,
+            )
+        except Exception:
+            pass
+
     return StepOutcome(
-        summary=f"Pitch drafted for {dossier.get('name', lead_id)}: {product_name} (${price}) [variant={active_variant_id} score={score:.2f}]",
-        artifacts=[{"kind": "pitch-draft", "title": "Sales Pitch", "path": path, "metadata": {"product": product, "price": price, "variant": active_variant_id, "quality_proxy": score}}],
+        summary=f"Pitch drafted for {dossier.get('name', lead_id)}: {product_name} (${price}) [variant={active_variant_id} score={score:.2f} patterns={len(picked_patterns)}]",
+        artifacts=[{"kind": "pitch-draft", "title": "Sales Pitch", "path": path, "metadata": {"product": product, "price": price, "variant": active_variant_id, "quality_proxy": score, "patterns_used": [p.get("id") for p in picked_patterns]}}],
         workflow_stage="pitch-drafted",
     )
 
