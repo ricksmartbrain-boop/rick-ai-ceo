@@ -268,5 +268,53 @@ class LeadIntakeBlocklistTests(unittest.TestCase):
                 self.assertTrue(known.split("@", 1)[1].endswith("meetrick.ai") or known.endswith("@belkins.io"))
 
 
+# =============================================================================
+# Fenix preflight gate
+# =============================================================================
+
+class FenixGateTests(unittest.TestCase):
+    def test_non_public_channel_bypasses_gate(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        # email is NOT in PUBLIC_CHANNELS — Iris/Noa workflows have own gates
+        needs, matches = needs_fenix_review("email", {"body": "Hi Newton, please refund"})
+        self.assertFalse(needs)
+        self.assertEqual([], matches)
+
+    def test_public_channel_safe_text_no_review(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("moltbook", {"body": "Just shipped a new feature today"})
+        self.assertFalse(needs)
+
+    def test_customer_naming_triggers_review(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("reddit", {"body": "Newton signed up yesterday"})
+        self.assertTrue(needs)
+        self.assertTrue(any("newton" in m.lower() for m in matches))
+
+    def test_pricing_triggers_review(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("blog", {"body": "Pro tier is now $29/mo"})
+        self.assertTrue(needs)
+
+    def test_legal_language_triggers_review(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("threads", {"body": "GDPR compliant from day one"})
+        self.assertTrue(needs)
+
+    def test_founder_voice_commitment_triggers_review(self) -> None:
+        from runtime.fenix_gate import needs_fenix_review
+        needs, matches = needs_fenix_review("linkedin", {"body": "I promise to ship daily"})
+        self.assertTrue(needs)
+
+    def test_observe_mode_default_proceeds(self) -> None:
+        from runtime.fenix_gate import preflight
+        os.environ.pop("RICK_FENIX_LIVE", None)  # ensure observe mode
+        result = preflight(None, "moltbook", {"body": "Newton just paid $29/mo"})
+        self.assertEqual("proceed", result["action"])
+        self.assertFalse(result["live"])
+        self.assertTrue(result["needs_review"])  # heuristic fired
+        self.assertGreater(len(result["matched_triggers"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

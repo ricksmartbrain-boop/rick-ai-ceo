@@ -195,6 +195,36 @@ def _process_one(conn, job) -> dict:
     except json.JSONDecodeError:
         payload = {}
 
+    # 2026-04-24: Fenix preflight gate. Public artifacts (moltbook/reddit/
+    # threads/instagram/linkedin/blog/x) get scanned for trigger keywords
+    # (customer names, prices, refund/legal language, founder voice).
+    # OBSERVE mode (RICK_FENIX_LIVE!=1, default): logs would-have-been
+    # blocks to fenix-observed.jsonl, doesn't gate.
+    # LIVE mode (RICK_FENIX_LIVE=1): invokes Fenix LLM on flagged artifacts;
+    # block/escalate suppresses the send + notifies Vlad. Approve proceeds.
+    try:
+        from runtime.fenix_gate import preflight as _fenix_preflight
+        gate = _fenix_preflight(conn, channel, payload, job_id=job["id"])
+        if gate["action"] != "proceed":
+            conn.execute(
+                """
+                UPDATE outbound_jobs
+                   SET status='fenix-blocked',
+                       last_error=?,
+                       finished_at=?,
+                       attempts=attempts+1
+                 WHERE id=?
+                """,
+                (f"fenix-{gate['action']}: {gate['reason'][:400]}", _now_iso(), job["id"]),
+            )
+            conn.commit()
+            summary["status"] = f"fenix-{gate['action']}"
+            summary["reason"] = gate["reason"]
+            return summary
+    except Exception:
+        # Never let the gate itself break the send pipeline.
+        pass
+
     attempts = int(job["attempts"] or 0) + 1
     try:
         result = send_fn(payload)
