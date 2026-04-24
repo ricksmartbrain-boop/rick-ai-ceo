@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
@@ -495,6 +496,11 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
     email = trigger.get("email", "")
     source = trigger.get("source", "unknown")
 
+    # Two outputs (intentional duplication for safety):
+    # 1) JSON record at outbox/ — durable audit trail (legacy, kept).
+    # 2) Markdown <stamp>-<slug>-step1.md at outbox/ad-hoc/ — the format
+    #    email-sequence-send.py actually delivers via Resend. Without this,
+    #    pitch_send "succeeds" but nothing leaves Rick.
     outbox_dir = DATA_ROOT / "mailbox" / "outbox"
     outbox_dir.mkdir(parents=True, exist_ok=True)
 
@@ -510,6 +516,37 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
         "status": "pending",
     }
     write_file(outbox_file, json.dumps(outbox_payload, indent=2))
+
+    # Wave-6 fix — emit the .md the sender actually picks up.
+    if email and "@" in email:
+        adhoc_dir = outbox_dir / "ad-hoc"
+        adhoc_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        slug = slugify(lead_id)[:40]
+        md_path = adhoc_dir / f"{stamp}-{slug}-step1.md"
+        # Strip any "**Subject:** ..." prefix from the LLM body and use as subject
+        body_lines = pitch.splitlines()
+        subject = f"Quick note for {lead_id}"
+        body_start = 0
+        for i, ln in enumerate(body_lines[:5]):
+            m = re.match(r"^\*\*Subject:\*\*\s*(.+)", ln, re.IGNORECASE)
+            if m:
+                subject = m.group(1).strip()[:120]
+                body_start = i + 1
+                break
+        clean_body = "\n".join(body_lines[body_start:]).strip().replace("{{checkout_url}}",
+                       f"https://meetrick.ai/install?utm_source=pitch&utm_campaign={slugify(lead_id)}")
+        frontmatter = (
+            "---\n"
+            f"to: {email}\n"
+            f"subject: {subject}\n"
+            "from: Rick <rick@meetrick.ai>\n"
+            f"workflow_id: {workflow['id']}\n"
+            f"product: {product}\n"
+            f"price_usd: {price}\n"
+            "---\n\n"
+        )
+        md_path.write_text(frontmatter + clean_body + "\n", encoding="utf-8")
 
     # Update prospect status
     connection.execute(
