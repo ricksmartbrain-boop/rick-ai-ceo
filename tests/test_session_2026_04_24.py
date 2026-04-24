@@ -319,6 +319,87 @@ class FenixGateTests(unittest.TestCase):
 
 
 # =============================================================================
+# VARA attestation
+# =============================================================================
+
+class VaraAttestationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Isolated in-memory DB with the customers/customer_events schema VARA needs
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        self.con.executescript("""
+            CREATE TABLE customers (
+                id TEXT PRIMARY KEY, email TEXT, name TEXT,
+                source TEXT, created_at TEXT, updated_at TEXT, last_seen_at TEXT
+            );
+            CREATE TABLE customer_events (
+                id TEXT PRIMARY KEY, customer_id TEXT, workflow_id TEXT,
+                event_type TEXT, payload_json TEXT, created_at TEXT
+            );
+        """)
+        os.environ["RICK_ID"] = "test_rick_id_for_vara"
+        os.environ["RICK_SECRET"] = "test_rick_secret_for_vara"
+
+    def _seed_customer(self, customer_id: str, total_usd: float, n_events: int = 1) -> None:
+        self.con.execute(
+            "INSERT INTO customers (id, email) VALUES (?, ?)",
+            (customer_id, f"{customer_id}@test.local"),
+        )
+        per_event = total_usd / max(1, n_events)
+        for i in range(n_events):
+            self.con.execute(
+                "INSERT INTO customer_events (id, customer_id, event_type, payload_json, created_at) "
+                "VALUES (?, ?, 'purchase_recorded', ?, ?)",
+                (f"evt_{customer_id}_{i}", customer_id,
+                 json.dumps({"amount_usd": per_event}),
+                 f"2026-01-{i+1:02d}T00:00:00"),
+            )
+        self.con.commit()
+
+    def test_no_attestation_below_tier(self) -> None:
+        from runtime.vara import scan_and_mint
+        self._seed_customer("cus_low", 100.0)
+        result = scan_and_mint(self.con, dry_run=False)
+        self.assertEqual(0, len(result["minted"]))
+        self.assertEqual(1, result["checked"])
+
+    def test_mints_at_first_tier(self) -> None:
+        from runtime.vara import scan_and_mint
+        self._seed_customer("cus_1k", 1500.0, n_events=3)
+        result = scan_and_mint(self.con, dry_run=False)
+        self.assertEqual(1, len(result["minted"]))
+        self.assertEqual(1000, result["minted"][0]["tier_usd"])
+
+    def test_idempotent_mint(self) -> None:
+        from runtime.vara import scan_and_mint
+        self._seed_customer("cus_1k", 1500.0)
+        scan_and_mint(self.con, dry_run=False)
+        result2 = scan_and_mint(self.con, dry_run=False)
+        # Second call — no new mints, but already_minted populated
+        self.assertEqual(0, len(result2["minted"]))
+        self.assertEqual(1, len(result2["already_minted"]))
+
+    def test_dry_run_no_writes(self) -> None:
+        from runtime.vara import scan_and_mint
+        self._seed_customer("cus_1k", 1500.0)
+        result = scan_and_mint(self.con, dry_run=True)
+        self.assertEqual(1, len(result["eligible"]))
+        self.assertEqual(0, len(result["minted"]))
+        # Table should be empty
+        rows = self.con.execute("SELECT COUNT(*) AS c FROM vara_attestations").fetchone()
+        self.assertEqual(0, rows["c"])
+
+    def test_multi_tier_progression(self) -> None:
+        from runtime.vara import scan_and_mint
+        self._seed_customer("cus_high", 12000.0, n_events=4)
+        result = scan_and_mint(self.con, dry_run=False)
+        # Crosses $1K AND $5K AND $10K — three attestations
+        self.assertEqual(3, len(result["minted"]))
+        tiers = sorted(m["tier_usd"] for m in result["minted"])
+        self.assertEqual([1000, 5000, 10000], tiers)
+
+
+# =============================================================================
 # Fenix gate — email channel coverage
 # =============================================================================
 

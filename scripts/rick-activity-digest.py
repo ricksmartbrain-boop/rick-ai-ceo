@@ -240,6 +240,20 @@ def gather() -> dict:
     summary["suppression_total"] = _suppression_count()
     summary["funnel"] = _funnel_24h()
 
+    # VARA attestation visibility — surfaces total + max tier reached.
+    # Mostly silent today (Newton at $18 cumulative, lowest tier $1K), but
+    # the moment any customer crosses a tier the digest will show it.
+    try:
+        from runtime.vara import attestation_summary as _vara_summary
+        from runtime.db import connect as _vc
+        _vc_con = _vc()
+        try:
+            summary["vara"] = _vara_summary(_vc_con)
+        finally:
+            _vc_con.close()
+    except Exception:
+        summary["vara"] = {"total_attestations": 0, "max_tier_usd": 0, "unique_customers": 0}
+
     # Lead-replay dry-run visibility — surfaces "would queue N leads" so Vlad
     # can see what the dormant 607-lead pool looks like BEFORE flipping
     # RICK_LEAD_REPLAY_LIVE=1. Counts entries from last 24h with action
@@ -383,6 +397,13 @@ def render(s: dict) -> str:
         lines.append(
             f"🚦 *Lead-replay (dry-run)*: would queue {lead_replay_dry} leads — "
             f"flip `RICK_LEAD_REPLAY_LIVE=1` in rick.env to ship"
+        )
+
+    vara = s.get("vara") or {}
+    if vara.get("total_attestations", 0) > 0:
+        lines.append(
+            f"🏅 *VARA*: {vara['total_attestations']} attestation(s) across "
+            f"{vara['unique_customers']} customer(s) — top tier ${vara['max_tier_usd']:,}"
         )
 
     fenix = s.get("fenix_observed_24h") or {}
