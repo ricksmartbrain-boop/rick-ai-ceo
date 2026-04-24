@@ -184,6 +184,40 @@ def gather() -> dict:
                 summary["active_email_threads"] = row["c"] if row else 0
             except Exception:
                 summary["active_email_threads"] = 0
+
+            # 2026-04-24: surface the self-learning loop. effective_patterns sum_runs/sum_wins
+            # were 0 for weeks (no readers). Now incrementing — Vlad sees the loop work.
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) AS total, "
+                    "       SUM(CASE WHEN sum_runs > 0 THEN 1 ELSE 0 END) AS used, "
+                    "       SUM(sum_wins) AS total_wins, "
+                    "       SUM(sum_runs) AS total_runs "
+                    "FROM effective_patterns"
+                ).fetchone()
+                summary["self_learning"] = {
+                    "patterns_total": int(row["total"] or 0) if row else 0,
+                    "patterns_used": int(row["used"] or 0) if row else 0,
+                    "credit_runs": int(row["total_runs"] or 0) if row else 0,
+                    "credit_wins": int(row["total_wins"] or 0) if row else 0,
+                }
+            except Exception:
+                summary["self_learning"] = {"patterns_total": 0, "patterns_used": 0, "credit_runs": 0, "credit_wins": 0}
+
+            # Notification dedup health (count of unique alerts being suppressed)
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) AS rows, COALESCE(SUM(total_seen),0) AS seen, "
+                    "       COALESCE(SUM(count_since_alert),0) AS suppressed_now "
+                    "FROM notification_dedupe"
+                ).fetchone()
+                summary["notification_dedup"] = {
+                    "unique_alerts": int(row["rows"] or 0) if row else 0,
+                    "total_occurrences": int(row["seen"] or 0) if row else 0,
+                    "currently_suppressed": int(row["suppressed_now"] or 0) if row else 0,
+                }
+            except Exception:
+                summary["notification_dedup"] = {"unique_alerts": 0, "total_occurrences": 0, "currently_suppressed": 0}
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001
@@ -266,6 +300,23 @@ def render(s: dict) -> str:
         lines.append("*Cancelled breakdown*:")
         for r in cbk[:3]:
             lines.append(f"  • {r['kind']}: {r['c']}")
+
+    sl = s.get("self_learning") or {}
+    if sl.get("patterns_total", 0) > 0:
+        used_pct = (100 * sl["patterns_used"] / max(1, sl["patterns_total"]))
+        wr = (sl["credit_wins"] / sl["credit_runs"]) if sl.get("credit_runs", 0) > 0 else 0.0
+        lines.append("")
+        lines.append(
+            f"🧠 *Self-learning*: {sl['patterns_used']}/{sl['patterns_total']} patterns active "
+            f"({used_pct:.0f}%) · {sl['credit_runs']} reads · {sl['credit_wins']} wins ({wr*100:.0f}% WR)"
+        )
+
+    nd = s.get("notification_dedup") or {}
+    if nd.get("currently_suppressed", 0) > 0:
+        lines.append(
+            f"🔕 *Alert dedup*: {nd['unique_alerts']} unique kinds · "
+            f"suppressed {nd['currently_suppressed']} dupes pending next 24h cycle"
+        )
 
     lines.append("")
     lines.append(f"_Suppression list: {s.get('suppression_total', 0)} entries_")

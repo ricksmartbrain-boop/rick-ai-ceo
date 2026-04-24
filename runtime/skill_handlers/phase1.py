@@ -320,7 +320,22 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         prompt_template = qualify_strict
         active_variant_id = "strict"
 
-    prompt = prompt_template.replace("{{DOSSIER}}", json.dumps(dossier))
+    # 2026-04-24: pattern READ side fanned out from pitch_draft to lead_qualify.
+    # Surfaces top-3 most-effective dream_insights / lead-related patterns so
+    # the qualifier benefits from accumulated lessons (e.g. "cold scraped names
+    # have no message field — score lower; warm replies with questions are
+    # higher intent than they appear"). Same shielded shape as handle_pitch_draft.
+    picked_patterns: list[dict] = []
+    pattern_context = ""
+    try:
+        from runtime import patterns as _patterns
+        picked_patterns = _patterns.pick_patterns(connection, "lead_qualify", top_n=3)
+        pattern_context = _patterns.format_pattern_context(picked_patterns)
+    except Exception:
+        picked_patterns = []
+        pattern_context = ""
+
+    prompt = prompt_template.replace("{{DOSSIER}}", json.dumps(dossier)) + pattern_context
     fallback = json.dumps({
         "intent_score": 5, "fit_score": 5, "budget_score": 5, "urgency_score": 5,
         "total_score": 5, "qualification": "warm",
@@ -382,13 +397,27 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
     except Exception:
         pass
 
+    # 2026-04-24: pattern CREDIT side fanned out to lead_qualify. Increment
+    # sum_runs for every pattern used, sum_wins if quality_score crossed
+    # threshold. Closes the read→credit loop for qualifier patterns.
+    if picked_patterns:
+        try:
+            from runtime import patterns as _patterns_record
+            _patterns_record.record_pattern_outcome(
+                connection,
+                pattern_ids=[p["id"] for p in picked_patterns if p.get("id")],
+                success=quality_score >= 0.7,
+            )
+        except Exception:
+            pass
+
     notify_text = None
     if total_score >= 8:
         notify_text = f"HOT LEAD: {dossier.get('name', lead_id)} scored {total_score}/10 — {qualification.get('recommended_product')}"
 
     return StepOutcome(
-        summary=f"Lead qualified: {qualification.get('qualification')} (score {total_score}/10) [variant={active_variant_id} q={quality_score:.2f}]",
-        artifacts=[{"kind": "lead-qualification", "title": "Lead Qualification", "path": path, "metadata": {**qualification, "variant": active_variant_id, "quality_proxy": quality_score}}],
+        summary=f"Lead qualified: {qualification.get('qualification')} (score {total_score}/10) [variant={active_variant_id} q={quality_score:.2f} patterns={len(picked_patterns)}]",
+        artifacts=[{"kind": "lead-qualification", "title": "Lead Qualification", "path": path, "metadata": {**qualification, "variant": active_variant_id, "quality_proxy": quality_score, "patterns_used": [p.get("id") for p in picked_patterns]}}],
         workflow_stage="qualified",
         notify_text=notify_text,
     )
