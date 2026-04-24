@@ -303,11 +303,16 @@ def main() -> int:
             failed += 1
             _log("dispatch.error", lead_id=lead.get("id"), error=str(e)[:200])
 
-    # Advance state (even in dry-run, so we don't loop the same batch forever
-    # in dry-run testing — Vlad can manually reset the state file if needed).
-    if new_max and new_max != last_id:
+    # Advance state ONLY when live — dry-run must NOT mutate state, otherwise
+    # a quick `--dry-run` accidentally skips real leads when live runs next
+    # (verified live 2026-04-23: dry-run consumed 2 real leads, lost them
+    # to the bridge until manual state reset). dry-run should be observable
+    # without side effects.
+    if live and new_max and new_max != last_id:
         _write_state(new_max)
         _log("state.advance", from_id=last_id, to_id=new_max)
+    elif (not live) and new_max and new_max != last_id:
+        _log("state.advance.skipped_dry_run", would_advance_to=new_max, current=last_id)
 
     if live:
         summary = (
