@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -291,6 +292,28 @@ def main() -> int:
                         source=lead.get("source"),
                         info=info,
                     )
+                    # Lane Q bonus integration — fire roast-case-study drafter
+                    # subprocess so Vlad gets a LinkedIn-shaped sharable card
+                    # in the customer Telegram topic for every dispatched lead.
+                    # Fire-and-forget; never blocks the poller; caps timeout
+                    # at 120s so a stuck Sonnet call can't stall the cron.
+                    try:
+                        cs_script = ROOT / "skills" / "roast-case-study" / "scripts" / "draft-case-study.py"
+                        if cs_script.is_file() and payload["domain"]:
+                            cs_args = ["python3", str(cs_script),
+                                       "--domain", payload["domain"]]
+                            roast_summary = (lead.get("roast_summary") or "")[:1500]
+                            if roast_summary:
+                                cs_args.extend(["--roast-summary", roast_summary])
+                            subprocess.Popen(
+                                cs_args,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True,
+                            )
+                            _log("case_study.dispatched", lead_id=lead_id, domain=payload["domain"])
+                    except Exception as cs_e:
+                        _log("case_study.error", lead_id=lead_id, error=str(cs_e)[:200])
                 else:
                     failed += 1
                     _log("dispatch.fail", lead_id=lead_id, info=info)
