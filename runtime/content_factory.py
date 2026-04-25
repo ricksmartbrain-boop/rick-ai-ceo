@@ -123,6 +123,12 @@ def produce(targets: int, channels: list[str]) -> dict:
                 # Channel-specific shape
                 if channel == "moltbook":
                     payload["submolt"] = os.getenv("RICK_FACTORY_DEFAULT_SUBMOLT", "buildinpublic")
+                    # moltbook-post.py requires --title. Derive from body's
+                    # first sentence (or first 80 chars), strip trailing punct.
+                    derived_title = body.split(". ")[0].strip().rstrip(".!?,:;")
+                    if len(derived_title) > 80:
+                        derived_title = derived_title[:77] + "..."
+                    payload["title"] = derived_title or "Operator notes"
                 if channel == "threads":
                     payload["caption"] = body
                 if channel == "instagram":
