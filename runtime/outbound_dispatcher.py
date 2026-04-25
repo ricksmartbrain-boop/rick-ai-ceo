@@ -158,7 +158,26 @@ def _process_one(conn, job) -> dict:
     try:
         kill_switches.assert_channel_active(conn, channel)
     except kill_switches.ChannelPaused as exc:
-        # Reschedule instead of failing — channel might come back online.
+        # 2026-04-25: "unknown channel" is non-recoverable — the channel is
+        # not in config/channel-limits.json and never will be without code.
+        # Treating it like quiet-hours/rate-limit pauses caused 200 synthetic
+        # load-test jobs to loop forever (no attempts++, no MAX_ATTEMPTS exit).
+        # Caught by Rick TUI diagnostic 2026-04-25. Mark as skipped (terminal).
+        if "unknown channel" in (exc.reason or ""):
+            conn.execute(
+                """
+                UPDATE outbound_jobs
+                   SET status='skipped', last_error=?, finished_at=?,
+                       attempts=attempts+1
+                 WHERE id=?
+                """,
+                (f"unknown-channel: {exc.reason}"[:500], _now_iso(), job["id"]),
+            )
+            conn.commit()
+            summary["status"] = "skipped"
+            summary["reason"] = exc.reason
+            return summary
+        # Recoverable pauses (quiet hours, rate limit) — reschedule.
         conn.execute(
             """
             UPDATE outbound_jobs

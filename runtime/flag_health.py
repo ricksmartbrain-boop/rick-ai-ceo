@@ -31,10 +31,10 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
         lambda e: e.get("mode") == "live"),
     ("RICK_HIVE_ENABLED", "hive-heartbeat.jsonl", 1.5,
         lambda e: e.get("result") == "posted" or e.get("status") == "ok"),
-    # 8h not 6h: hive-sync runs every 6h. A 6h threshold flaps every cycle
-    # because the probe runs slightly after the cron's nominal trigger.
-    # 8h adds 2h of hysteresis without missing actual loop-dead regressions.
-    ("RICK_HIVE_SYNC_LIVE", "hive-sync.jsonl", 8.0,
+    # 26h not 8h: hive-sync's actual cadence is daily (04:30 PT per
+    # ai.rick.hive-sync.plist), not every 6h as I originally assumed. 26h
+    # gives 2h slack on a 24h cron. Confirmed via Rick TUI 2026-04-25.
+    ("RICK_HIVE_SYNC_LIVE", "hive-sync.jsonl", 26.0,
         lambda e: e.get("status") == "ok"),
     ("RICK_VARA_LIVE", "vara.jsonl", 168.0, None),
     ("RICK_LEAD_REPLAY_LIVE", "lead-replay.jsonl", 26.0, None),
@@ -44,13 +44,12 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     ("RICK_OUTBOUND_MOLTBOOK_LIVE", "outbound-dispatcher.jsonl", 26.0,
         lambda e: e.get("channel") == "moltbook"
         and e.get("status") in ("sent", "observed-only")),
-    # Operationally-important flags added 2026-04-25 after coverage gap caught
-    # in review (8 of 17 → 12 of 17). EMAIL_SEND is the single most important
-    # — silent mail-relay regression is exactly the "X silent for 4 days"
-    # class of bug this probe was built for.
-    ("RICK_EMAIL_SEND_LIVE", "outbound-dispatcher.jsonl", 26.0,
-        lambda e: (e.get("channel") or "").startswith("email")
-        and e.get("status") in ("sent", "observed-only")),
+    # TODO(2026-04-25): RICK_EMAIL_SEND_LIVE probe pulled — Rick TUI
+    # confirmed email sends bypass outbound-dispatcher.jsonl and resolve
+    # via the Resend API directly (verified Apr 25: 5 deliveries in last
+    # 4h despite this log showing 95h stale). Re-add once we identify the
+    # right log surface — likely a Resend webhook log or
+    # skills/email-automation/scripts/email-sequence-dispatch.py output.
     ("RICK_OUTBOUND_THREADS_LIVE", "outbound-dispatcher.jsonl", 26.0,
         lambda e: e.get("channel") == "threads"
         and e.get("status") in ("sent", "observed-only")),
