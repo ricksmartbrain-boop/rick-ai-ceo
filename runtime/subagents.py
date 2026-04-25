@@ -364,6 +364,7 @@ def dispatch_openclaw(
     parent_workflow_id: str | None = None,
     parent_job_id: str | None = None,
     parent_fanout_id: str | None = None,
+    forked_context: bool = False,
 ) -> DelegationResult:
     """Dispatch a task to a sub-agent via OpenClaw subagent spawn."""
     run_id = f"sa_{uuid.uuid4().hex[:12]}"
@@ -433,6 +434,15 @@ def dispatch_openclaw(
         "--timeout", "900",
         "--thinking", thinking_level,
     ]
+    # 2026-04-25: forked_context plumbing reserved for future OpenClaw CLI
+    # support. Confirmed against `openclaw agent --help` on 4.23: no
+    # --forked-context flag exists yet. The 4.23 release note describes a JS
+    # sessions_spawn primitive, not a CLI flag. Keeping the kwarg + the
+    # lead_qualify trigger in engine.py:5153 so the moment OpenClaw exposes
+    # this via CLI we can flip RICK_FORKED_CONTEXT_AVAILABLE=1 and start
+    # emitting the flag. Until then this is a no-op.
+    if forked_context and os.getenv("RICK_FORKED_CONTEXT_AVAILABLE", "0").strip() == "1":
+        cmd.append("--forked-context")
 
     # Record a heartbeat row so engine.reap_stuck_subagents can detect ghosts
     # and engine.merge_completed_subagents can dispatch follow-up events to

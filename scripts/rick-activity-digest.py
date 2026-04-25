@@ -313,6 +313,68 @@ def gather() -> dict:
     except Exception:
         summary["fenix_observed_24h"] = {"would_have_blocked": 0, "top_triggers": []}
 
+    # Per-flag staleness — surfaces "flag ON but loop dead" regressions.
+    try:
+        from runtime.flag_health import scan_flags
+        summary["flag_health"] = scan_flags()
+    except Exception:
+        summary["flag_health"] = []
+
+    # Pattern control-arm assignment counts (last 14d).
+    try:
+        from runtime.patterns import arm_assignments_summary
+        summary["pattern_arm_14d"] = arm_assignments_summary(window_hours=336)
+    except Exception:
+        summary["pattern_arm_14d"] = {
+            "window_hours": 336, "total": 0,
+            "by_arm": {"control": 0, "treatment": 0}, "by_skill": {},
+        }
+
+    # Fenix accept-rate (live + observe). Reads unified decisions log written
+    # by runtime/fenix_gate.py preflight() for every needs_review=True outcome.
+    try:
+        from datetime import timedelta as _td
+        decisions_log = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "fenix-decisions.jsonl"
+        cutoff_dt = datetime.now() - _td(hours=24)
+        verdicts = {"proceed": 0, "block": 0, "escalate": 0}
+        live_total = 0
+        observe_total = 0
+        if decisions_log.exists():
+            for line in decisions_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("ts", "")
+                try:
+                    if datetime.fromisoformat(ts) < cutoff_dt:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                action = entry.get("action", "proceed")
+                if action in verdicts:
+                    verdicts[action] += 1
+                if entry.get("mode") == "live":
+                    live_total += 1
+                elif entry.get("mode") == "observe":
+                    observe_total += 1
+        total = sum(verdicts.values())
+        accept_rate = (verdicts["proceed"] / total) if total > 0 else None
+        summary["fenix_decisions_24h"] = {
+            "total": total,
+            "proceed": verdicts["proceed"],
+            "block": verdicts["block"],
+            "escalate": verdicts["escalate"],
+            "accept_rate": accept_rate,
+            "live_count": live_total,
+            "observe_count": observe_total,
+        }
+    except Exception:
+        summary["fenix_decisions_24h"] = {
+            "total": 0, "proceed": 0, "block": 0, "escalate": 0,
+            "accept_rate": None, "live_count": 0, "observe_count": 0,
+        }
+
     return summary
 
 
@@ -406,6 +468,22 @@ def render(s: dict) -> str:
             f"{vara['unique_customers']} customer(s) — top tier ${vara['max_tier_usd']:,}"
         )
 
+    flags = s.get("flag_health") or []
+    stale = [r for r in flags if r.get("status") == "stale"]
+    if stale:
+        lines.append("")
+        lines.append(f"🚨 *Stale flags* ({len(stale)} ON but loop dead):")
+        for r in stale[:8]:
+            age = r.get("age_hours")
+            age_str = f"{age:.1f}h" if age is not None else "no data"
+            short = r["flag"].replace("RICK_", "").replace("_LIVE", "").replace("_ENABLED", "")
+            lines.append(f"  • `{short}` last success {age_str} ago (threshold {r['max_age_hours']:.0f}h)")
+    no_data = [r for r in flags if r.get("status") == "no_data"]
+    if no_data:
+        bits = ", ".join(r["flag"].replace("RICK_", "").replace("_LIVE", "").replace("_ENABLED", "")
+                         for r in no_data[:5])
+        lines.append(f"  ⚠️ no-data flags: {bits}")
+
     fenix = s.get("fenix_observed_24h") or {}
     if fenix.get("would_have_blocked", 0) > 0:
         lines.append("")
@@ -413,6 +491,22 @@ def render(s: dict) -> str:
         lines.append(line)
         for trigger, count in fenix.get("top_triggers", [])[:3]:
             lines.append(f"  • {trigger} ×{count}")
+
+    fd = s.get("fenix_decisions_24h") or {}
+    if fd.get("total", 0) > 0:
+        if not (fenix.get("would_have_blocked", 0) > 0):
+            lines.append("")
+        ar = fd.get("accept_rate")
+        ar_str = f"{ar*100:.0f}%" if ar is not None else "n/a"
+        lines.append(
+            f"🛡️ *Fenix decisions*: {fd['total']} reviewed ({fd['live_count']} live · {fd['observe_count']} observe) "
+            f"→ {fd['proceed']}✅ · {fd['block']}🚫 · {fd['escalate']}⬆ · accept-rate {ar_str}"
+        )
+        if ar is not None and fd['live_count'] > 0:
+            if ar < 0.30:
+                lines.append("  ⚠️ accept-rate <30% — factory may be producing trash, prompt-tune content_factory")
+            elif ar > 0.95 and fd['live_count'] >= 10:
+                lines.append("  ⚠️ accept-rate >95% — Fenix may be too lenient, audit triggers")
 
     sl = s.get("self_learning") or {}
     if sl.get("patterns_total", 0) > 0:
@@ -422,6 +516,16 @@ def render(s: dict) -> str:
         lines.append(
             f"🧠 *Self-learning*: {sl['patterns_used']}/{sl['patterns_total']} patterns active "
             f"({used_pct:.0f}%) · {sl['credit_runs']} reads · {sl['credit_wins']} wins ({wr*100:.0f}% WR)"
+        )
+
+    pa = s.get("pattern_arm_14d") or {}
+    if pa.get("total", 0) > 0:
+        ctrl = pa["by_arm"].get("control", 0)
+        treat = pa["by_arm"].get("treatment", 0)
+        ctrl_pct = (100 * ctrl / pa["total"]) if pa["total"] > 0 else 0
+        lines.append(
+            f"  ↳ A/B 14d: control={ctrl} ({ctrl_pct:.0f}%) · treatment={treat} "
+            f"(target ~10%, lift query pending downstream join)"
         )
 
     nd = s.get("notification_dedup") or {}

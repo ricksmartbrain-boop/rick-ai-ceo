@@ -5150,6 +5150,7 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
                             spec, task_text, json_loads(job["payload_json"]),
                             parent_workflow_id=workflow["id"],
                             parent_job_id=job["id"],
+                            forked_context=(job["step_name"] == "lead_qualify"),
                         )
                         # OpenClaw 2026.4.15 runs agents synchronously, so a
                         # successful run returns status='completed'. The legacy

@@ -122,7 +122,7 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     pattern_context = ""
     try:
         from runtime import patterns as _patterns
-        picked_patterns = _patterns.pick_patterns(connection, "lead_intake", top_n=3)
+        picked_patterns = _patterns.pick_patterns(connection, "lead_intake", top_n=3, lead_id=lead_email)
         pattern_context = _patterns.format_pattern_context(picked_patterns)
     except Exception:
         picked_patterns = []
@@ -362,7 +362,7 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
     pattern_context = ""
     try:
         from runtime import patterns as _patterns
-        picked_patterns = _patterns.pick_patterns(connection, "lead_qualify", top_n=3)
+        picked_patterns = _patterns.pick_patterns(connection, "lead_qualify", top_n=3, lead_id=lead_id)
         pattern_context = _patterns.format_pattern_context(picked_patterns)
     except Exception:
         picked_patterns = []
@@ -564,7 +564,7 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     pattern_context = ""
     try:
         from runtime import patterns as _patterns
-        picked_patterns = _patterns.pick_patterns(connection, "pitch_draft", top_n=3)
+        picked_patterns = _patterns.pick_patterns(connection, "pitch_draft", top_n=3, lead_id=lead_id)
         pattern_context = _patterns.format_pattern_context(picked_patterns)
     except Exception:
         picked_patterns = []
@@ -832,7 +832,7 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
     pattern_context = ""
     try:
         from runtime import patterns as _patterns
-        picked_patterns = _patterns.pick_patterns(connection, "close_or_escalate", top_n=3)
+        picked_patterns = _patterns.pick_patterns(connection, "close_or_escalate", top_n=3, lead_id=lead_id)
         pattern_context = _patterns.format_pattern_context(picked_patterns)
     except Exception:
         picked_patterns = []

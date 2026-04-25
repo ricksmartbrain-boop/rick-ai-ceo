@@ -133,6 +133,14 @@ def produce(targets: int, channels: list[str]) -> dict:
                     payload["caption"] = body
                 if channel == "instagram":
                     payload["caption"] = body
+                # Attach image for channels that require it (instagram, threads).
+                # Failure is silent — payload returned unchanged, formatter will
+                # raise PermanentError and dispatcher's retry/backoff handles it.
+                try:
+                    from runtime import media_factory
+                    payload = media_factory.attach_media(channel, payload, angle=angle_name)
+                except Exception as exc:
+                    _log({"event": "media_factory_error", "channel": channel, "error": str(exc)[:200]})
                 try:
                     job_ids = outbound_dispatcher.fan_out(
                         con, lead_id=lead_id, template_id=template_id,

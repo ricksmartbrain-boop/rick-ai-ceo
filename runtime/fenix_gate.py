@@ -43,6 +43,9 @@ from pathlib import Path
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OBSERVED_LOG = DATA_ROOT / "operations" / "fenix-observed.jsonl"
 BLOCKED_LOG = DATA_ROOT / "operations" / "fenix-blocked.jsonl"
+# Unified decisions log — every needs_review=True preflight outcome lands here
+# regardless of mode/decision. Source of truth for accept-rate computation.
+DECISIONS_LOG = DATA_ROOT / "operations" / "fenix-decisions.jsonl"
 
 # Channels Fenix considers "public artifacts" (others bypass the gate)
 PUBLIC_CHANNELS = {
@@ -88,7 +91,8 @@ def _now_iso() -> str:
 def _log(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": _now_iso(), **payload}) + "\n")
+        # sort_keys matches the convention used elsewhere in rick-vault/operations.
+        f.write(json.dumps({"ts": _now_iso(), **payload}, sort_keys=True) + "\n")
 
 
 def _extract_text(payload: dict) -> str:
@@ -200,6 +204,13 @@ def preflight(conn: sqlite3.Connection, channel: str, payload: dict, job_id: str
 
     if not live:
         _log(OBSERVED_LOG, {**base, "would_have_invoked": True})
+        # Trimmed payload for decisions log — keeps lines well under 4KB so
+        # POSIX O_APPEND atomicity holds under concurrent writes.
+        _log(DECISIONS_LOG, {
+            "channel": base["channel"], "job_id": base["job_id"],
+            "action": base["action"], "mode": "observe",
+            "trigger_count": len(base["matched_triggers"]),
+        })
         return base
 
     # LIVE mode — invoke Fenix
@@ -208,6 +219,14 @@ def preflight(conn: sqlite3.Connection, channel: str, payload: dict, job_id: str
     base["action"] = action_map.get(decision["decision"], "escalate")
     base["reason"] = decision["reason"]
     base["model"] = decision["model"]
+
+    _log(DECISIONS_LOG, {
+        "channel": base["channel"], "job_id": base["job_id"],
+        "action": base["action"], "mode": "live",
+        "model": base["model"],
+        "reason": (base["reason"] or "")[:200],
+        "trigger_count": len(base["matched_triggers"]),
+    })
 
     if base["action"] != "proceed":
         _log(BLOCKED_LOG, base)

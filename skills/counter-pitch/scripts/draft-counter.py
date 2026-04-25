@@ -130,7 +130,8 @@ def _draft(thread_id: str, objection_text: str, prospect_id: str | None) -> dict
         pattern_context = ""
         try:
             from runtime.patterns import pick_patterns, format_pattern_context
-            picked_patterns = pick_patterns(con, "counter_pitch", top_n=3)
+            picked_patterns = pick_patterns(con, "counter_pitch", top_n=3,
+                                            lead_id=(prospect_id or thread_id))
             pattern_context = format_pattern_context(picked_patterns)
         except Exception:
             picked_patterns = []
