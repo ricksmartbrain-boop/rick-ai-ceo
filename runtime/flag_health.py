@@ -60,6 +60,13 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
         lambda e: e.get("channel") == "instagram"
         and e.get("status") in ("sent", "observed-only")),
     ("RICK_ANALYTICS_LIVE", "analytics-ingest.jsonl", 26.0, None),
+    # Added 2026-04-26 after Rick TUI surfaced "CDP port 9225 dead" — LinkedIn
+    # outbound was silently muted (chrome-cdp-linkedin LaunchAgent had stopped
+    # without crash, KeepAlive only triggers on Crashed=true). Probe surfaces
+    # any future repeat so a restart can be triggered before backlog grows.
+    ("RICK_OUTBOUND_LINKEDIN_LIVE", "outbound-dispatcher.jsonl", 26.0,
+        lambda e: e.get("channel") == "linkedin"
+        and e.get("status") in ("sent", "observed-only")),
 ]
 
 
