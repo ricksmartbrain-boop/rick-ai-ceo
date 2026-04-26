@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,13 +52,13 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "observed-only", "reason": "RICK_OUTBOUND_INSTAGRAM_LIVE!=1"}
 
     if video_path and REEL_CDP_SCRIPT.exists():
-        cmd = ["python3", str(REEL_CDP_SCRIPT), video_path, caption]
+        cmd = [sys.executable, str(REEL_CDP_SCRIPT), video_path, caption]
     elif PW_SCRIPT.exists():
         # script uses positional sys.argv: video_path caption
         media = video_path or image_path
         if not media:
             raise PermanentError("video_path or image_path required for Instagram playwright script")
-        cmd = ["python3", str(PW_SCRIPT), media, caption]
+        cmd = [sys.executable, str(PW_SCRIPT), media, caption]
     else:
         raise PermanentError("no instagram script available")
 

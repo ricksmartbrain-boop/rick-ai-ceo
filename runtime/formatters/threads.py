@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -54,9 +55,9 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     if CDP_SCRIPT.exists():
         if not media_path:
             raise PermanentError("media file required for Threads CDP (video_path or image_path missing from payload)")
-        cmd = ["python3", str(CDP_SCRIPT), media_path, caption]
+        cmd = [sys.executable, str(CDP_SCRIPT), media_path, caption]
     elif OIDC_SCRIPT.exists():
-        cmd = ["python3", str(OIDC_SCRIPT), "--caption", caption]
+        cmd = [sys.executable, str(OIDC_SCRIPT), "--caption", caption]
         if video_path:
             cmd.extend(["--video", video_path])
     else:
@@ -66,12 +67,17 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
     except subprocess.TimeoutExpired as exc:
         raise TransientError(f"threads timeout: {exc}") from exc
-    stderr = (result.stderr or "")[:500]
-    low = stderr.lower()
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    # CDP script prints errors to stdout; fall back when stderr empty
+    diag = stderr or stdout
+    low = diag.lower()
     if result.returncode != 0:
-        if "401" in stderr or "login" in low or "unauthorized" in low:
-            raise AuthFailure(f"threads auth: {stderr}")
-        if "429" in stderr or "rate" in low:
-            raise TransientError(f"threads rate: {stderr}")
-        raise TransientError(f"threads failed: {stderr}")
-    return {"status": "sent", "stdout": (result.stdout or "")[:500]}
+        if "401" in diag or "login" in low or "unauthorized" in low:
+            raise AuthFailure(f"threads auth: {diag[:500]}")
+        if "429" in diag or "rate" in low:
+            raise TransientError(f"threads rate: {diag[:500]}")
+        if "no threads tab" in low or "cdp" in low or "chrome" in low:
+            raise TransientError(f"threads cdp: {diag[:500]}")
+        raise TransientError(f"threads failed: {diag[:500]}")
+    return {"status": "sent", "stdout": stdout[:500]}
