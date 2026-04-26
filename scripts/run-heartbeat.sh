@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export ROOT_DIR
 ENV_FILE="${RICK_ENV_FILE:-$ROOT_DIR/config/rick.env}"
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -23,12 +24,12 @@ bash "$ROOT_DIR/skills/claude-monitor/scripts/system-health.sh" || true
 bash "$ROOT_DIR/skills/claude-monitor/scripts/openclaw-health.sh" || true
 python3 "$ROOT_DIR/runtime/runner.py" heartbeat --work-limit 2 >/dev/null
 bash "$ROOT_DIR/skills/fiverr/scripts/fiverr-monitor.sh" >/dev/null || true
-python3 -c "from runtime.db import connect; from runtime.engine import process_fiverr_inbox; conn = connect(); process_fiverr_inbox(conn); conn.close()" >/dev/null || true
+PYTHONPATH="$ROOT_DIR" python3 -c "from runtime.db import connect; from runtime.engine import process_fiverr_inbox; conn = connect(); process_fiverr_inbox(conn); conn.close()" >/dev/null || true
 bash "$ROOT_DIR/skills/upwork/scripts/upwork-monitor.sh" >/dev/null || true
 if [[ -f "$RICK_DATA_ROOT/upwork/config/rss-feeds.json" ]]; then
   python3 "$ROOT_DIR/skills/upwork/scripts/upwork-rss.py" >/dev/null || true
 fi
-python3 -c "from runtime.db import connect; from runtime.engine import process_upwork_inbox; conn = connect(); process_upwork_inbox(conn); conn.close()" >/dev/null || true
+PYTHONPATH="$ROOT_DIR" python3 -c "from runtime.db import connect; from runtime.engine import process_upwork_inbox; conn = connect(); process_upwork_inbox(conn); conn.close()" >/dev/null || true
 python3 "$ROOT_DIR/scripts/stripe-poll.py" >/dev/null || true
 python3 "$ROOT_DIR/skills/email-automation/scripts/email-sequence-dispatch.py" >/dev/null || true
 
@@ -157,7 +158,8 @@ else:
 python3 - << 'PYEOF'
 import json, os, pathlib, datetime
 DATA_ROOT = pathlib.Path(os.environ.get("RICK_DATA_ROOT", str(pathlib.Path.home() / "rick-vault")))
-WORKSPACE = pathlib.Path(os.environ.get("RICK_WORKSPACE_ROOT", str(pathlib.Path.home() / ".openclaw" / "workspace")))
+# ROOT_DIR is exported by the bash script (derived from script location, never corrupted by cron env)
+WORKSPACE = pathlib.Path(os.environ.get("ROOT_DIR") or os.environ.get("RICK_WORKSPACE_ROOT") or str(pathlib.Path.home() / ".openclaw" / "workspace"))
 MEMORY = WORKSPACE / "MEMORY.md"
 patterns_dir = DATA_ROOT / "learning/patterns"
 if not patterns_dir.exists():

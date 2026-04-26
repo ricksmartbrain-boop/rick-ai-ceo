@@ -168,10 +168,17 @@ def process_file(path: Path, dry_run: bool, batch_cap: int) -> dict:
             continue
     classified = 0
     skipped = 0
+    skipped_already_classified = 0
+    skipped_no_subject_or_body = 0
     errors = 0
     for row in rows:
         if row.get("classification"):
             skipped += 1
+            skipped_already_classified += 1
+            continue
+        if not (row.get("subject") or row.get("body") or row.get("snippet")):
+            skipped += 1
+            skipped_no_subject_or_body += 1
             continue
         if classified >= batch_cap:
             break
@@ -191,7 +198,14 @@ def process_file(path: Path, dry_run: bool, batch_cap: int) -> dict:
         except OSError as exc:
             errors += 1
             log_event({"action": "write-failed", "file": str(path), "error": str(exc)})
-    return {"file": str(path), "classified": classified, "skipped": skipped, "errors": errors}
+    return {
+        "file": str(path),
+        "classified": classified,
+        "skipped": skipped,
+        "skipped_already_classified": skipped_already_classified,
+        "skipped_no_subject_or_body": skipped_no_subject_or_body,
+        "errors": errors,
+    }
 
 
 def main() -> int:
@@ -209,11 +223,13 @@ def main() -> int:
         print(json.dumps(summary, indent=2))
         return 0
 
-    totals = {"classified": 0, "skipped": 0, "errors": 0, "files": 0}
+    totals = {"classified": 0, "skipped": 0, "skipped_already_classified": 0, "skipped_no_subject_or_body": 0, "errors": 0, "files": 0}
     for f in files:
         result = process_file(f, args.dry_run, args.batch)
         totals["classified"] += result["classified"]
         totals["skipped"] += result["skipped"]
+        totals["skipped_already_classified"] += result.get("skipped_already_classified", 0)
+        totals["skipped_no_subject_or_body"] += result.get("skipped_no_subject_or_body", 0)
         totals["errors"] += result["errors"]
         totals["files"] += 1
         if totals["classified"] >= args.batch:
