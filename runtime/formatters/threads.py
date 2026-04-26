@@ -28,6 +28,34 @@ def _log(event: dict) -> None:
         f.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+def _diag(result: subprocess.CompletedProcess[str]) -> str:
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    return stderr or stdout
+
+
+def _is_cdp_infra_error(diag: str) -> bool:
+    low = diag.lower()
+    return (
+        "no threads tab" in low
+        or "chrome unavailable" in low
+        or "chrome not available" in low
+        or "chrome" in low and "9222" in low
+        or "cdp" in low
+    )
+
+
+def _run_threads_oidc(video_path: str, image_path: str, caption: str) -> subprocess.CompletedProcess[str]:
+    if not OIDC_SCRIPT.exists():
+        raise PermanentError("no threads OIDC script available")
+    cmd = [sys.executable, str(OIDC_SCRIPT), "--caption", caption]
+    if video_path:
+        cmd.extend(["--video", video_path])
+    elif image_path:
+        _log({"event": "threads_oidc_text_only_fallback", "reason": "OIDC script has no image upload path", "image_path": image_path})
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+
+
 def send(payload: dict[str, Any]) -> dict[str, Any]:
     caption = (payload.get("caption") or payload.get("body") or payload.get("content") or "").strip()
     caption = stamp_urls_in_text(caption, "threads", payload.get("lane"), payload.get("msg_id"))
@@ -51,33 +79,33 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     if not live:
         return {"status": "observed-only", "reason": "RICK_OUTBOUND_THREADS_LIVE!=1"}
 
-    # Prefer CDP when available (uses the already-running Chrome session).
-    if CDP_SCRIPT.exists():
-        if not media_path:
-            raise PermanentError("media file required for Threads CDP (video_path or image_path missing from payload)")
-        cmd = [sys.executable, str(CDP_SCRIPT), media_path, caption]
-    elif OIDC_SCRIPT.exists():
-        cmd = [sys.executable, str(OIDC_SCRIPT), "--caption", caption]
-        if video_path:
-            cmd.extend(["--video", video_path])
+    # Try CDP first; fall back to OIDC only for infra failures.
+    cdp_error = ""
+    if CDP_SCRIPT.exists() and media_path:
+        cdp_cmd = [sys.executable, str(CDP_SCRIPT), media_path, caption]
+        try:
+            result = subprocess.run(cdp_cmd, capture_output=True, text=True, timeout=180, check=False)
+        except subprocess.TimeoutExpired as exc:
+            cdp_error = f"threads timeout: {exc}"
+        else:
+            diag = _diag(result)
+            low = diag.lower()
+            if result.returncode == 0:
+                return {"status": "sent", "stdout": (result.stdout or "").strip()[:500]}
+            cdp_error = diag or f"threads failed rc={result.returncode}"
+            if "401" in diag or "login" in low or "unauthorized" in low:
+                raise AuthFailure(f"threads auth: {diag[:500]}")
+            if "429" in diag or "rate" in low:
+                raise TransientError(f"threads rate: {diag[:500]}")
+            if not _is_cdp_infra_error(diag):
+                raise TransientError(f"threads failed: {diag[:500]}")
+    elif CDP_SCRIPT.exists() and not media_path:
+        cdp_error = "missing media for CDP; using OIDC text-only fallback"
     else:
-        raise PermanentError("no threads script available")
+        cdp_error = "CDP script missing"
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
-    except subprocess.TimeoutExpired as exc:
-        raise TransientError(f"threads timeout: {exc}") from exc
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
-    # CDP script prints errors to stdout; fall back when stderr empty
-    diag = stderr or stdout
-    low = diag.lower()
-    if result.returncode != 0:
-        if "401" in diag or "login" in low or "unauthorized" in low:
-            raise AuthFailure(f"threads auth: {diag[:500]}")
-        if "429" in diag or "rate" in low:
-            raise TransientError(f"threads rate: {diag[:500]}")
-        if "no threads tab" in low or "cdp" in low or "chrome" in low:
-            raise TransientError(f"threads cdp: {diag[:500]}")
-        raise TransientError(f"threads failed: {diag[:500]}")
-    return {"status": "sent", "stdout": stdout[:500]}
+    oidc_result = _run_threads_oidc(video_path, image_path, caption)
+    oidc_diag = _diag(oidc_result)
+    if oidc_result.returncode != 0:
+        raise TransientError(f"threads oidc failed after cdp fallback: cdp={cdp_error[:300]} | oidc={oidc_diag[:300]}")
+    return {"status": "sent", "stdout": (oidc_result.stdout or "").strip()[:500]}
