@@ -31,6 +31,8 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     caption = (payload.get("caption") or payload.get("body") or payload.get("content") or "").strip()
     caption = stamp_urls_in_text(caption, "threads", payload.get("lane"), payload.get("msg_id"))
     video_path = (payload.get("video_path") or "").strip()
+    image_path = (payload.get("image_path") or "").strip()
+    media_path = video_path or image_path
     if not caption:
         raise PermanentError("caption required")
 
@@ -41,6 +43,8 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
             "live": live,
             "caption_preview": caption[:200],
             "has_video": bool(video_path),
+            "has_image": bool(image_path),
+            "media_path": media_path or None,
         }
     )
     if not live:
@@ -48,10 +52,9 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Prefer CDP when available (uses the already-running Chrome session).
     if CDP_SCRIPT.exists():
-        cmd = ["python3", str(CDP_SCRIPT)]
-        if video_path:
-            cmd.append(video_path)
-        cmd.append(caption)
+        if not media_path:
+            raise PermanentError("media file required for Threads CDP (video_path or image_path missing from payload)")
+        cmd = ["python3", str(CDP_SCRIPT), media_path, caption]
     elif OIDC_SCRIPT.exists():
         cmd = ["python3", str(OIDC_SCRIPT), "--caption", caption]
         if video_path:

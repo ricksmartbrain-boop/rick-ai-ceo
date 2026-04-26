@@ -97,14 +97,16 @@ def _memelord_image(prompt: str, out_path: Path,
     }
     started = time.monotonic()
     last_err = None
-    # 20s per attempt: Memelord either responds promptly or it's down. 60s
-    # was over-generous and would block content_factory's tick when degraded.
+    # 90s per attempt: Memelord image gen runs an LLM + image model server-side
+    # and typically takes 30-60s. 20s was too aggressive (2026-04-26: every
+    # call timing out at exactly 20s in media-factory.jsonl, zero successes).
+    # 90s matches the working contract in scripts/memelord-pipeline.py:360.
     # 1 retry on transient 5xx; no retry on 4xx (likely a bad prompt).
     for attempt in (1, 2):
         try:
             resp = requests.post(
                 "https://www.memelord.com/api/v1/ai-meme",
-                headers=headers, json=body, timeout=20,
+                headers=headers, json=body, timeout=90,
             )
             if 500 <= resp.status_code < 600 and attempt == 1:
                 last_err = f"http {resp.status_code}"

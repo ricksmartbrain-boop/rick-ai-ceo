@@ -53,11 +53,11 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
     if video_path and REEL_CDP_SCRIPT.exists():
         cmd = ["python3", str(REEL_CDP_SCRIPT), video_path, caption]
     elif PW_SCRIPT.exists():
-        cmd = ["python3", str(PW_SCRIPT), "--caption", caption]
-        if video_path:
-            cmd.extend(["--video", video_path])
-        elif image_path:
-            cmd.extend(["--image", image_path])
+        # script uses positional sys.argv: video_path caption
+        media = video_path or image_path
+        if not media:
+            raise PermanentError("video_path or image_path required for Instagram playwright script")
+        cmd = ["python3", str(PW_SCRIPT), media, caption]
     else:
         raise PermanentError("no instagram script available")
 
