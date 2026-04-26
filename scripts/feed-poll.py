@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -116,7 +117,46 @@ def _classify_source(source: str | None) -> str:
     return s
 
 
+# Matches “(Score: 23 ★ in 6 hours)” or “(Score: 9 pts in 1 hours)” embedded in
+# the summary HTML that the RSS ingest service writes. Used as a velocity
+# fallback when the server-side sm_algo_score column is null (P0.2 —
+# 2026-04-26: scoring worker not populating the field).
+_SCORE_RE = re.compile(
+    r"Score:\s*([\d.]+)\s*(?:[\u2605*]|pts?|stars?|points?)\s+in\s+([\d.]+)\s+hours?",
+    re.IGNORECASE,
+)
+
+
+def _velocity_to_score(pts: float, hours: float) -> float:
+    """Normalise raw points-per-hour into a 0–1 score bucket.
+
+    Calibrated so:
+      ≥20/h → 0.95 (viral / top-of-front-page)
+      10–20/h → 0.92
+       5–10/h → 0.88
+       2–5/h  → 0.82  (roundup-eligible)
+       1–2/h  → 0.78
+       0.5–1/h → 0.70  (below roundup threshold — will be skipped)
+      <0.5/h  → 0.40
+    """
+    rate = pts / max(hours, 0.5)  # floor hours at 0.5 to avoid div/0
+    if rate >= 20:
+        return 0.95
+    if rate >= 10:
+        return 0.92
+    if rate >= 5:
+        return 0.88
+    if rate >= 2:
+        return 0.82
+    if rate >= 1:
+        return 0.78
+    if rate >= 0.5:
+        return 0.70
+    return 0.40
+
+
 def _get_score(item: dict[str, Any]) -> float:
+    # Primary: structured score fields populated by the ingest scoring worker.
     for key in ("sm_algo_score", "algo_score", "score"):
         v = item.get(key)
         if v is None:
@@ -125,6 +165,15 @@ def _get_score(item: dict[str, Any]) -> float:
             return float(v)
         except (TypeError, ValueError):
             continue
+    # Fallback: parse velocity from the summary text when the server-side
+    # scoring worker hasn’t populated sm_algo_score / raw_score (P0.2).
+    summary = item.get("summary") or ""
+    m = _SCORE_RE.search(summary)
+    if m:
+        try:
+            return _velocity_to_score(float(m.group(1)), float(m.group(2)))
+        except (TypeError, ValueError):
+            pass
     return 0.0
 
 

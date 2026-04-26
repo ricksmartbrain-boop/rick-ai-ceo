@@ -53,7 +53,10 @@ OPS_DIR = DATA_ROOT / "operations"
 STATE_FILE = OPS_DIR / "roast-lead-poll-state.json"
 LOG_FILE = OPS_DIR / "roast-lead-poll.jsonl"
 
-API_BASE = os.getenv("MEETRICK_API_BASE", "https://api.meetrick.ai")
+# Use MEETRICK_ROAST_API_BASE exclusively — do NOT inherit MEETRICK_API_BASE
+# which is shared with (and currently points at) the RSS Railway ingest
+# service. Mixing the two caused 655 silent 404s (P0.1 — 2026-04-26).
+API_BASE = os.getenv("MEETRICK_ROAST_API_BASE", "https://api.meetrick.ai")
 USER_AGENT = "Rick-RoastLeadPoll/1.0"
 DEFAULT_TIMEOUT = 12
 
