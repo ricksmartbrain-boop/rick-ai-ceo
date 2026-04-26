@@ -37,7 +37,10 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     ("RICK_HIVE_SYNC_LIVE", "hive-sync.jsonl", 26.0,
         lambda e: e.get("status") == "ok"),
     ("RICK_VARA_LIVE", "vara.jsonl", 168.0, None),
-    ("RICK_LEAD_REPLAY_LIVE", "lead-replay.jsonl", 26.0, None),
+    # 170h not 26h: lead-replay runs weekly (Mondays 09:00 PT per
+    # ai.rick.lead-replay.plist StartCalendarInterval). 26h flapped between
+    # cycles. 170h gives 2h slack on the 168h cadence.
+    ("RICK_LEAD_REPLAY_LIVE", "lead-replay.jsonl", 170.0, None),
     ("RICK_IMAP_LIVE", "imap-watcher.jsonl", 1.0,
         lambda e: e.get("status") == "ok"),
     ("RICK_REPLY_ROUTER_LIVE", "reply-router.jsonl", 26.0, None),
