@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import shutil
@@ -374,11 +375,16 @@ def generate_images(prompts: list[str], work_dir: Path, dry_run: bool) -> list[P
     if dry_run:
         return paths
 
-    for index, prompt in enumerate(prompts, start=1):
+    def _render_one(index_prompt: tuple[int, str]) -> tuple[int, Path]:
+        index, prompt = index_prompt
         path = image_dir / f"scene-{index:02d}.png"
         image_bytes = _openai_image_request(prompt)
         path.write_bytes(image_bytes)
-        paths.append(path)
+        return index, path
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(prompts))) as pool:
+        for index, path in sorted(pool.map(_render_one, list(enumerate(prompts, start=1))), key=lambda item: item[0]):
+            paths.append(path)
     return paths
 
 
@@ -391,7 +397,9 @@ def generate_voice(narration: str, work_dir: Path, dry_run: bool) -> Path | None
         return None
 
     api_key = require_env("ELEVENLABS_API_KEY")
-    voice_id = require_env("ELEVENLABS_VOICE_ID")
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+    if not voice_id or voice_id.lower().startswith("replace_me") or voice_id.lower() in {"placeholder", "todo"}:
+        voice_id = os.getenv("ELEVENLABS_VOICE_FALLBACK_ID", "").strip() or "iP95p4xoKVk53GoZ742B"
     audio_path = work_dir / "narration.mp3"
     payload = {
         "text": narration,
@@ -536,7 +544,9 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     PUBLIC_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
+    print(f"[1/5] summarizing wins for {date_str}", flush=True)
     summary = summarize_wins(now)
+    print("[2/5] composing narration", flush=True)
     narration = compose_narration(summary, dry_run=True)
     image_prompts = build_image_prompts(summary)
 
@@ -569,10 +579,12 @@ def main() -> int:
             print(f"{idx}. {prompt}")
         return 0
 
+    print(f"[3/5] generating {len(image_prompts)} still images", flush=True)
     image_paths = generate_images(image_prompts, work_dir, dry_run=False)
     if not image_paths:
         raise RuntimeError("No images generated")
 
+    print("[4/5] generating ElevenLabs narration", flush=True)
     audio_path = generate_voice(narration, work_dir, dry_run=False)
     if audio_path is None or not audio_path.exists():
         raise RuntimeError("No narration audio generated")
@@ -581,6 +593,7 @@ def main() -> int:
     stitched = False
     stitch_error: str | None = None
     if shutil.which("ffmpeg"):
+        print("[5/5] stitching MP4 via ffmpeg", flush=True)
         try:
             stitched = stitch_video(image_paths, audio_path, video_path)
         except Exception as exc:

@@ -76,12 +76,33 @@
       "cooldown_per_recipient_days": 0,
       "formatter_module": "runtime.formatters.threads"
     },
+    "hn": {
+      "active": true,
+      "daily": 10,
+      "per_minute": 1,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.hn"
+    },
     "instagram": {
       "active": true,
       "daily": 2,
       "per_minute": 1,
       "cooldown_per_recipient_days": 0,
       "formatter_module": "runtime.formatters.instagram"
+    },
+    "cold_email_subject": {
+      "active": true,
+      "daily": 100,
+      "per_minute": 5,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.cold_email_subject"
+    },
+    "meme_prompt": {
+      "active": true,
+      "daily": 100,
+      "per_minute": 5,
+      "cooldown_per_recipient_days": 0,
+      "formatter_module": "runtime.formatters.meme_prompt"
     },
     "x": {
       "active": false,
