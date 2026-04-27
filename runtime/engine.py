@@ -5740,9 +5740,11 @@ def reap_ghost_completed_workflows(connection: sqlite3.Connection) -> int:
     try:
         candidates = connection.execute(
             """
-            SELECT id, kind, title, project, lane, stage
+            SELECT id, kind, title, project, lane, stage, updated_at
               FROM workflows
              WHERE status = 'active'
+               AND updated_at < datetime('now', '-15 minutes')
+               AND kind NOT IN ('qualified_lead')
                AND id NOT IN (
                    SELECT DISTINCT workflow_id FROM jobs
                     WHERE status NOT IN ('done','cancelled','published','fulfilled')
