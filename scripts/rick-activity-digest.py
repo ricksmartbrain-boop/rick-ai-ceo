@@ -835,6 +835,38 @@ def gather() -> dict:
     except Exception:
         summary["flag_health"] = []
 
+    # Media factory output split by provider (last 24h) — shows the hybrid in action.
+    try:
+        media_log = DATA_ROOT / "operations" / "media-factory.jsonl"
+        cutoff_dt = datetime.now() - timedelta(hours=24)
+        by_provider: dict[str, int] = {}
+        total = 0
+        generated = 0
+        if media_log.exists():
+            for line in media_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("ts", "")
+                try:
+                    if datetime.fromisoformat(ts) < cutoff_dt:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                total += 1
+                provider = str(entry.get("provider") or "unknown")
+                if entry.get("status") == "generated":
+                    generated += 1
+                    by_provider[provider] = by_provider.get(provider, 0) + 1
+        summary["media_factory_24h"] = {
+            "total": total,
+            "generated": generated,
+            "by_provider": by_provider,
+        }
+    except Exception:
+        summary["media_factory_24h"] = {"total": 0, "generated": 0, "by_provider": {}}
+
     # Pattern control-arm assignment counts (last 14d).
     try:
         from runtime.patterns import arm_assignments_summary
@@ -1107,6 +1139,12 @@ def render(s: dict) -> str:
             f"🏅 *VARA*: {vara['total_attestations']} attestation(s) across "
             f"{vara['unique_customers']} customer(s) — top tier ${vara['max_tier_usd']:,}"
         )
+
+    media = s.get("media_factory_24h") or {}
+    if media.get("generated", 0) > 0:
+        bp = media.get("by_provider") or {}
+        parts = [f"{k}={v}" for k, v in sorted(bp.items()) if v > 0]
+        lines.append(f"🖼️ *Media factory*: {media['generated']} generated (" + " · ".join(parts) + ")")
 
     flags = s.get("flag_health") or []
     stale = [r for r in flags if r.get("status") == "stale"]

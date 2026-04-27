@@ -17,6 +17,7 @@ just doesn't ship until next factory tick.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -67,6 +68,34 @@ def _cache_path(angle: Optional[str], prompt: str) -> Path:
     safe_angle = (angle or "untagged").replace("/", "_")[:32]
     date = datetime.now().strftime("%Y-%m-%d")
     return MEDIA_ROOT / date / f"{safe_angle}-{h}.webp"
+
+
+def _detect_image_ext(raw: bytes, hint: str | None = None) -> str:
+    low = (hint or "").lower()
+    if "webp" in low:
+        return "webp"
+    if "png" in low:
+        return "png"
+    if "jpeg" in low or "jpg" in low:
+        return "jpg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if raw.startswith(b"RIFF") and len(raw) >= 12 and raw[8:12] == b"WEBP":
+        return "webp"
+    if raw.startswith(b"\xff\xd8"):
+        return "jpg"
+    return "png"
+
+
+def _write_image_bytes(out_path: Path, raw: bytes, *, hint: str | None = None) -> Path:
+    ext = _detect_image_ext(raw, hint=hint)
+    final_path = out_path.with_suffix(f".{ext}") if out_path.suffix.lower() != f".{ext}" else out_path
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(raw)
+    if final_path != out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(raw)
+    return final_path
 
 
 def _memelord_image(prompt: str, out_path: Path,
@@ -131,9 +160,14 @@ def _memelord_image(prompt: str, out_path: Path,
                 return None
             img = requests.get(url, timeout=20)
             img.raise_for_status()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(img.content)
-            return str(out_path)
+            written = _write_image_bytes(out_path, img.content, hint=(img.headers.get("content-type") or url))
+            _log({
+                "channel": channel, "angle": angle, "provider": "memelord",
+                "status": "generated", "latency_ms": int((time.monotonic() - started) * 1000),
+                "file_path": str(written),
+                "bytes": len(img.content),
+            })
+            return str(written)
         except Exception as exc:  # network, parse, http error
             last_err = str(exc)[:200]
             if attempt == 1:
@@ -150,9 +184,75 @@ def _memelord_image(prompt: str, out_path: Path,
 
 def _gpt_image_2(prompt: str, out_path: Path,
                  channel: str = "?", angle: str = "?") -> Optional[str]:
-    # TODO(2026-04-25): runtime/llm.py has no image route. When OpenClaw exposes
-    # gpt-image-2 through the gateway, wire it here. For now, returns None so
-    # the chain falls through to text-only.
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import requests  # local import — not all environments have it
+    except ImportError:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "size": "1024x1024",
+        "n": 1,
+        # Note: gpt-image-2 returns b64_json by default — `response_format` is
+        # rejected with HTTP 400 (only valid for legacy dall-e-*). Confirmed
+        # via direct API test 2026-04-27 after the silent-fail bug was caught.
+    }
+    started = time.monotonic()
+    last_err = None
+    for attempt in (1, 2):
+        resp = None
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/images/generations",
+                headers=headers, json=body, timeout=60,
+            )
+            if 500 <= resp.status_code < 600 and attempt == 1:
+                last_err = f"http {resp.status_code}"
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            items = data.get("data") or []
+            item = items[0] if items else {}
+            b64 = item.get("b64_json") or data.get("b64_json")
+            if not b64:
+                last_err = "missing b64_json in response"
+                _log({
+                    "channel": channel, "angle": angle, "provider": "gpt-image-2",
+                    "status": "error", "latency_ms": int((time.monotonic() - started) * 1000),
+                    "error": last_err,
+                })
+                return None
+            raw = base64.b64decode(b64)
+            ext_hint = item.get("output_format") or data.get("output_format")
+            written = _write_image_bytes(out_path, raw, hint=ext_hint)
+            _log({
+                "channel": channel, "angle": angle, "provider": "gpt-image-2",
+                "status": "generated", "latency_ms": int((time.monotonic() - started) * 1000),
+                "file_path": str(written),
+                "bytes": len(raw),
+                "output_format": _detect_image_ext(raw, hint=ext_hint),
+            })
+            return str(written)
+        except Exception as exc:  # network, parse, http error
+            last_err = str(exc)[:200]
+            if resp is not None and resp.status_code >= 500 and attempt == 1:
+                time.sleep(2)
+                continue
+            _log({
+                "channel": channel, "angle": angle, "provider": "gpt-image-2",
+                "status": "error", "latency_ms": int((time.monotonic() - started) * 1000),
+                "error": last_err,
+            })
+            return None
     return None
 
 
@@ -189,7 +289,15 @@ def attach_media(channel: str, payload: dict, angle: Optional[str] = None) -> di
             "file_path": str(cache),
         })
         return payload
-    for provider, fn in (("memelord", _memelord_image), ("gpt-image-2", _gpt_image_2)):
+    memelord_key = os.getenv("MEMELORD_API_KEY", "").strip()
+    if angle == "meme" and memelord_key:
+        provider_chain = (("memelord", _memelord_image), ("gpt-image-2", _gpt_image_2))
+    else:
+        provider_chain = (("gpt-image-2", _gpt_image_2),)
+        if memelord_key:
+            provider_chain += (("memelord", _memelord_image),)
+
+    for provider, fn in provider_chain:
         result = fn(prompt, cache, channel=channel, angle=(angle or ""))
         if result:
             payload["image_path"] = result
