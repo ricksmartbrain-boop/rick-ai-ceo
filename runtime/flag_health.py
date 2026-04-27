@@ -84,6 +84,11 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # sleep without false positives.
     ("RICK_BOUNCE_POLL_LIVE", "email-bounces.jsonl", 1.0,
         lambda e: e.get("event") == "poll.done"),
+    # bounce-rate-guardian runs hourly (ai.rick.bounce-rate-guardian.plist,
+    # StartInterval=3600). Writes a run.done sentinel on every pass so the
+    # guard itself trips if it goes stale.
+    ("RICK_BOUNCE_GUARDIAN_LIVE", "bounce-rate-guardian.jsonl", 2.0,
+        lambda e: e.get("event") == "run.done"),
     # roast-lead-poll runs every 5 min (ai.rick.roast-lead-poll.plist
     # StartInterval=300). 0.5h = 6 missed cycles before alerting — enough
     # hysteresis to survive a brief machine sleep without false positives.

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.rick.bounce-rate-guardian</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>python3</string>
+    <string>__RICK_WORKSPACE__/scripts/bounce-rate-guardian.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__RICK_WORKSPACE__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__RICK_DATA_ROOT__/logs/bounce-rate-guardian.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RICK_DATA_ROOT__/logs/bounce-rate-guardian.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RICK_ENV_FILE</key>
+    <string>__RICK_WORKSPACE__/config/rick.env</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
