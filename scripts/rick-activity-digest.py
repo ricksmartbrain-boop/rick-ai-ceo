@@ -71,6 +71,65 @@ def _count_drafts() -> dict:
     return out
 
 
+def _email_bounce_health() -> dict:
+    """Compute bounce + complaint rate over last 24h from email-bounces.jsonl / email-sends.jsonl."""
+    bounces_file = DATA_ROOT / "operations" / "email-bounces.jsonl"
+    sends_file = DATA_ROOT / "operations" / "email-sends.jsonl"
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+
+    bounces_24h = 0
+    complaints_24h = 0
+    sends_24h = 0
+
+    # Count sends in last 24h
+    if sends_file.exists():
+        try:
+            for line in sends_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if row.get("ts", "") >= cutoff and row.get("status") == "sent":
+                        sends_24h += 1
+                except json.JSONDecodeError:
+                    pass
+        except OSError:
+            pass
+
+    # Count bounces/complaints in last 24h (exclude sentinel rows)
+    if bounces_file.exists():
+        try:
+            for line in bounces_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    event = row.get("event", "")
+                    if event == "poll.done":
+                        continue
+                    if row.get("ts", "") >= cutoff:
+                        if event == "bounced":
+                            bounces_24h += 1
+                        elif event == "complained":
+                            complaints_24h += 1
+                except json.JSONDecodeError:
+                    pass
+        except OSError:
+            pass
+
+    bounce_pct = (100.0 * bounces_24h / sends_24h) if sends_24h > 0 else 0.0
+    complaint_pct = (100.0 * complaints_24h / sends_24h) if sends_24h > 0 else 0.0
+    return {
+        "sends_24h": sends_24h,
+        "bounces_24h": bounces_24h,
+        "complaints_24h": complaints_24h,
+        "bounce_pct": round(bounce_pct, 2),
+        "complaint_pct": round(complaint_pct, 3),
+        "alarm_bounce": bounce_pct > 2.0,
+        "alarm_complaint": complaint_pct > 0.1,
+    }
+
+
 def _suppression_count() -> int:
     if not SUPPRESSION_FILE.is_file():
         return 0
@@ -268,6 +327,7 @@ def gather() -> dict:
     summary["drafts_pending"] = _count_drafts()
     summary["suppression_total"] = _suppression_count()
     summary["funnel"] = _funnel_24h()
+    summary["email_bounce_health"] = _email_bounce_health()
 
     # VARA attestation visibility — surfaces total + max tier reached.
     # Mostly silent today (Newton at $18 cumulative, lowest tier $1K), but
@@ -463,6 +523,28 @@ def render(s: dict) -> str:
 
     threads = s.get("active_email_threads", 0)
     lines.append(f"*Active email threads*: {threads}")
+
+    # ── Email sender-health ────────────────────────────────────────────────
+    bh = s.get("email_bounce_health") or {}
+    if bh.get("sends_24h", 0) > 0 or bh.get("bounces_24h", 0) > 0:
+        b_pct = bh.get("bounce_pct", 0.0)
+        c_pct = bh.get("complaint_pct", 0.0)
+        health_icon = "🔴" if (bh.get("alarm_bounce") or bh.get("alarm_complaint")) else "✅"
+        lines.append(
+            f"{health_icon} *Email health 24h*: {bh['sends_24h']}✉ sent · "
+            f"{bh['bounces_24h']} bounced ({b_pct:.1f}%) · "
+            f"{bh['complaints_24h']} complaints ({c_pct:.2f}%)"
+        )
+        if bh.get("alarm_bounce"):
+            lines.append(
+                f"  🚨 *BOUNCE RATE {b_pct:.1f}% > 2.0% ALARM* — "
+                f"sender reputation at risk; auto-suppressed hard-bounces, check suppression.txt"
+            )
+        if bh.get("alarm_complaint"):
+            lines.append(
+                f"  🚨 *COMPLAINT RATE {c_pct:.2f}% > 0.1% ALARM* — "
+                f"spam reports detected; pause cold outreach and audit targeting"
+            )
 
     f = s.get("funnel") or {}
     if f.get("inbound"):

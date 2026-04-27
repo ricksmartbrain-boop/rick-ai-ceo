@@ -175,12 +175,83 @@ def handle_call_execute(connection: sqlite3.Connection, workflow: sqlite3.Row, j
     voice_dir.mkdir(parents=True, exist_ok=True)
     path = write_file(voice_dir / f"script-{now_iso()[:10]}-{uuid.uuid4().hex[:8]}.md", result.content)
 
-    # Note: Actual ElevenLabs API call would go here
-    # For now, queue the script and mark as ready
+    # --- ElevenLabs outbound call ---
+    agent_id = os.getenv("ELEVENLABS_AGENT_ID", "").strip()
+    phone_id = os.getenv("ELEVENLABS_PHONE_ID", "").strip()
+    to_number = trigger.get("phone", "").strip()
+
+    if not agent_id or not phone_id:
+        return StepOutcome(
+            summary="Call script prepared — ELEVENLABS_AGENT_ID or ELEVENLABS_PHONE_ID not set in rick.env",
+            artifacts=[{"kind": "call-script", "title": "Call Script", "path": path, "metadata": {}}],
+            workflow_stage="call-blocked-no-creds",
+        )
+
+    if not to_number:
+        return StepOutcome(
+            summary="Call script prepared — no phone number in trigger payload (skipped gracefully)",
+            artifacts=[{"kind": "call-script", "title": "Call Script", "path": path, "metadata": {}}],
+            workflow_stage="call-skipped-no-phone",
+        )
+
+    call_payload = {
+        "agent_id": agent_id,
+        "agent_phone_number_id": phone_id,
+        "to_number": to_number,
+        "conversation_initiation_client_data": {
+            "dynamic_variables": {
+                "lead_name": trigger.get("name", "there"),
+                "lead_email": trigger.get("email", ""),
+                "call_type": trigger.get("call_type", "outreach"),
+                "product_url": "https://meetrick.ai",
+                "cta_url": "https://buy.stripe.com/9B69ATaET7vef3S9170x20t",
+            }
+        },
+    }
+
+    import urllib.request as _urllib_req
+    import urllib.error as _urllib_err
+    _data = json.dumps(call_payload).encode("utf-8")
+    _req = _urllib_req.Request(
+        "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+        data=_data,
+        headers={"xi-api-key": elevenlabs_key, "Content-Type": "application/json"},
+    )
+    try:
+        with _urllib_req.urlopen(_req, timeout=30) as _resp:
+            _result = json.loads(_resp.read().decode())
+        conv_id = _result.get("conversation_id", "")
+        call_sid = _result.get("callSid", "")
+        success = _result.get("success", False)
+    except _urllib_err.HTTPError as _e:
+        _body = _e.read().decode() if _e.fp else ""
+        raise DependencyBlocked("voice-call", f"ElevenLabs API error {_e.code}: {_body[:200]}")
+    except Exception as _ex:
+        raise DependencyBlocked("voice-call", f"ElevenLabs call failed: {_ex}")
+
+    # Append to operations log
+    _calls_log = DATA_ROOT.parent / "operations" / "elevenlabs-calls.jsonl"
+    _calls_log.parent.mkdir(parents=True, exist_ok=True)
+    _log_entry = json.dumps({
+        "ts": now_iso(),
+        "lead_id": trigger.get("lead_id", ""),
+        "email": trigger.get("email", ""),
+        "phone": to_number,
+        "status": "initiated" if success else "failed",
+        "conversation_id": conv_id,
+        "call_sid": call_sid,
+        "duration_s": 0,
+        "transcript_url": f"https://elevenlabs.io/app/conversations/{conv_id}" if conv_id else None,
+        "cost_usd": 0,
+        "agent_id": agent_id,
+    })
+    with open(_calls_log, "a") as _f:
+        _f.write(_log_entry + "\n")
+
     return StepOutcome(
-        summary="Call script prepared (ElevenLabs execution pending)",
-        artifacts=[{"kind": "call-script", "title": "Call Script", "path": path, "metadata": {}}],
-        workflow_stage="call-prepared",
+        summary=f"Voice call initiated via ElevenLabs — conv_id: {conv_id} | to: {to_number}",
+        artifacts=[{"kind": "call-script", "title": "Call Script", "path": path, "metadata": {"conversation_id": conv_id, "call_sid": call_sid}}],
+        workflow_stage="call-initiated",
     )
 
 

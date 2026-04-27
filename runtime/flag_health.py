@@ -72,6 +72,13 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # so partial/interrupted runs don't mask a stalled loop.
     ("RICK_FEED_POLL_LIVE", "feed-poll.jsonl", 2.0,
         lambda e: e.get("event") == "run.done"),
+    # resend-bounce-poll runs every 5 min (ai.rick.resend-bounce-poll.plist
+    # StartInterval=300). Writes a poll.done sentinel on every run (even when
+    # no bounces found) so the probe detects a dead loop within 1h.
+    # 1.0h = 12 missed cycles before alerting — enough hysteresis for machine
+    # sleep without false positives.
+    ("RICK_BOUNCE_POLL_LIVE", "email-bounces.jsonl", 1.0,
+        lambda e: e.get("event") == "poll.done"),
     # roast-lead-poll runs every 5 min (ai.rick.roast-lead-poll.plist
     # StartInterval=300). 0.5h = 6 missed cycles before alerting — enough
     # hysteresis to survive a brief machine sleep without false positives.

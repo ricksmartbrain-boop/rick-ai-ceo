@@ -122,6 +122,67 @@ def _maybe_queue_sms_draft(row: dict, label: str, dry_run: bool) -> dict | None:
 import re  # noqa: E402  — used by _maybe_queue_sms_draft
 
 
+# ── Auto-draft integration (Phase G additive layer) ──────────────────────────
+# Labels that get an auto-drafted reply in addition to their existing dispatch.
+# HIGH_INTENT → opus-4-7 (route="review").  WARM → sonnet-4-6 (route="writing").
+# Smart-models invariant: never downgrade these routes inside the drafter.
+_AUTO_DRAFT_HIGH_INTENT: frozenset[str] = frozenset({
+    "sales_inquiry", "scheduling_request", "pricing_question",
+})
+_AUTO_DRAFT_WARM: frozenset[str] = frozenset({
+    "objection_with_counter", "question", "referral_request", "support_request",
+})
+_AUTO_DRAFT_LABELS: frozenset[str] = _AUTO_DRAFT_HIGH_INTENT | _AUTO_DRAFT_WARM
+
+_AUTO_DRAFT_SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "skills" / "email-automation" / "scripts" / "auto-draft-reply.py"
+)
+
+
+def _maybe_auto_draft(row: dict, label: str, dry_run: bool) -> dict | None:
+    """Additive step: fire the auto-draft script for warm/high-intent replies.
+
+    Fires AFTER the primary dispatch. Never modifies existing dispatch behaviour.
+    Saves draft to ~/rick-vault/mailbox/drafts/auto/. NEVER auto-sends.
+    Returns the drafter result dict, or None if label is not draftable.
+    """
+    if label not in _AUTO_DRAFT_LABELS:
+        return None
+    if not _AUTO_DRAFT_SCRIPT.is_file():
+        log_event({"action": "auto-draft-skip", "reason": "script-missing",
+                   "path": str(_AUTO_DRAFT_SCRIPT)})
+        return {"action": "skip-script-missing"}
+    try:
+        row_json = json.dumps(row, ensure_ascii=False)
+        cmd = [
+            "python3", str(_AUTO_DRAFT_SCRIPT),
+            "--row-json", row_json,
+            "--label", label,
+        ]
+        if not dry_run:
+            cmd.append("--live")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=120, check=False,
+            env={**os.environ},
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                return json.loads(proc.stdout.strip().splitlines()[-1])
+            except (json.JSONDecodeError, IndexError):
+                return {"action": "drafter-no-json", "stdout": proc.stdout[:200]}
+        return {
+            "action": "drafter-failed",
+            "exit": proc.returncode,
+            "stderr": proc.stderr[:300],
+        }
+    except subprocess.TimeoutExpired:
+        return {"action": "drafter-timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "drafter-exception", "error": str(exc)[:200]}
+
+
 def dispatch_sales_inquiry(conn, row: dict, dry_run: bool) -> dict:
     email = row.get("from", "").strip()
     body = (row.get("body") or "")[:500]
@@ -339,6 +400,7 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
         except json.JSONDecodeError:
             continue
     routed = 0
+    auto_drafted = 0
     summary_by_action = {}
     self_sends_skipped = 0
     for row in rows:
@@ -364,6 +426,13 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
         summary_by_action[result.get("action", "unknown")] = summary_by_action.get(result.get("action", "unknown"), 0) + 1
         routed += 1
         log_event({"file": path.name, "label": label, **result})
+        # Additive: auto-draft alongside existing dispatch for warm/high-intent labels
+        draft_result = _maybe_auto_draft(row, label, dry_run)
+        if draft_result:
+            row["auto_draft"] = draft_result
+            if draft_result.get("action") in ("auto-drafted", "would-draft"):
+                auto_drafted += 1
+            log_event({"file": path.name, "label": label, "auto_draft": draft_result})
     # Persist the file when ANY row was mutated (routed OR self-send-skipped),
     # so we don't re-process self-sends every cycle.
     if (routed or self_sends_skipped) and not dry_run:
@@ -371,7 +440,8 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
             path.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n", encoding="utf-8")
         except OSError:
             pass
-    out = {"file": str(path), "routed": routed, "by_action": summary_by_action}
+    out = {"file": str(path), "routed": routed, "auto_drafted": auto_drafted,
+            "by_action": summary_by_action}
     if self_sends_skipped:
         out["self_sends_skipped"] = self_sends_skipped
     return out
@@ -381,12 +451,13 @@ def drain(dry_run: bool, batch_cap: int) -> dict:
     TRIAGE_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(TRIAGE_DIR.glob("inbound-*.jsonl"))
     conn = db_connect()
-    totals = {"files": 0, "routed": 0, "by_action": {}, "self_sends_skipped": 0}
+    totals = {"files": 0, "routed": 0, "auto_drafted": 0, "by_action": {}, "self_sends_skipped": 0}
     try:
         for f in files:
             r = process_file(conn, f, dry_run, batch_cap - totals["routed"])
             totals["files"] += 1
             totals["routed"] += r["routed"]
+            totals["auto_drafted"] += r.get("auto_drafted", 0)
             totals["self_sends_skipped"] += r.get("self_sends_skipped", 0)
             for k, v in (r.get("by_action") or {}).items():
                 totals["by_action"][k] = totals["by_action"].get(k, 0) + v

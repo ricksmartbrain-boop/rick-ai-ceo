@@ -107,7 +107,8 @@ def gather() -> dict:
         "today_inbound": _today_inbound_count(),
         "drafts_counter_pitch": _count_drafts("counter-pitch"),
         "drafts_follow_up": _count_drafts("follow-up"),
-        "drafts_total": _count_drafts("counter-pitch") + _count_drafts("follow-up"),
+        "drafts_auto": _count_drafts("auto"),
+        "drafts_total": _count_drafts("counter-pitch") + _count_drafts("follow-up") + _count_drafts("auto"),
         "needs_vlad": _scan_needs_vlad(),
     }
     try:
@@ -168,12 +169,22 @@ def render(s: dict) -> str:
         f"*Active threads*: {s.get('active_threads_total', 0)} total",
     ]
     drafts_total = s.get("drafts_total", 0)
+    drafts_auto = s.get("drafts_auto", 0)
     if drafts_total:
+        parts = []
+        if s.get("drafts_auto", 0):
+            parts.append(f"{drafts_auto} auto-drafted")
+        if s.get("drafts_counter_pitch", 0):
+            parts.append(f"{s['drafts_counter_pitch']} counter-pitch")
+        if s.get("drafts_follow_up", 0):
+            parts.append(f"{s['drafts_follow_up']} follow-up")
+        detail = " · ".join(parts) if parts else ""
         lines.append(
-            f"*Drafts pending review*: {drafts_total} "
-            f"({s.get('drafts_counter_pitch', 0)} counter-pitch · "
-            f"{s.get('drafts_follow_up', 0)} follow-up)"
+            f"*Drafts pending review*: {drafts_total}"
+            + (f" ({detail})" if detail else "")
         )
+    elif drafts_auto == 0:
+        pass  # will hit the quiet-day fallback below
     follow_due = s.get("follow_ups_due", 0)
     follow_pending = s.get("follow_ups_total_pending", 0)
     if follow_pending:
