@@ -103,6 +103,14 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # resets the clock; error entries alone would mask a broken setup.
     ("RICK_GOOGLE_MAPS_LIVE", "../data/google-maps-firehose-*.jsonl", 168.0,
         lambda e: e.get("outcome") in ("inserted", "duplicate-or-bad")),
+    # gmail_personal: sequencer Day-5 / Day-15 personal-touch slots.
+    # Low-cadence by design (daily=5). 48h window = acceptable if no touch
+    # needed today; staleness only fires if sequencer has due slots but
+    # the channel went silent (auth failure, formatter crash, etc.).
+    # Shares outbound-dispatcher.jsonl with other channels.
+    ("RICK_GMAIL_PERSONAL_LIVE", "outbound-dispatcher.jsonl", 48.0,
+        lambda e: e.get("channel") == "gmail_personal"
+        and e.get("status") == "sent"),
 ]
 
 

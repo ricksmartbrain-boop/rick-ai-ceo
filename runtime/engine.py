@@ -209,6 +209,11 @@ FLEET_ANALYZE_STEPS: list[tuple[str, str]] = [
     ("insight_generate", "writing"),
     ("report_distribute", "writing"),
 ]
+# Cold email pipeline for pre-screened leads (qualified_lead workflows)
+QUALIFIED_LEAD_STEPS: list[tuple[str, str]] = [
+    ("cold_email_draft", "writing"),
+    ("cold_email_send", "writing"),
+]
 WORKFLOW_STEP_MAP: dict[str, list[tuple[str, str]]] = {
     "info_product_launch": INFO_PRODUCT_STEPS,
     "post_purchase_fulfillment": POST_PURCHASE_STEPS,
@@ -239,6 +244,8 @@ WORKFLOW_STEP_MAP: dict[str, list[tuple[str, str]]] = {
     "voice_outreach": VOICE_OUTREACH_STEPS,
     "affiliate_recruit": AFFILIATE_RECRUIT_STEPS,
     "fleet_analyze": FLEET_ANALYZE_STEPS,
+    # Outbound cold email for pre-qualified leads
+    "qualified_lead": QUALIFIED_LEAD_STEPS,
 }
 
 PUBLISH_STEP_ROUTES: dict[str, str] = {
@@ -268,6 +275,7 @@ WORKFLOW_LANE_OVERRIDES = {
     "upwork_post_project": "customer-lane",
     "upwork_analytics": "ops-lane",
     # Phase 1
+    "qualified_lead": "customer-lane",
     "deal_close": "customer-lane",
     "testimonial_collect": "customer-lane",
     "proof_publish": "distribution-lane",
@@ -5891,6 +5899,15 @@ def merge_completed_subagents(connection: sqlite3.Connection, limit: int = 50) -
 def heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     # Sweep stale running jobs first to unblock lanes
     sweep_stale_running_jobs(connection)
+    # 21-day multi-touch sequencer — advances qualified_lead workflows
+    # through the full email/voice/LinkedIn touch sequence.
+    # Best-effort: errors here never break the heartbeat loop.
+    try:
+        from runtime.sequencer import tick as _sequencer_tick
+        _sequencer_tick(connection)
+    except Exception as _seq_exc:
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning("sequencer.tick failed: %s", _seq_exc)
     # Auto-close workflows whose jobs all completed but status flip was missed
     # (crash/kill between last job write and workflow finalization).
     try:

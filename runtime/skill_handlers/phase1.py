@@ -114,6 +114,30 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
                 workflow_status="cancelled",
                 workflow_stage="auto-suppressed",
             )
+        # 2026-04-27: Low-quality scraped-lead guard. Generic role addresses on
+        # local-SMB domains (restaurants, clinics, wellness, trades) bounce hard
+        # and burn sender reputation. Block before any LLM spend.
+        _LOW_QUALITY_ROLE_PREFIXES = (
+            "info@", "contact@", "hello@", "admin@", "office@",
+            "support@", "team@", "mail@",
+        )
+        _LOW_QUALITY_DOMAIN_SIGNALS = (
+            "restaurant", "clinic", "chiro", "dental", "dentist", "wellness",
+            "medspa", "med-spa", "spa", "salon", "gym", "yoga", "pilates",
+            "plumb", "roofing", "hvac", "landscap", "autorepair", "auto-repair",
+        )
+        if any(low_email.startswith(p) for p in _LOW_QUALITY_ROLE_PREFIXES):
+            if any(sig in low_domain for sig in _LOW_QUALITY_DOMAIN_SIGNALS):
+                return StepOutcome(
+                    summary=f"auto_suppressed: generic role address on local-SMB domain ({low_email}) — hard-bounce risk",
+                    artifacts=[{
+                        "kind": "suppression-record",
+                        "title": "Lead intake auto-suppressed (scraped local-SMB)",
+                        "metadata": {"reason": "generic_role_local_smb", "email": low_email, "source": lead_source},
+                    }],
+                    workflow_status="cancelled",
+                    workflow_stage="auto-suppressed",
+                )
 
     # 2026-04-24: pattern READ side fanned out to lead_intake. Surfaces top-3
     # most-effective patterns so the dossier-building LLM benefits from
@@ -1536,6 +1560,159 @@ def handle_engagement_track(connection: sqlite3.Connection, workflow: sqlite3.Ro
 
 
 # ---------------------------------------------------------------------------
+# Skill 5: qualified-lead — cold email pipeline for pre-screened leads
+# ---------------------------------------------------------------------------
+
+def _get_qualified_lead_context(workflow: sqlite3.Row) -> dict:
+    """Extract lead fields from flat or trigger_payload-wrapped context_json.
+
+    qualified_lead workflows store email/name/company at top level of
+    context_json (not inside trigger_payload). Deal-close workflows use
+    trigger_payload. This helper normalises both shapes.
+    """
+    context = json_loads(workflow["context_json"])
+    trigger = context.get("trigger_payload", context)
+    return {
+        "email": trigger.get("email", ""),
+        "name": trigger.get("name", ""),
+        "company": trigger.get("company", ""),
+        "source": trigger.get("source", "outreach"),
+        "sequence": trigger.get("sequence", "multi-touch-v1"),
+    }
+
+
+def handle_cold_email_draft(
+    connection: sqlite3.Connection, workflow: sqlite3.Row, job: sqlite3.Row
+) -> StepOutcome:
+    """Draft cold outreach email for a pre-qualified lead (qualified_lead workflow)."""
+    lead = _get_qualified_lead_context(workflow)
+    email = lead["email"]
+    name = lead["name"]
+    company = lead["company"]
+
+    prompt = (
+        "You are Rick, an AI CEO sending a short cold outreach email.\n\n"
+        f"Lead name: {name}\n"
+        f"Company: {company}\n"
+        f"Email: {email}\n\n"
+        "Write a 3-paragraph cold email:\n"
+        "1. A specific hook about their business or industry (pain-point first, no generic opener)\n"
+        "2. One line about what Rick is + one concrete proof point (real metric \u2014 drafts/day, cost/action, etc.)\n"
+        "3. A single CTA \u2014 one pointed question OR a link to meetrick.ai (not both)\n\n"
+        "Rules: no filler phrases, no 'I hope this finds you well', under 120 words total.\n"
+        "First line format: '**Subject:** <6-10 word subject>'\n"
+        "Tone: direct, warm, founder-to-founder.\n"
+        "Output ONLY the email body (subject line + text)."
+    )
+    company_slug = (company or "").split(".")[0] or name or "your business"
+    fallback = (
+        f"**Subject:** Quick question about {company_slug}\n\n"
+        f"Hi {name or 'there'},\n\n"
+        f"Running a business like {company_slug} manually is a full-time job in itself \u2014 "
+        f"especially the stuff that should be automated but isn't yet.\n\n"
+        f"I'm Rick \u2014 an AI CEO operating meetrick.ai autonomously. Last week: 200+ workflows "
+        f"completed, $0.002/action average. The system is available for a second business.\n\n"
+        f"Worth a 2-minute look? meetrick.ai\n\n\u2014 Rick"
+    )
+    result = generate_text("writing", prompt, fallback)
+
+    draft_dir = DATA_ROOT / "deals" / slugify(email or name or "unknown")
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    path = write_file(draft_dir / "cold-email-draft.md", result.content)
+
+    return StepOutcome(
+        summary=f"Cold email drafted for {name} ({company})",
+        artifacts=[{
+            "kind": "cold-email-draft",
+            "title": "Cold Email Draft",
+            "path": path,
+            "metadata": {"email": email, "company": company},
+        }],
+        workflow_stage="cold-email-drafted",
+    )
+
+
+def handle_cold_email_send(
+    connection: sqlite3.Connection, workflow: sqlite3.Row, job: sqlite3.Row
+) -> StepOutcome:
+    """Queue cold email for send \u2014 writes ad-hoc outbox .md for email-sequence-send.py."""
+    lead = _get_qualified_lead_context(workflow)
+    email = lead["email"]
+    name = lead["name"]
+    company = lead["company"]
+
+    if not email or "@" not in email:
+        return StepOutcome(
+            summary=f"Cold email skipped \u2014 no valid email for {name or 'unknown'}",
+            artifacts=[],
+            workflow_status="cancelled",
+            workflow_stage="cold-email-skipped",
+        )
+
+    draft_dir = DATA_ROOT / "deals" / slugify(email)
+    draft_path = draft_dir / "cold-email-draft.md"
+    draft = draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
+
+    # Write to ad-hoc outbox (same pattern as handle_pitch_send)
+    outbox_dir = DATA_ROOT / "mailbox" / "outbox" / "ad-hoc"
+    outbox_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = slugify(email)[:40]
+    md_path = outbox_dir / f"{stamp}-{slug}-step1.md"
+
+    body_lines = draft.splitlines()
+    subject = f"Quick question about {company or name}"
+    body_start = 0
+    for i, ln in enumerate(body_lines[:5]):
+        m = re.match(r"^\*\*Subject:\*\*\s*(.+)", ln, re.IGNORECASE)
+        if m:
+            subject = m.group(1).strip()[:120]
+            body_start = i + 1
+            break
+    clean_body = "\n".join(body_lines[body_start:]).strip()
+
+    frontmatter = (
+        "---\n"
+        f"to: {email}\n"
+        f"subject: {subject}\n"
+        "from: Rick <rick@meetrick.ai>\n"
+        f"workflow_id: {workflow['id']}\n"
+        "type: cold_outreach\n"
+        f"company: {company}\n"
+        "---\n\n"
+    )
+    md_path.write_text(frontmatter + clean_body + "\n", encoding="utf-8")
+
+    # Upsert prospect pipeline record
+    prospect_id = f"pr_{uuid.uuid4().hex[:12]}"
+    stamp_iso = now_iso()
+    connection.execute(
+        """INSERT OR IGNORE INTO prospect_pipeline
+               (id, platform, username, profile_url, score, status, notes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pitched', ?, ?, ?)""",
+        (prospect_id, lead["source"], email, "", 6,
+         json.dumps({"company": company, "sequence": lead["sequence"]}), stamp_iso, stamp_iso),
+    )
+    connection.execute(
+        "UPDATE prospect_pipeline SET status='pitched', last_contact_at=?, updated_at=? WHERE username=?",
+        (stamp_iso, stamp_iso, email),
+    )
+
+    return StepOutcome(
+        summary=f"Cold email queued: {name} ({company}) \u2192 {email}",
+        artifacts=[{
+            "kind": "cold-email-queued",
+            "title": "Cold Email",
+            "path": md_path,
+            "metadata": {"to": email, "subject": subject, "company": company},
+        }],
+        workflow_status="done",
+        workflow_stage="cold-email-sent",
+        notify_text=f"Cold email queued: {name} ({company}) \u2192 {email}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Handler registry
 # ---------------------------------------------------------------------------
 
@@ -1562,4 +1739,7 @@ PHASE1_HANDLERS = {
     "sequence_draft": handle_sequence_draft,
     "outbox_send": handle_outbox_send,
     "engagement_track": handle_engagement_track,
+    # Skill 5: qualified-lead (cold email pipeline)
+    "cold_email_draft": handle_cold_email_draft,
+    "cold_email_send": handle_cold_email_send,
 }

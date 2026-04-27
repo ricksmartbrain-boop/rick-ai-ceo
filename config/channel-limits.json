@@ -90,6 +90,15 @@
       "per_minute": 1,
       "cooldown_per_recipient_days": 0,
       "formatter_module": "runtime.formatters.x"
+    },
+    "gmail_personal": {
+      "active": true,
+      "_notes": "Personal-touch slot for sequencer Day-5 / Day-15. Low-volume, high-trust. Sends from rick@meetrick.ai via Gmail SMTP App Password (same cred as himalaya). Daily cap=5 enforces human-cadence; per_minute=1 prevents burst.",
+      "daily": 5,
+      "per_minute": 1,
+      "quiet_hours": {"start": 22, "end": 7},
+      "cooldown_per_recipient_days": 5,
+      "formatter_module": "runtime.formatters.gmail_personal"
     }
   }
 }

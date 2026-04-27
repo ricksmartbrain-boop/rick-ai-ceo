@@ -289,16 +289,21 @@ def generate_draft(row: dict, label: str, dry_run: bool) -> dict:
     prospect = _lookup_prospect(from_email)
     prompt = _build_prompt(row, label, thread_ctx, prospect)
 
-    # Smart-models invariant: NEVER downgrade
-    route = "review" if label in HIGH_INTENT_LABELS else "writing"
-    # "review" → claude-opus-4-7  |  "writing" → claude-sonnet-4-6
+    # Smart-models invariant: NEVER downgrade.
+    # Always use route "writing" for the correct email-persona system prompt.
+    # For HIGH_INTENT, temporarily force the writing-route model to opus-4-7
+    # via env override so we get opus intelligence without the red-team reviewer
+    # system prompt that lives on the "review" route.
+    route = "writing"
+    is_high_intent = label in HIGH_INTENT_LABELS
+    model_hint = "claude-opus-4-7" if is_high_intent else "claude-sonnet-4-6"
 
     if dry_run:
         return {
             "action": "would-draft",
             "label": label,
             "route": route,
-            "model_hint": "claude-opus-4-7" if label in HIGH_INTENT_LABELS else "claude-sonnet-4-6",
+            "model_hint": model_hint,
             "prompt_chars": len(prompt),
             "thread_ctx_msgs": len(thread_ctx),
             "from": from_email,
@@ -306,12 +311,25 @@ def generate_draft(row: dict, label: str, dry_run: bool) -> dict:
         }
 
     # ── LLM call ────────────────────────────────────────────────────────────
+    # For HIGH_INTENT: temporarily override the writing-route model env var to
+    # claude-opus-4-7. We restore it in the finally block — thread-safe for
+    # this subprocess-isolated call (the router spawns us as a child process).
+    _env_key = "RICK_MODEL_ANTHROPIC_WORKHORSE"
+    _old_val = os.environ.get(_env_key)
     try:
+        if is_high_intent:
+            os.environ[_env_key] = "claude-opus-4-7"
         result = generate_text(route, prompt, fallback="")
         draft_text = (result.content if hasattr(result, "content") else str(result) or "").strip()
     except Exception as exc:
         _log({"action": "draft-error", "label": label, "from": from_email, "error": str(exc)[:300]})
         return {"action": "draft-error", "error": str(exc)[:300]}
+    finally:
+        if is_high_intent:
+            if _old_val is None:
+                os.environ.pop(_env_key, None)
+            else:
+                os.environ[_env_key] = _old_val
 
     if not draft_text:
         _log({"action": "draft-empty", "label": label, "from": from_email})
@@ -334,7 +352,7 @@ def generate_draft(row: dict, label: str, dry_run: bool) -> dict:
         "thread_id": thread_id,
         "label": label,
         "route": route,
-        "model": getattr(result, "model", "?"),
+        "model": getattr(result, "model", None) or model_hint,
         "body": draft_text,
         "original_reply_body": (row.get("body") or "")[:1000],
         "thread_ctx_msgs": len(thread_ctx),
