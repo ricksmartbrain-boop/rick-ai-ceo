@@ -189,7 +189,12 @@ def scan_flags() -> list[dict]:
         # raise when a logger writes `2026-04-25T...+00:00`. Time math is
         # local-clock for both sides; logs are wall-clock anyway.
         if latest.tzinfo is not None:
-            latest = latest.replace(tzinfo=None)
+            # 2026-04-27: tz-aware logs (UTC with +00:00 / Z suffix) were being
+            # stripped to naive then compared against naive local now() →
+            # negative ages (-7h on PDT). astimezone() without arg converts
+            # to system local first, THEN strip — so the comparison is local
+            # vs local, age math is correct.
+            latest = latest.astimezone().replace(tzinfo=None)
         try:
             age_h = (now - latest).total_seconds() / 3600.0
         except TypeError:
