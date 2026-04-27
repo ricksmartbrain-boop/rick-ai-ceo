@@ -81,14 +81,38 @@ def _suppression_count() -> int:
         return 0
 
 
+# Actions that confirm a warm lead was properly handled by the router.
+# "drafted" = objection counter-pitch auto-draft (existing).
+# "queued"  = deal-close workflow queued for sales_inquiry.
+# "alerted-vlad" = Vlad pinged for pricing/scheduling/referral questions.
+# "logged-for-rebuttal" = objection written to ledger for rebuttal.
+# would-* = dry-run previews (test/CI only).
+_WARM_HANDLED_ACTIONS = frozenset({
+    "drafted", "drafted-no-payload",
+    "queued",
+    "alerted-vlad",
+    "logged-for-rebuttal",
+    "would-queue-deal_close", "would-draft-counter-pitch",
+    "would-delegate-remy", "would-alert-vlad",
+})
+
+
 def _funnel_24h() -> dict:
-    """Inbound → classified → routed → drafted funnel for last 24h.
+    """Inbound → classified → routed → drafted/handled funnel for last 24h.
     Reads today's triage JSONL since that's where router persists state.
+
+    Key metric fix (2026-04-27): ``drafted`` tracks only objection counter-pitch
+    auto-drafts. ``warm_handled`` tracks ALL warm labels that were properly
+    dispatched (queued deal workflow, alerted-vlad, logged-for-rebuttal, drafted).
+    The funnel-break alarm now fires on ``warm_handled == 0``, not ``drafted == 0``,
+    so pricing/scheduling/referral/sales leads that are correctly alerted don't
+    produce a false ⚠️ every time.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     triage_file = DATA_ROOT / "mailbox" / "triage" / f"inbound-{today}.jsonl"
     funnel = {"inbound": 0, "classified": 0, "warm_class": 0,
-              "routed": 0, "drafted": 0, "suppressed": 0, "self_send_skipped": 0}
+              "routed": 0, "drafted": 0, "warm_handled": 0,
+              "suppressed": 0, "self_send_skipped": 0}
     if not triage_file.is_file():
         return funnel
     warm = {"sales_inquiry", "objection_with_counter", "pricing_question",
@@ -105,7 +129,8 @@ def _funnel_24h() -> dict:
             cls = row.get("classification")
             if cls and cls != "unknown":
                 funnel["classified"] += 1
-            if cls in warm:
+            is_warm = cls in warm
+            if is_warm:
                 funnel["warm_class"] += 1
             if row.get("router_ran_at"):
                 rr = row.get("router_result") or {}
@@ -117,8 +142,12 @@ def _funnel_24h() -> dict:
                 elif action == "drafted":
                     funnel["drafted"] += 1
                     funnel["routed"] += 1
+                    if is_warm:
+                        funnel["warm_handled"] += 1
                 else:
                     funnel["routed"] += 1
+                    if is_warm and action in _WARM_HANDLED_ACTIONS:
+                        funnel["warm_handled"] += 1
     except OSError:
         pass
     return funnel
@@ -440,11 +469,15 @@ def render(s: dict) -> str:
         lines.append("")
         lines.append(
             f"*Inbox funnel*: {f.get('inbound', 0)} in → {f.get('classified', 0)} classified "
-            f"→ {f.get('warm_class', 0)} warm → {f.get('drafted', 0)} drafted "
-            f"({f.get('suppressed', 0)} suppressed, {f.get('self_send_skipped', 0)} self-send)"
+            f"→ {f.get('warm_class', 0)} warm → {f.get('warm_handled', f.get('drafted', 0))} handled "
+            f"({f.get('drafted', 0)} auto-drafted, {f.get('suppressed', 0)} suppressed, "
+            f"{f.get('self_send_skipped', 0)} self-send)"
         )
-        if f.get("warm_class", 0) > 0 and f.get("drafted", 0) == 0:
-            lines.append(f"  ⚠️ {f.get('warm_class')} warm classifications, 0 drafts produced — funnel break")
+        if f.get("warm_class", 0) > 0 and f.get("warm_handled", 0) == 0:
+            lines.append(
+                f"  ⚠️ {f.get('warm_class')} warm leads received, 0 handled — "
+                f"router not dispatching (check reply_router.py drain cron)"
+            )
 
     drafts = s.get("drafts_pending", {})
     if drafts.get("total", 0) > 0:
