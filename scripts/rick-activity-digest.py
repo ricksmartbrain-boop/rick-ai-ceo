@@ -20,6 +20,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -31,6 +32,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runtime.db import connect  # noqa: E402
+
+LEVERAGE_METER_PATH = ROOT / "scripts" / "leverage-meter.py"
+
+
+def _load_compute_leverage():
+    spec = importlib.util.spec_from_file_location("leverage_meter", LEVERAGE_METER_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"unable to load leverage meter from {LEVERAGE_METER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.compute_leverage
+
+
+compute_leverage = _load_compute_leverage()
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 LOG_FILE = DATA_ROOT / "operations" / "rick-activity-digest.jsonl"
@@ -546,6 +561,10 @@ def gather() -> dict:
     summary["funnel"] = _funnel_24h()
     summary["email_bounce_health"] = _email_bounce_health()
     summary["channel_reply_rates"] = _channel_reply_rate_24h()
+    try:
+        summary["leverage"] = compute_leverage()
+    except Exception as exc:  # noqa: BLE001
+        summary["leverage"] = {"error": str(exc)[:200]}
 
     # VARA attestation visibility — surfaces total + max tier reached.
     # Mostly silent today (Newton at $18 cumulative, lowest tier $1K), but
@@ -741,6 +760,30 @@ def render(s: dict) -> str:
 
     threads = s.get("active_email_threads", 0)
     lines.append(f"*Active email threads*: {threads}")
+
+    lev = s.get("leverage") or {}
+    if lev and not lev.get("error"):
+        lines.append("")
+        lines.append(
+            f"🚀 *Rick leverage 24h*: {lev['autonomous_hours']:.1f} autonomous-hours = "
+            f"{lev['person_days']:.2f} person-days at human pace"
+        )
+        firing = lev.get("persona_audit", {}).get("firing_today", [])
+        if firing:
+            lines.append(f"  • Firing: {', '.join(firing)}")
+        warm_idle = lev.get("persona_audit", {}).get("warm_idle", [])
+        dormant = lev.get("persona_audit", {}).get("dormant_no_evidence", [])
+        if warm_idle or dormant:
+            bits = []
+            if warm_idle:
+                bits.append(f"warm-idle {', '.join(warm_idle)}")
+            if dormant:
+                bits.append(f"dormant {', '.join(dormant)}")
+            lines.append(f"  • Persona audit: {'; '.join(bits)}")
+        gaps = lev.get("automation_gaps", [])
+        if gaps:
+            gap_bits = "; ".join(g.get("gap", "") for g in gaps[:3])
+            lines.append(f"  • P1 gaps: {gap_bits}")
 
     # ── Email sender-health ────────────────────────────────────────────────
     bh = s.get("email_bounce_health") or {}

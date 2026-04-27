@@ -580,6 +580,12 @@ def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
         conn.commit()
         return 0  # replied, not a new dispatch
 
+    # Manual eyeball gate: founder leads can be queued now but must not auto-send
+    # until Vlad has reviewed and flipped the approval flag in context_json.
+    if ctx.get("manual_eyeball_required") and not ctx.get("vlad_approved_at"):
+        _log({"event": "workflow_waiting_on_vlad", "wf_id": wf_id, "reason": "manual_eyeball_required"})
+        return 0
+
     days = _days_since_start(seq)
 
     # Find the FIRST touch that is due and not yet dispatched

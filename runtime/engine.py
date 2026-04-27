@@ -6246,6 +6246,7 @@ def parse_telegram_text(
             "/tenants — Tenant overview\n"
             "/churn — Run churn detection\n"
             "/nurture — Run email nurture cycle\n"
+            "/install [tenant_id] [--test-email addr] [--dry-run]\n"
             "/fleet — Show live fleet stats (every Rick on meetrick.ai)\n"
             "/fleet-analyze — Run fleet intelligence workflow\n"
             "/map — Link to the live Rick swarm map\n"
@@ -7041,6 +7042,32 @@ def parse_telegram_text(
         industry = parts[3] if len(parts) > 3 else ""
         wf_id = queue_managed_onboarding_workflow(connection, email=email, business_name=biz, industry=industry)
         return f"Managed onboarding queued: {wf_id}"
+
+    if command in {"/install", "install"}:
+        denied = _require_authorized_chat(chat_id, "/install")
+        if denied:
+            return denied
+        script_path = ROOT_DIR / "scripts" / "install-rick.sh"
+        if not script_path.exists():
+            return f"Install script missing: {script_path}"
+        try:
+            result = subprocess.run(
+                ["bash", str(script_path), *parts[1:]],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=str(ROOT_DIR),
+                env=os.environ.copy(),
+                timeout=7200,
+            )
+        except subprocess.TimeoutExpired:
+            return "/install timed out after 2h"
+        output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()])).strip()
+        if not output:
+            output = f"/install exit {result.returncode}"
+        if result.returncode != 0:
+            return f"/install failed (exit {result.returncode}):\n{output[:3000]}"
+        return output[:3000]
 
     # --- TIER-3.5 #A12 — Inbox UI for Vlad's draft review ----------------
     # /i is a quick alias for /inbox (most-used cmd from phone, save typing)

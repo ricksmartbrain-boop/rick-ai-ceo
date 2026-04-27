@@ -72,6 +72,11 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # so partial/interrupted runs don't mask a stalled loop.
     ("RICK_FEED_POLL_LIVE", "feed-poll.jsonl", 2.0,
         lambda e: e.get("event") == "run.done"),
+    # daily-proof-engine runs daily at 09:00 PT (ai.rick.daily-proof-engine.plist
+    # StartCalendarInterval Hour=9 Minute=0). Filter on the terminal run.done
+    # event so generate-only failures don't look fresh.
+    ("RICK_DAILY_PROOF_LIVE", "daily-proof-engine.jsonl", 26.0,
+        lambda e: e.get("event") == "run.done"),
     # resend-bounce-poll runs every 5 min (ai.rick.resend-bounce-poll.plist
     # StartInterval=300). Writes a poll.done sentinel on every run (even when
     # no bounces found) so the probe detects a dead loop within 1h.
