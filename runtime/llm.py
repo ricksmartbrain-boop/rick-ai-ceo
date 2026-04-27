@@ -167,7 +167,12 @@ ROUTE_FALLBACK_DEFAULTS = {
         ("anthropic", "claude-opus-4-7"),
     ),
     "review": (
+        # 2026-04-27: Anthropic billing-skip caught dropping review
+        # (opus-4-7) → gpt-5.4-mini, violating smart-models invariant.
+        # Added gpt-5.4 (full) as the next-best after Google so opus
+        # failures don't degrade to the cheap mini.
         ("google", "gemini-3.1-pro-preview"),
+        ("openai", "gpt-5.4"),
         ("openai", "gpt-5.4-mini"),
     ),
     "analysis": (
@@ -183,8 +188,12 @@ ROUTE_FALLBACK_DEFAULTS = {
         ("anthropic", "claude-sonnet-4-6"),
     ),
     "strategy": (
+        # When Anthropic is down (billing-skip 2026-04-27) the chain used
+        # to fall to Google then break. Added gpt-5.4 (full, not mini) as
+        # second fallback so strategic reasoning doesn't degrade silently.
         ("anthropic", "claude-sonnet-4-6"),
         ("google", "gemini-3.1-pro-preview"),
+        ("openai", "gpt-5.4"),
     ),
 }
 STRATEGY_SYNTHESIS_DEFAULT = ("openai", "RICK_STRATEGY_PANEL_SYNTHESIS_MODEL", "openai:gpt-5.4")
