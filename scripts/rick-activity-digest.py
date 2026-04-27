@@ -842,6 +842,7 @@ def gather() -> dict:
         by_provider: dict[str, int] = {}
         total = 0
         generated = 0
+        seen: set[tuple[str, str]] = set()
         if media_log.exists():
             for line in media_log.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
@@ -856,7 +857,12 @@ def gather() -> dict:
                     continue
                 total += 1
                 provider = str(entry.get("provider") or "unknown")
-                if entry.get("status") == "generated":
+                file_path = str(entry.get("file_path") or "")
+                if entry.get("status") == "generated" and file_path:
+                    key = (provider, file_path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     generated += 1
                     by_provider[provider] = by_provider.get(provider, 0) + 1
         summary["media_factory_24h"] = {

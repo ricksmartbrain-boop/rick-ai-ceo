@@ -303,7 +303,7 @@ def attach_media(channel: str, payload: dict, angle: Optional[str] = None) -> di
             payload["image_path"] = result
             _log({
                 "channel": channel, "angle": angle or "", "provider": provider,
-                "status": "generated", "latency_ms": int((time.monotonic() - started) * 1000),
+                "status": "attached", "latency_ms": int((time.monotonic() - started) * 1000),
                 "file_path": result,
             })
             return payload
