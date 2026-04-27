@@ -130,6 +130,223 @@ def _email_bounce_health() -> dict:
     }
 
 
+# ── Per-channel reply-rate instrumentation ───────────────────────────────────
+# Warm labels that count as a genuine reply signal (same set as funnel, kept
+# independent so _email_bounce_health and _funnel_24h are untouched).
+_REPLY_WARM_LABELS: frozenset[str] = frozenset({
+    "sales_inquiry", "pricing_question", "scheduling_request",
+    "objection_with_counter", "referral_request",
+})
+
+# Sender-domain suffix → outbound channel attribution for inbound replies.
+# More-specific entries MUST precede broader ones.
+_CHANNEL_DOMAIN_MAP: list[tuple[str, str]] = [
+    ("linkedin.com", "linkedin"),
+    ("linkedinmail.com", "linkedin"),
+    ("instagram.com", "instagram"),
+    ("threads.net", "threads"),
+    ("moltbook.com", "moltbook"),
+]
+
+TRACKED_CHANNELS: tuple[str, ...] = ("email", "linkedin", "threads", "instagram", "moltbook")
+_MIN_SENDS_FOR_RATE = 5  # fewer sends → 'insufficient data'; avoids misleading %
+
+
+def _attribute_reply_channel(from_addr: str) -> str:
+    """Map a sender email address to the outbound channel that prompted the reply."""
+    domain = from_addr.split("@")[-1].lower() if "@" in from_addr else ""
+    for suffix, ch in _CHANNEL_DOMAIN_MAP:
+        if domain == suffix or domain.endswith("." + suffix):
+            return ch
+    return "email"  # default: plain email channel
+
+
+def _channel_reply_rate_24h() -> dict:
+    """Count sends and attributed warm replies per outbound channel in last 24 h.
+
+    Signature
+    ---------
+    _channel_reply_rate_24h() -> dict[str, dict]
+
+    Send sources
+    ------------
+    email    : operations/email-sends.jsonl          (status=="sent", ts >= cutoff)
+    social   : operations/outbound-dispatcher.jsonl  (status=="sent", channel=X, ran_at >= cutoff)
+
+    Reply sources  (warm labels only — see _REPLY_WARM_LABELS)
+    ---------------------------------------------------------------
+    Primary  : mailbox/triage/inbound-{today,yesterday}.jsonl
+                 classified_at >= cutoff AND classification in WARM_LABELS
+    Supplemental: operations/reply-router.jsonl
+                 ran_at >= cutoff AND label in WARM_LABELS
+                 (skipped when the same message was already seen in triage)
+
+    Attribution
+    -----------
+    Sender domain matched against _CHANNEL_DOMAIN_MAP.  Unknown domains → email.
+    Unclear/unmatchable → 'unattributed'.
+
+    Deduplication
+    -------------
+    Best-effort: primary key is message id (triage) or from+minute-ts;
+    reply-router entries with the same from+minute already counted via triage
+    are skipped.
+
+    Returns
+    -------
+    {
+      channel: {
+        "sent": int,
+        "replied": int,
+        "rate_pct": float | None,   # None when sends < _MIN_SENDS_FOR_RATE
+        "sufficient_data": bool,
+        "throttle_flag": bool,      # True when rate_pct < 0.5 — for smart-spray sequencer
+      },
+      ...
+      "unattributed": {"sent": 0, "replied": int, "rate_pct": None,
+                        "sufficient_data": False, "throttle_flag": False},
+    }
+    """
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+    dispatched_file = DATA_ROOT / "operations" / "outbound-dispatcher.jsonl"
+    email_sends_file = DATA_ROOT / "operations" / "email-sends.jsonl"
+    reply_router_file = DATA_ROOT / "operations" / "reply-router.jsonl"
+    triage_dir = DATA_ROOT / "mailbox" / "triage"
+
+    # ------------------------------------------------------------------
+    # 1. Count sends per channel
+    # ------------------------------------------------------------------
+    sent: dict[str, int] = {ch: 0 for ch in TRACKED_CHANNELS}
+
+    if email_sends_file.exists():
+        try:
+            for line in email_sends_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if row.get("status") == "sent" and row.get("ts", "") >= cutoff:
+                        sent["email"] += 1
+                except json.JSONDecodeError:
+                    pass
+        except OSError:
+            pass
+
+    if dispatched_file.exists():
+        try:
+            for line in dispatched_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    ch = row.get("channel", "")
+                    if (
+                        row.get("status") == "sent"
+                        and ch in sent
+                        and row.get("ran_at", "") >= cutoff
+                    ):
+                        sent[ch] += 1
+                except json.JSONDecodeError:
+                    pass
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 2. Count attributed warm replies (dedup across sources)
+    # ------------------------------------------------------------------
+    replied: dict[str, int] = {ch: 0 for ch in TRACKED_CHANNELS}
+    replied["unattributed"] = 0
+    # Dedup key: message id (preferred) OR from_addr + minute-truncated ts.
+    # Using minute truncation so triage classified_at and reply-router ran_at
+    # (which may differ by seconds) resolve to the same key.
+    seen_keys: set[str] = set()
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    for date_str in (today_str, yesterday_str):
+        tfile = triage_dir / f"inbound-{date_str}.jsonl"
+        if not tfile.exists():
+            continue
+        try:
+            for line in tfile.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("classified_at", "") < cutoff:
+                    continue
+                if row.get("classification") not in _REPLY_WARM_LABELS:
+                    continue
+                # Dedup: prefer stable message id; fall back to from+minute
+                msg_id = row.get("id") or ""
+                from_addr = row.get("from", "")
+                ts_minute = row.get("classified_at", "")[:16]
+                dedup_key = msg_id if msg_id else f"{from_addr}|{ts_minute}"
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+                ch = _attribute_reply_channel(from_addr)
+                replied[ch] = replied.get(ch, 0) + 1
+        except OSError:
+            pass
+
+    # Supplemental: reply-router.jsonl (catches social DM inbounds not in triage)
+    if reply_router_file.exists():
+        try:
+            for line in reply_router_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("ran_at", "") < cutoff:
+                    continue
+                if row.get("label") not in _REPLY_WARM_LABELS:
+                    continue
+                from_addr = row.get("email", "")
+                ts_minute = row.get("ran_at", "")[:16]
+                dedup_key = f"{from_addr}|{ts_minute}"
+                if dedup_key in seen_keys:
+                    continue  # already counted via triage
+                seen_keys.add(dedup_key)
+                ch = _attribute_reply_channel(from_addr)
+                replied[ch] = replied.get(ch, 0) + 1
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 3. Compute per-channel rates
+    # ------------------------------------------------------------------
+    result: dict = {}
+    for ch in TRACKED_CHANNELS:
+        s_count = sent[ch]
+        r_count = replied.get(ch, 0)
+        sufficient = s_count >= _MIN_SENDS_FOR_RATE
+        rate = round(100.0 * r_count / s_count, 2) if sufficient else None
+        result[ch] = {
+            "sent": s_count,
+            "replied": r_count,
+            "rate_pct": rate,
+            "sufficient_data": sufficient,
+            "throttle_flag": (rate is not None and rate < 0.5),
+        }
+
+    # Unattributed bucket — no throttle concept (unknown source)
+    result["unattributed"] = {
+        "sent": 0,
+        "replied": replied.get("unattributed", 0),
+        "rate_pct": None,
+        "sufficient_data": False,
+        "throttle_flag": False,
+    }
+
+    return result
+
+
 def _suppression_count() -> int:
     if not SUPPRESSION_FILE.is_file():
         return 0
@@ -328,6 +545,7 @@ def gather() -> dict:
     summary["suppression_total"] = _suppression_count()
     summary["funnel"] = _funnel_24h()
     summary["email_bounce_health"] = _email_bounce_health()
+    summary["channel_reply_rates"] = _channel_reply_rate_24h()
 
     # VARA attestation visibility — surfaces total + max tier reached.
     # Mostly silent today (Newton at $18 cumulative, lowest tier $1K), but
@@ -544,6 +762,48 @@ def render(s: dict) -> str:
             lines.append(
                 f"  🚨 *COMPLAINT RATE {c_pct:.2f}% > 0.1% ALARM* — "
                 f"spam reports detected; pause cold outreach and audit targeting"
+            )
+
+    # ── Per-channel reply-rate 24h ─────────────────────────────────────────
+    crr = s.get("channel_reply_rates") or {}
+    if crr:
+        def _rate_icon(rate_val: float | None, suff: bool) -> str:
+            if not suff or rate_val is None:
+                return "⚪"
+            if rate_val >= 1.0:
+                return "🟢"
+            if rate_val >= 0.3:
+                return "🟡"
+            return "🔴"
+
+        rate_parts: list[str] = []
+        for _ch in TRACKED_CHANNELS:
+            _ch_data = crr.get(_ch, {})
+            _sent = _ch_data.get("sent", 0)
+            if _sent == 0:
+                continue  # channel had no outbound activity; omit to keep digest clean
+            _rate = _ch_data.get("rate_pct")
+            _suff = _ch_data.get("sufficient_data", False)
+            _icon = _rate_icon(_rate, _suff)
+            _rate_str = f"{_rate:.1f}%" if _suff else "insuf. data"
+            rate_parts.append(f"{_ch} {_rate_str}{_icon}")
+
+        _unattr = crr.get("unattributed", {})
+        if _unattr.get("replied", 0) > 0:
+            rate_parts.append(f"unattributed ↩{_unattr['replied']}")
+
+        if rate_parts:
+            lines.append(f"📊 *Reply rate 24h*: {', '.join(rate_parts)}")
+
+        # Surface throttle candidates — data only, no actual throttling yet
+        _throttled = [
+            _ch for _ch in TRACKED_CHANNELS
+            if crr.get(_ch, {}).get("throttle_flag")
+        ]
+        if _throttled:
+            lines.append(
+                f"  ⚠️ *Throttle candidates* (rate <0.5%): {', '.join(_throttled)} "
+                f"— smart-spray sequencer will back off when live"
             )
 
     f = s.get("funnel") or {}
