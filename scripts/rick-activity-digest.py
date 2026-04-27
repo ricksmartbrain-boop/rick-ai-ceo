@@ -145,6 +145,195 @@ def _email_bounce_health() -> dict:
     }
 
 
+def _bounce_by_source_24h() -> dict:
+    """Best-effort bounce attribution by upstream source pipeline for the last 24h."""
+    cutoff = datetime.now() - timedelta(hours=24)
+    bounces_file = DATA_ROOT / "operations" / "email-bounces.jsonl"
+    suppression_file = DATA_ROOT / "mailbox" / "suppression.txt"
+    suppressed = suppression_file.read_text(encoding="utf-8", errors="replace").lower() if suppression_file.exists() else ""
+
+    bounced_emails: dict[str, dict] = {}
+    if bounces_file.exists():
+        try:
+            for line in bounces_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("event") != "bounced":
+                    continue
+                ts = row.get("ts", "")
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if dt.replace(tzinfo=None) < cutoff:
+                    continue
+                email = str(row.get("to", "")).lower().strip()
+                if email:
+                    bounced_emails[email] = row
+        except OSError:
+            pass
+
+    def _bucket(label: str) -> dict:
+        return {"sent": 0, "bounced": 0, "pending": [], "bounced_emails": []}
+
+    stats: dict[str, dict] = {}
+
+    def add_send(label: str, email: str, ts: datetime, meta: dict | None = None) -> None:
+        if not email:
+            return
+        email = email.lower().strip()
+        if not email:
+            return
+        bucket = stats.setdefault(label, _bucket(label))
+        bucket["sent"] += 1
+        if email in bounced_emails:
+            bucket["bounced"] += 1
+            bucket["bounced_emails"].append({"email": email, "ts": ts.isoformat(timespec="seconds"), **(meta or {})})
+        elif email not in suppressed:
+            bucket["pending"].append({"email": email, "ts": ts.isoformat(timespec="seconds"), **(meta or {})})
+
+    # 1) AI CEO course drip state (current live cohort)
+    course_state = DATA_ROOT / "projects" / "email-course-ai-ceo" / "drip-state.json"
+    if course_state.exists():
+        try:
+            course = json.loads(course_state.read_text(encoding="utf-8"))
+            if isinstance(course, dict):
+                for email, rec in course.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("last_sent_at")
+                    if not ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if dt.replace(tzinfo=None) < cutoff:
+                        continue
+                    add_send("email_course_ai_ceo", str(email), dt, {"day": rec.get("last_day_sent")})
+        except Exception:
+            pass
+
+    # 2) Google Maps/local-biz chain (lead scrape + blast / local-biz-pipeline)
+    pipeline_log = DATA_ROOT / "logs" / "pipeline.jsonl"
+    if pipeline_log.exists():
+        try:
+            for line in pipeline_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                email = str(row.get("email", "")).lower().strip()
+                if not email:
+                    continue
+                ts = row.get("ts", "")
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if dt.replace(tzinfo=None) < cutoff:
+                    continue
+                source = str(row.get("source") or "").strip().lower()
+                sprint = str(row.get("sprint") or "").strip().lower()
+                if source == "google_maps" or "lead scrape + blast" in sprint:
+                    add_send("google_maps", email, dt, {"business": row.get("business") or row.get("business_name"), "city": row.get("city")})
+        except OSError:
+            pass
+
+    # 3) Contacted.json cold-email sends
+    contacted_path = DATA_ROOT / "projects" / "outreach" / "contacted.json"
+    if contacted_path.exists():
+        try:
+            contacted = json.loads(contacted_path.read_text(encoding="utf-8"))
+
+            def _walk(obj: object, path: str = "") -> None:
+                if isinstance(obj, dict):
+                    email = str(obj.get("email", "")).lower().strip()
+                    if email and obj.get("email_sent"):
+                        ts = obj.get("sent_at") or obj.get("date")
+                        dt = None
+                        if ts:
+                            try:
+                                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                            except Exception:
+                                try:
+                                    dt = datetime.fromisoformat(str(ts))
+                                except Exception:
+                                    dt = None
+                        if dt and dt.replace(tzinfo=None) >= cutoff:
+                            label = str(obj.get("source") or "contacted_json_cold_email")
+                            if label == "founder_scrape":
+                                label = "founder_scrape"
+                            add_send(label, email, dt, {"subject": obj.get("subject"), "path": path})
+                    for k, v in obj.items():
+                        _walk(v, f"{path}/{k}")
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj):
+                        _walk(v, f"{path}[{i}]")
+
+            _walk(contacted)
+        except Exception:
+            pass
+
+    # 4) Founder lead files (only when they carry an email)
+    for rel in (
+        "projects/outreach/leads-founders-2026-04-21.jsonl",
+        "projects/outreach/founder-leads-2026-04-21.jsonl",
+    ):
+        path = DATA_ROOT / rel
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                email = str(row.get("email", "")).lower().strip()
+                if not email:
+                    continue
+                ts = row.get("ts") or row.get("date")
+                if not ts:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if dt.replace(tzinfo=None) < cutoff:
+                    continue
+                label = "founder_scrape" if row.get("source") == "founder-scrape" else "founder_leads"
+                add_send(label, email, dt, {"company": row.get("product") or row.get("company") or row.get("name")})
+        except OSError:
+            pass
+
+    # Rank and format.
+    rows = []
+    for label, bucket in stats.items():
+        sent = bucket["sent"]
+        bounced = bucket["bounced"]
+        rate = (100.0 * bounced / sent) if sent else 0.0
+        rows.append({
+            "source": label,
+            "sent": sent,
+            "bounced": bounced,
+            "bounce_pct": round(rate, 1),
+            "high": rate > 5.0,
+            "pending": bucket["pending"][-5:],
+            "bounced_emails": bucket["bounced_emails"][-5:],
+        })
+
+    rows.sort(key=lambda r: (-r["bounced"], -r["bounce_pct"], -r["sent"], r["source"]))
+    return {"rows": rows, "any_high": any(r["high"] for r in rows)}
+
+
 # ── Per-channel reply-rate instrumentation ───────────────────────────────────
 # Warm labels that count as a genuine reply signal (same set as funnel, kept
 # independent so _email_bounce_health and _funnel_24h are untouched).
@@ -807,6 +996,24 @@ def render(s: dict) -> str:
                 f"spam reports detected; pause cold outreach and audit targeting"
             )
 
+    bbs = s.get("bounce_by_source_24h") or {}
+    rows = bbs.get("rows") or []
+    if rows:
+        parts = []
+        for r in rows[:6]:
+            icon = "🔴" if r.get("high") else "🟡" if r.get("bounce_pct", 0.0) > 0 else "⚪"
+            parts.append(f"{r['source']} {r['bounce_pct']:.1f}% ({r['bounced']}/{r['sent']}){icon}")
+        lines.append("")
+        lines.append(f"{ '🔴' if bbs.get('any_high') else '🟡' } *Bounce by source 24h*: {', '.join(parts)}")
+        high = [r for r in rows if r.get("high")]
+        if high:
+            lines.append("  ⚠️ *High-bounce sources*:")
+            for r in high[:3]:
+                sample = ", ".join(x.get("email", "") for x in (r.get("pending") or [])[-3:])
+                if not sample:
+                    sample = "none pending"
+                lines.append(f"  • {r['source']}: {r['bounced']}/{r['sent']} bounced; pending: {sample}")
+
     # ── Per-channel reply-rate 24h ─────────────────────────────────────────
     crr = s.get("channel_reply_rates") or {}
     if crr:
@@ -1013,6 +1220,7 @@ def main() -> int:
     args = ap.parse_args()
 
     summary = gather()
+    summary["bounce_by_source_24h"] = _bounce_by_source_24h()
     text = render(summary)
 
     dry = args.dry_run or args.print_only

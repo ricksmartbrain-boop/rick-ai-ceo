@@ -1,43 +1,64 @@
 # Rick Install
 
-## Today
-
-Use `scripts/install-rick.sh` for a new tenant on a clean Mac.
-
-What it does:
-1. validates macOS, Python 3.12+, ffmpeg, Chrome, and git
-2. clones `https://github.com/ricksmartbrain-boop/rick-ai-ceo.git` to `~/clawd-rick-<timestamp>`
-3. creates `~/.rick-<tenant_id>/` with `rick.env.template` and tenant `rick.env`
-4. initializes `~/rick-vault-<tenant_id>/db/rick.db` via `runtime/db.py` migrations
-5. installs tenant-scoped LaunchAgents
-6. smoke-tests heartbeat + cold-email path
-
-Example:
+## One command
 
 ```bash
-bash scripts/install-rick.sh --tenant-id acme-001 --test-email test@example.com
+curl -fsSL https://meetrick.ai/install | bash
 ```
 
-For a scaffold-only dry run:
+Equivalent raw-script form:
 
 ```bash
-bash scripts/install-rick.sh --tenant-id acme-001 --dry-run
+curl -fsSL https://raw.githubusercontent.com/ricksmartbrain-boop/rick-ai-ceo/main/scripts/install-rick.sh | bash
 ```
 
-## Slash command
+## What the installer does
 
-`/install` is registered in `runtime/engine.py` alongside the other Telegram/TUI commands and wraps `scripts/install-rick.sh`.
+1. installs missing prereqs on macOS: Homebrew, Python 3.12, ffmpeg, git, Chrome
+2. clones Rick into `~/rick-install` by default, or a user-specified install dir
+3. runs an interactive key wizard for:
+   - `OPENAI_API_KEY` (required)
+   - `ANTHROPIC_API_KEY` (required)
+   - `RESEND_API_KEY` (optional)
+   - `ELEVENLABS_API_KEY` (optional)
+   - `MEMELORD_API_KEY` (optional)
+   - `GMAIL_APP_PASSWORD` (optional)
+4. writes a per-install `config/rick.env`
+5. initializes the SQLite DB via `runtime/db.py` migrations
+6. installs unique LaunchAgents per machine + install
+7. smoke-tests a heartbeat, renders a digest, and sends a test email when a recipient is provided
 
-## P1 multi-tenant hard parts: flag only
+## Example
 
-These are explicitly not shipped in this first step.
+```bash
+bash scripts/install-rick.sh --install-dir ~/rick-install-test --test-email hello@meetrick.ai
+```
 
-- per-tenant DB isolation across every runtime path
-- per-tenant Stripe customer ID mapping
-- per-tenant cost limits / budget enforcement
-- billing webhook → tenant activation
+## Re-run behavior
 
-Notes:
-- do not add Stripe/payment paths here
-- keep single-tenant Vlad deployment untouched
-- multi-tenant activation should be a separate P1 implementation plan, not mixed into the installer
+If Rick already exists in that install dir, the script offers:
+- reinstall
+- update keys
+- exit
+
+It will not wipe the DB or double-install LaunchAgents.
+
+## Parallel installs on the same machine
+
+Each install keeps its own:
+- install root: `~/rick-install*`
+- data root: `.../data`
+- SQLite DB: `.../data/runtime/rick-runtime.db`
+- LaunchAgent labels: `ai.rick-{hostname}-{install-slug}.heartbeat` and `.daemon`
+- CDP port: first free port in the 9222+ range, written to `RICK_CDP_PORT`
+
+That is the collision-avoidance pattern.
+
+## Logs
+
+Runtime logs land under:
+
+- `.../data/logs/<label>.out.log`
+- `.../data/logs/<label>.err.log`
+
+Tail those after install.

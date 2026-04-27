@@ -355,7 +355,8 @@ choose_mode() {
     while true; do
       read -r -p "Choose [r]einstall, [u]pdate keys, or [e]xit [u]: " choice
       choice="$(trim "${choice:-u}")"
-      case "${choice,,}" in
+      choice_lc="$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')"
+      case "$choice_lc" in
         r|reinstall) FORCE_MODE="reinstall"; break ;;
         u|update-keys) FORCE_MODE="update-keys"; break ;;
         e|exit) exit 0 ;;
@@ -374,13 +375,10 @@ ensure_repo_layout() {
     return 0
   fi
 
-  if exists_nonempty_dir "$INSTALL_ROOT"; then
-    die "Install dir exists and is not empty: $INSTALL_ROOT. Pick --install-dir or clear it first."
-  fi
-
   if [[ -n "$SOURCE_ROOT" ]]; then
     say "Copying source tree from $SOURCE_ROOT"
-    rsync -a --delete \
+    rsync -a \
+      --delete \
       --exclude '.git/' \
       --exclude 'node_modules/' \
       --exclude '.tmp/' \
@@ -388,11 +386,20 @@ ensure_repo_layout() {
       --exclude 'artifacts/' \
       --exclude 'logs/' \
       --exclude '.pytest_cache/' \
+      --exclude 'data/' \
+      --exclude 'config/rick.env' \
+      --exclude 'config/install-state.json' \
+      --exclude 'config/launchd/' \
       "$SOURCE_ROOT"/ "$INSTALL_ROOT"/
-  else
-    say "Cloning repo to $INSTALL_ROOT"
-    git clone "$REPO_URL" "$INSTALL_ROOT"
+    return 0
   fi
+
+  if exists_nonempty_dir "$INSTALL_ROOT"; then
+    die "Install dir exists and is not empty: $INSTALL_ROOT. Pick --install-dir or clear it first."
+  fi
+
+  say "Cloning repo to $INSTALL_ROOT"
+  git clone "$REPO_URL" "$INSTALL_ROOT"
 }
 
 bootstrap_db() {
@@ -563,6 +570,8 @@ req = urllib.request.Request(
     headers={
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
+        'User-Agent': 'curl/8.0',
+        'Accept': 'application/json',
     },
     method='POST',
 )
