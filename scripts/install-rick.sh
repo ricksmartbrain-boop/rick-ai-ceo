@@ -4,32 +4,51 @@ IFS=$'\n\t'
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_URL="https://github.com/ricksmartbrain-boop/rick-ai-ceo.git"
-TENANT_ID=""
+INSTALL_ROOT="${HOME}/rick-install"
 TEST_EMAIL=""
+SOURCE_ROOT=""
 DRY_RUN=0
+FORCE_MODE=""
 HELP=0
 PYTHON_BIN=""
-SOURCE_ROOT="${RICK_INSTALL_SOURCE_ROOT:-}"
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/install-rick.sh [options]
 
-Scaffold a new tenant install of Rick on macOS.
+Install Rick on a fresh macOS machine.
 
 Options:
-  --tenant-id <id>     Tenant slug (required unless prompted)
-  --test-email <addr>  Smoke-test recipient for the cold-email path
-  --repo-url <url>     Override repo origin
-  --source-root <dir>  Copy from a local working tree instead of cloning (testing only)
-  --dry-run            Render files and verify flow, but do not bootstrap launchd or send email
-  -h, --help           Show this help
+  --install-dir <dir>   Install root (default: ~/rick-install)
+  --repo-url <url>      Override git repo URL
+  --source-root <dir>   Copy from a local working tree instead of cloning (testing)
+  --test-email <addr>   Smoke-test recipient for the cold-email send
+  --reinstall           Re-run install on an existing Rick
+  --update-keys         Only update secrets on an existing Rick
+  --dry-run             Render config and validate, but skip launchd + email send
+  -h, --help            Show this help
 USAGE
 }
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+trim() {
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  printf '%s' "$value"
+}
+
+slugify() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  value="$(printf '%s' "$value" | tr -cs 'a-z0-9' '-')"
+  value="${value#-}"
+  value="${value%-}"
+  printf '%s' "$value"
+}
 
 sq() {
   local value="${1:-}"
@@ -43,32 +62,10 @@ write_export() {
   printf 'export %s=%s\n' "$key" "$(sq "$value")"
 }
 
-trim() {
-  local value="$1"
-  value="${value#${value%%[![:space:]]*}}"
-  value="${value%${value##*[![:space:]]}}"
-  printf '%s' "$value"
-}
-
-normalize_tenant_id() {
-  local raw="$1"
-  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
-  raw="$(printf '%s' "$raw" | tr -cs 'a-z0-9' '-')"
-  raw="${raw#-}"
-  raw="${raw%-}"
-  printf '%s' "$raw"
-}
-
-require_cmd() {
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required"
-}
-
-prompt_value() {
-  local var_name="$1"
-  local prompt_text="$2"
+prompt_text() {
+  local current_value="${1:-}"
+  local prompt="$2"
   local default_value="${3:-}"
-  local current_value="${!var_name:-}"
   local input=""
 
   if [[ -n "$current_value" ]]; then
@@ -77,20 +74,19 @@ prompt_value() {
   fi
 
   if [[ -n "$default_value" ]]; then
-    read -r -p "$prompt_text [$default_value]: " input
+    read -r -p "$prompt [$default_value]: " input
     input="$(trim "$input")"
     printf '%s' "${input:-$default_value}"
   else
-    read -r -p "$prompt_text: " input
+    read -r -p "$prompt: " input
     printf '%s' "$(trim "$input")"
   fi
 }
 
 prompt_secret() {
-  local var_name="$1"
-  local prompt_text="$2"
+  local current_value="${1:-}"
+  local prompt="$2"
   local optional="${3:-0}"
-  local current_value="${!var_name:-}"
   local input=""
 
   if [[ -n "$current_value" ]]; then
@@ -99,56 +95,313 @@ prompt_secret() {
   fi
 
   if [[ "$optional" == "1" ]]; then
-    read -r -s -p "$prompt_text [optional]: " input
+    read -r -s -p "$prompt [optional]: " input
   else
-    read -r -s -p "$prompt_text: " input
+    read -r -s -p "$prompt: " input
   fi
   printf '\n' >&2
   printf '%s' "$(trim "$input")"
 }
 
-check_macos() {
+ensure_macos() {
   [[ "$(uname -s)" == "Darwin" ]] || die "Rick install is macOS-only"
 }
 
-check_python() {
-  local version
-  PYTHON_BIN="$(command -v python3.12 || command -v python3 || true)"
-  [[ -n "$PYTHON_BIN" ]] || die "Python 3.12+ is required"
-  version="$("$PYTHON_BIN" - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-PY
-)"
-  if ! "$PYTHON_BIN" - <<'PY'
+ensure_brew() {
+  if command -v brew >/dev/null 2>&1; then
+    eval "$(brew shellenv)"
+    return 0
+  fi
+
+  say "Homebrew missing — installing it now."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+  elif [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+  fi
+
+  command -v brew >/dev/null 2>&1 || die "Homebrew install finished but brew is still unavailable"
+  eval "$(brew shellenv)"
+}
+
+brew_formula_installed() {
+  brew list --formula "$1" >/dev/null 2>&1
+}
+
+brew_cask_installed() {
+  brew list --cask "$1" >/dev/null 2>&1
+}
+
+ensure_xcode_clt() {
+  if xcode-select -p >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "Xcode Command Line Tools missing; opening the installer prompt."
+  xcode-select --install >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    if xcode-select -p >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  die "Xcode Command Line Tools still missing. Finish the popup, then rerun the installer."
+}
+
+ensure_formula() {
+  local formula="$1"
+  local command_name="${2:-$1}"
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! brew_formula_installed "$formula"; then
+    say "Installing $formula"
+    brew install "$formula"
+  fi
+}
+
+ensure_cask() {
+  local cask="$1"
+  if command -v google-chrome >/dev/null 2>&1 || [[ -d "/Applications/Google Chrome.app" ]]; then
+    return 0
+  fi
+  if ! brew_cask_installed "$cask"; then
+    say "Installing $cask"
+    brew install --cask "$cask"
+  fi
+}
+
+ensure_python() {
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.12)"
+  else
+    if ! brew_formula_installed python@3.12; then
+      say "Installing python@3.12"
+      brew install python@3.12
+    fi
+    PYTHON_BIN="$(brew --prefix python@3.12)/bin/python3.12"
+  fi
+
+  "$PYTHON_BIN" - <<'PY'
 import sys
 if sys.version_info < (3, 12):
     raise SystemExit(1)
 PY
-  then
-    die "Python 3.12+ is required (found ${version})"
-  fi
-  say "Python: ${version}"
 }
 
-check_chrome() {
-  if command -v google-chrome >/dev/null 2>&1 || command -v chrome >/dev/null 2>&1 || [[ -d "/Applications/Google Chrome.app" ]]; then
+ensure_prereqs() {
+  ensure_xcode_clt
+  ensure_brew
+  ensure_python
+  ensure_formula git git
+  ensure_formula ffmpeg ffmpeg
+  ensure_cask google-chrome
+}
+
+exists_nonempty_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+}
+
+install_slug_from_path() {
+  slugify "$(basename "$INSTALL_ROOT")"
+}
+
+hostname_slug() {
+  local host
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo mac)"
+  slugify "$host"
+}
+
+load_existing_env() {
+  local env_file="$1"
+  [[ -f "$env_file" ]] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+}
+
+pick_free_port() {
+  local start="${1:-9222}"
+  local end="${2:-9300}"
+  "$PYTHON_BIN" - "$start" "$end" <<'PY'
+import socket, sys
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+for port in range(start, end + 1):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        print(port)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+validate_http_json() {
+  local name="$1"
+  local method="$2"
+  local url="$3"
+  local headers_json="$4"
+  local data="${5:-}"
+  local tmp_body tmp_status
+  tmp_body="$(mktemp)"
+  tmp_status="$(mktemp)"
+
+  local curl_args=(--silent --show-error --output "$tmp_body" --write-out '%{http_code}' -X "$method")
+  if [[ -n "$headers_json" ]]; then
+    while IFS= read -r header; do
+      [[ -n "$header" ]] && curl_args+=(-H "$header")
+    done < <("$PYTHON_BIN" - "$headers_json" <<'PY'
+import json, sys
+for item in json.loads(sys.argv[1]):
+    print(item)
+PY
+)
+  fi
+  if [[ -n "$data" ]]; then
+    curl_args+=(-d "$data")
+  fi
+  curl_args+=("$url")
+
+  local status
+  if ! status="$(curl "${curl_args[@]}" 2>"$tmp_status")"; then
+    cat "$tmp_status" >&2 || true
+    cat "$tmp_body" >&2 || true
+    rm -f "$tmp_body" "$tmp_status"
+    die "$name validation failed"
+  fi
+
+  if [[ "$status" != 2* ]]; then
+    say "--- $name response ---"
+    cat "$tmp_body" >&2 || true
+    rm -f "$tmp_body" "$tmp_status"
+    die "$name validation failed (HTTP $status)"
+  fi
+
+  rm -f "$tmp_body" "$tmp_status"
+}
+
+validate_openai() {
+  validate_http_json \
+    "OpenAI" \
+    "GET" \
+    "https://api.openai.com/v1/models" \
+    "$(printf '["Authorization: Bearer %s"]' "$OPENAI_KEY")"
+}
+
+validate_anthropic() {
+  validate_http_json \
+    "Anthropic" \
+    "GET" \
+    "https://api.anthropic.com/v1/models" \
+    "$(printf '["x-api-key: %s", "anthropic-version: 2023-06-01"]' "$ANTHROPIC_KEY")"
+}
+
+validate_resend() {
+  validate_http_json \
+    "Resend" \
+    "GET" \
+    "https://api.resend.com/domains" \
+    "$(printf '["Authorization: Bearer %s"]' "$RESEND_KEY")"
+}
+
+validate_elevenlabs() {
+  validate_http_json \
+    "ElevenLabs" \
+    "GET" \
+    "https://api.elevenlabs.io/v1/user" \
+    "$(printf '["xi-api-key: %s"]' "$ELEVENLABS_KEY")"
+}
+
+validate_gmail_app_password() {
+  local gmail_user="$1"
+  "$PYTHON_BIN" - "$gmail_user" "$GMAIL_APP_PASSWORD" <<'PY'
+import smtplib
+import sys
+user, pw = sys.argv[1], sys.argv[2]
+with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+    smtp.ehlo()
+    smtp.starttls()
+    smtp.ehlo()
+    smtp.login(user, pw)
+PY
+}
+
+validate_memelord() {
+  local payload='{"prompt":"install-auth-check","count":1}'
+  validate_http_json \
+    "Memelord" \
+    "POST" \
+    "https://www.memelord.com/api/v1/ai-meme" \
+    "$(printf '["Authorization: Bearer %s", "Content-Type: application/json"]' "$MEMELORD_KEY")" \
+    "$payload"
+}
+
+choose_mode() {
+  if [[ "$FORCE_MODE" == "reinstall" || "$FORCE_MODE" == "update-keys" ]]; then
     return 0
   fi
-  die "Chrome is required for CDP (install Google Chrome)"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    say "Rick already exists at: $INSTALL_ROOT"
+    while true; do
+      read -r -p "Choose [r]einstall, [u]pdate keys, or [e]xit [u]: " choice
+      choice="$(trim "${choice:-u}")"
+      case "${choice,,}" in
+        r|reinstall) FORCE_MODE="reinstall"; break ;;
+        u|update-keys) FORCE_MODE="update-keys"; break ;;
+        e|exit) exit 0 ;;
+        *) warn "Pick r, u, or e." ;;
+      esac
+    done
+  else
+    FORCE_MODE="install"
+  fi
 }
 
-check_ffmpeg() { require_cmd ffmpeg; }
-check_git() { require_cmd git; }
+ensure_repo_layout() {
+  mkdir -p "$INSTALL_ROOT"
+
+  if [[ -d "$INSTALL_ROOT/.git" ]]; then
+    return 0
+  fi
+
+  if exists_nonempty_dir "$INSTALL_ROOT"; then
+    die "Install dir exists and is not empty: $INSTALL_ROOT. Pick --install-dir or clear it first."
+  fi
+
+  if [[ -n "$SOURCE_ROOT" ]]; then
+    say "Copying source tree from $SOURCE_ROOT"
+    rsync -a --delete \
+      --exclude '.git/' \
+      --exclude 'node_modules/' \
+      --exclude '.tmp/' \
+      --exclude 'tmp/' \
+      --exclude 'artifacts/' \
+      --exclude 'logs/' \
+      --exclude '.pytest_cache/' \
+      "$SOURCE_ROOT"/ "$INSTALL_ROOT"/
+  else
+    say "Cloning repo to $INSTALL_ROOT"
+    git clone "$REPO_URL" "$INSTALL_ROOT"
+  fi
+}
 
 bootstrap_db() {
   local db_path="$1"
   local workspace_root="$2"
-  RICK_RUNTIME_DB_FILE="$db_path" PYTHONPATH="$workspace_root" "$PYTHON_BIN" - <<'PY'
+  local data_root="$3"
+  RICK_WORKSPACE_ROOT="$workspace_root" RICK_DATA_ROOT="$data_root" RICK_RUNTIME_DB_FILE="$db_path" PYTHONPATH="$workspace_root" "$PYTHON_BIN" - <<'PY'
 import os
-from pathlib import Path
 from runtime.db import connect, init_db, migrate_db
-
 conn = connect()
 try:
     init_db(conn)
@@ -165,8 +418,9 @@ render_plist() {
   local out_path="$3"
   local workspace_root="$4"
   local data_root="$5"
-  local interval="${6:-}"
-  local keepalive="${7:-1}"
+  local extra_env_json="$6"
+  local interval="${7:-}"
+  local keepalive="${8:-1}"
 
   cat > "$out_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -216,6 +470,27 @@ EOF
     <string>${data_root}/config/rick.env</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+EOF
+
+  if [[ -n "$extra_env_json" ]]; then
+    while IFS= read -r kv; do
+      [[ -z "$kv" ]] && continue
+      local key value
+      key="${kv%%=*}"
+      value="${kv#*=}"
+      cat >> "$out_path" <<EOF
+    <key>${key}</key>
+    <string>${value}</string>
+EOF
+    done < <("$PYTHON_BIN" - "$extra_env_json" <<'PY'
+import json, sys
+for key, value in json.loads(sys.argv[1]).items():
+    print(f"{key}={value}")
+PY
+)
+  fi
+
+  cat >> "$out_path" <<'EOF'
   </dict>
 </dict>
 </plist>
@@ -227,9 +502,7 @@ bootstrap_launch_agent() {
   local label="$2"
   local uid
   uid="$(id -u)"
-  if launchctl print "gui/${uid}/${label}" >/dev/null 2>&1; then
-    launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
-  fi
+  launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/${uid}" "$plist_path"
   launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
   launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
@@ -241,69 +514,68 @@ smoke_heartbeat() {
   RICK_ENV_FILE="$env_file" RICK_WORKSPACE_ROOT="$workspace_root" "$PYTHON_BIN" "$workspace_root/runtime/runner.py" heartbeat --work-limit 0
 }
 
-smoke_email() {
+smoke_digest() {
   local workspace_root="$1"
   local env_file="$2"
-  local to_addr="$3"
-  local tenant_id="$4"
-  RICK_ENV_FILE="$env_file" PYTHONPATH="$workspace_root" "$PYTHON_BIN" - <<'PY'
+  RICK_ENV_FILE="$env_file" RICK_WORKSPACE_ROOT="$workspace_root" "$PYTHON_BIN" "$workspace_root/scripts/rick-activity-digest.py" --dry-run
+}
+
+smoke_email() {
+  local env_file="$1"
+  local recipient="$2"
+  "$PYTHON_BIN" - "$env_file" "$recipient" <<'PY'
 import json
 import os
+import sys
 import urllib.request
 from pathlib import Path
 
-workspace_root = Path(os.environ["WORKSPACE_ROOT"])
-env_file = Path(os.environ["ENV_FILE"])
-recipient = os.environ["TEST_EMAIL"]
-tenant_id = os.environ["TENANT_ID"]
-
+env_file = Path(sys.argv[1])
+recipient = sys.argv[2]
 values = {}
 for line in env_file.read_text().splitlines():
     line = line.strip()
-    if not line or line.startswith("#") or "=" not in line:
+    if not line or line.startswith('#') or '=' not in line:
         continue
-    if line.startswith("export "):
+    if line.startswith('export '):
         line = line[7:]
-    key, _, raw_value = line.partition("=")
-    value = raw_value.strip()
+    key, _, raw = line.partition('=')
+    value = raw.strip()
     if value.startswith("'") and value.endswith("'"):
         value = value[1:-1].replace("'\"'\"'", "'")
     values[key.strip()] = value
 
-api_key = values.get("RESEND_API_KEY") or os.environ.get("RESEND_API_KEY", "")
+api_key = values.get('RESEND_API_KEY', '')
+from_addr = values.get('MEETRICK_FROM_EMAIL', 'Rick <hello@meetrick.ai>')
 if not api_key:
-    raise SystemExit("RESEND_API_KEY missing")
+    raise SystemExit('RESEND_API_KEY missing')
 
 payload = {
-    "from": "Rick <rick@meetrick.ai>",
-    "to": [recipient],
-    "subject": f"Rick install smoke test ({tenant_id})",
-    "html": f"<p>Smoke test for tenant <strong>{tenant_id}</strong>.</p>",
-    "text": f"Smoke test for tenant {tenant_id}.",
+    'from': from_addr,
+    'to': [recipient],
+    'subject': 'Rick install smoke test',
+    'html': '<p>Rick install smoke test.</p>',
+    'text': 'Rick install smoke test.'
 }
 req = urllib.request.Request(
-    "https://api.resend.com/emails",
-    data=json.dumps(payload).encode("utf-8"),
+    'https://api.resend.com/emails',
+    data=json.dumps(payload).encode('utf-8'),
     headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
     },
-    method="POST",
+    method='POST',
 )
 with urllib.request.urlopen(req, timeout=30) as resp:
-    body = json.loads(resp.read().decode("utf-8"))
-print(json.dumps({"status": resp.status, "id": body.get("id", "")}, indent=2))
+    body = json.loads(resp.read().decode('utf-8'))
+print(json.dumps({'status': resp.status, 'id': body.get('id', '')}, indent=2))
 PY
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tenant-id)
-      TENANT_ID="${2:-}"
-      shift 2
-      ;;
-    --test-email)
-      TEST_EMAIL="${2:-}"
+    --install-dir)
+      INSTALL_ROOT="${2:-}"
       shift 2
       ;;
     --repo-url)
@@ -313,6 +585,18 @@ while [[ $# -gt 0 ]]; do
     --source-root)
       SOURCE_ROOT="${2:-}"
       shift 2
+      ;;
+    --test-email)
+      TEST_EMAIL="${2:-}"
+      shift 2
+      ;;
+    --reinstall)
+      FORCE_MODE="reinstall"
+      shift
+      ;;
+    --update-keys)
+      FORCE_MODE="update-keys"
+      shift
       ;;
     --dry-run)
       DRY_RUN=1
@@ -333,135 +617,190 @@ if [[ "$HELP" == "1" ]]; then
   exit 0
 fi
 
-check_macos
-check_python
-check_ffmpeg
-check_git
-check_chrome
+ensure_macos
+ensure_prereqs
 
-TENANT_ID_RAW="${TENANT_ID:-}"
-if [[ -z "$TENANT_ID_RAW" ]]; then
-  read -r -p "Tenant id (slug): " TENANT_ID_RAW
+INSTALL_ROOT="$(cd "$(dirname "$INSTALL_ROOT")" && pwd)/$(basename "$INSTALL_ROOT")"
+HOST_SLUG="$(hostname_slug)"
+INSTALL_SLUG="$(install_slug_from_path)"
+LABEL_BASE="ai.rick-${HOST_SLUG}-${INSTALL_SLUG}"
+CONFIG_DIR="$INSTALL_ROOT/config"
+DATA_ROOT="$INSTALL_ROOT/data"
+LAUNCHD_DIR="$INSTALL_ROOT/launchd"
+ENV_FILE="$CONFIG_DIR/rick.env"
+DB_FILE="$DATA_ROOT/runtime/rick-runtime.db"
+STATE_FILE="$CONFIG_DIR/install-state.json"
+PLIST_HEARTBEAT="$HOME/Library/LaunchAgents/${LABEL_BASE}.heartbeat.plist"
+PLIST_DAEMON="$HOME/Library/LaunchAgents/${LABEL_BASE}.daemon.plist"
+
+if [[ -f "$ENV_FILE" ]]; then
+  load_existing_env "$ENV_FILE"
 fi
-TENANT_ID="$(normalize_tenant_id "$(trim "$TENANT_ID_RAW")")"
-[[ -n "$TENANT_ID" ]] || die "Tenant id is required"
 
-OPENAI_KEY="$(prompt_secret OPENAI_API_KEY "OpenAI key")"
-ANTHROPIC_KEY="$(prompt_secret ANTHROPIC_API_KEY "Anthropic key")"
-RESEND_KEY="$(prompt_secret RESEND_API_KEY "Resend key")"
-ELEVENLABS_KEY="$(prompt_secret ELEVENLABS_API_KEY "ElevenLabs key" 1)"
-MEMELORD_KEY="$(prompt_secret MEMELORD_API_KEY "Memelord key" 1)"
+choose_mode
+
+if [[ "$FORCE_MODE" == "update-keys" && ! -f "$ENV_FILE" ]]; then
+  die "No existing install found at $INSTALL_ROOT"
+fi
+
+if [[ "$FORCE_MODE" == "install" ]]; then
+  ensure_repo_layout
+elif [[ "$FORCE_MODE" == "reinstall" ]]; then
+  if [[ ! -d "$INSTALL_ROOT/.git" ]]; then
+    ensure_repo_layout
+  fi
+fi
+
+mkdir -p "$CONFIG_DIR" "$DATA_ROOT/runtime" "$DATA_ROOT/logs" "$DATA_ROOT/control" "$DATA_ROOT/memory" "$LAUNCHD_DIR" "$HOME/Library/LaunchAgents"
+
+OPENAI_KEY="$(prompt_secret "${OPENAI_API_KEY:-}" "OpenAI key")"
+ANTHROPIC_KEY="$(prompt_secret "${ANTHROPIC_API_KEY:-}" "Anthropic key")"
+RESEND_KEY="$(prompt_secret "${RESEND_API_KEY:-}" "Resend key")"
+ELEVENLABS_KEY="$(prompt_secret "${ELEVENLABS_API_KEY:-}" "ElevenLabs key" 1)"
+MEMELORD_KEY="$(prompt_secret "${MEMELORD_API_KEY:-}" "Memelord key" 1)"
+GMAIL_APP_PASSWORD="$(prompt_secret "${GMAIL_APP_PASSWORD:-}" "Gmail app password" 1)"
+if [[ -n "$GMAIL_APP_PASSWORD" || -n "${GMAIL_IMAP_USER:-}" ]]; then
+  GMAIL_IMAP_USER="$(prompt_text "${GMAIL_IMAP_USER:-}" "Gmail user (for app-password validation)" "hello@meetrick.ai")"
+else
+  GMAIL_IMAP_USER=""
+fi
 
 if [[ -z "$TEST_EMAIL" ]]; then
-  read -r -p "Smoke test email address [optional]: " TEST_EMAIL
+  read -r -p "Smoke-test email address [optional]: " TEST_EMAIL
   TEST_EMAIL="$(trim "$TEST_EMAIL")"
 fi
 
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-CLONE_DIR="$HOME/clawd-rick-${TIMESTAMP}"
-TENANT_CONFIG_DIR="$HOME/.rick-${TENANT_ID}"
-TENANT_DATA_ROOT="$HOME/rick-vault-${TENANT_ID}"
-TENANT_DB="$TENANT_DATA_ROOT/db/rick.db"
-ENV_TEMPLATE_SRC="$ROOT_DIR/templates/install/rick.env.template"
-ENV_TEMPLATE_DST="$TENANT_CONFIG_DIR/rick.env.template"
-ENV_FILE="$TENANT_CONFIG_DIR/rick.env"
-LAUNCHD_DIR="$HOME/Library/LaunchAgents"
-PLIST_DIR="$TENANT_CONFIG_DIR/launchd"
+OPENAI_API_KEY="$OPENAI_KEY"
+ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
+RESEND_API_KEY="$RESEND_KEY"
+ELEVENLABS_API_KEY="$ELEVENLABS_KEY"
+MEMELORD_API_KEY="$MEMELORD_KEY"
+GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD"
+export OPENAI_API_KEY ANTHROPIC_API_KEY RESEND_API_KEY ELEVENLABS_API_KEY MEMELORD_API_KEY GMAIL_APP_PASSWORD GMAIL_IMAP_USER
 
-mkdir -p "$TENANT_CONFIG_DIR" "$TENANT_DATA_ROOT/db" "$TENANT_DATA_ROOT/logs" "$TENANT_DATA_ROOT/control" "$TENANT_DATA_ROOT/memory" "$LAUNCHD_DIR" "$PLIST_DIR"
-
-if [[ ! -f "$ENV_TEMPLATE_SRC" ]]; then
-  die "Missing env template: $ENV_TEMPLATE_SRC"
+CDP_PORT="${RICK_CDP_PORT:-}"
+if [[ -z "$CDP_PORT" ]]; then
+  CDP_PORT="$(pick_free_port 9222 9300)"
 fi
-cp "$ENV_TEMPLATE_SRC" "$ENV_TEMPLATE_DST"
-chmod 600 "$ENV_TEMPLATE_DST"
 
-{
-  write_export RICK_TENANT_ID "$TENANT_ID"
-  write_export RICK_WORKSPACE_ROOT "$CLONE_DIR"
-  write_export RICK_DATA_ROOT "$TENANT_DATA_ROOT"
-  write_export RICK_RUNTIME_DB_FILE "$TENANT_DB"
-  write_export RICK_ENV_FILE "$ENV_FILE"
-  write_export OPENAI_API_KEY "$OPENAI_KEY"
-  write_export ANTHROPIC_API_KEY "$ANTHROPIC_KEY"
-  write_export RESEND_API_KEY "$RESEND_KEY"
-  write_export ELEVENLABS_API_KEY "$ELEVENLABS_KEY"
-  write_export MEMELORD_API_KEY "$MEMELORD_KEY"
-  write_export RICK_DAEMON_INTERVAL_SECONDS "120"
-  write_export RICK_DAEMON_WORK_LIMIT "3"
-} > "$ENV_FILE"
+RICK_INSTALL_ROOT="$INSTALL_ROOT"
+RICK_WORKSPACE_ROOT="$INSTALL_ROOT"
+RICK_DATA_ROOT="$DATA_ROOT"
+RICK_RUNTIME_DB_FILE="$DB_FILE"
+RICK_ENV_FILE="$ENV_FILE"
+RICK_TMUX_SOCKET_PATH="$DATA_ROOT/tmux.sock"
+RICK_CDP_PORT="$CDP_PORT"
+RICK_LINKEDIN_CDP_PORT="$CDP_PORT"
+RICK_INSTAGRAM_CDP_PORT="$CDP_PORT"
+RICK_THREADS_CDP_PORT="$CDP_PORT"
+RICK_REDDIT_CDP_PORT="$CDP_PORT"
+RICK_INSTALL_LABEL_BASE="$LABEL_BASE"
+
+cat > "$ENV_FILE" <<EOF
+# Rick install env — generated by scripts/install-rick.sh
+$(write_export RICK_INSTALL_ROOT "$RICK_INSTALL_ROOT")
+$(write_export RICK_WORKSPACE_ROOT "$RICK_WORKSPACE_ROOT")
+$(write_export RICK_DATA_ROOT "$RICK_DATA_ROOT")
+$(write_export RICK_RUNTIME_DB_FILE "$RICK_RUNTIME_DB_FILE")
+$(write_export RICK_ENV_FILE "$RICK_ENV_FILE")
+$(write_export RICK_TMUX_SOCKET_PATH "$RICK_TMUX_SOCKET_PATH")
+$(write_export RICK_CDP_PORT "$RICK_CDP_PORT")
+$(write_export RICK_LINKEDIN_CDP_PORT "$RICK_LINKEDIN_CDP_PORT")
+$(write_export RICK_INSTAGRAM_CDP_PORT "$RICK_INSTAGRAM_CDP_PORT")
+$(write_export RICK_THREADS_CDP_PORT "$RICK_THREADS_CDP_PORT")
+$(write_export RICK_REDDIT_CDP_PORT "$RICK_REDDIT_CDP_PORT")
+$(write_export RICK_INSTALL_LABEL_BASE "$RICK_INSTALL_LABEL_BASE")
+$(write_export MEETRICK_FROM_EMAIL "Rick <hello@meetrick.ai>")
+$(write_export RICK_DAEMON_INTERVAL_SECONDS "120")
+$(write_export RICK_DAEMON_WORK_LIMIT "3")
+$(write_export RICK_OPENCLAW_SECURE_DM_MODE "prepared")
+$(write_export OPENAI_API_KEY "$OPENAI_API_KEY")
+$(write_export ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY")
+$(write_export RESEND_API_KEY "$RESEND_API_KEY")
+$(write_export ELEVENLABS_API_KEY "$ELEVENLABS_API_KEY")
+$(write_export MEMELORD_API_KEY "$MEMELORD_API_KEY")
+$(write_export GMAIL_APP_PASSWORD "$GMAIL_APP_PASSWORD")
+$(write_export GMAIL_IMAP_USER "$GMAIL_IMAP_USER")
+EOF
 chmod 600 "$ENV_FILE"
 
-say "Tenant config: $TENANT_CONFIG_DIR"
-say "Tenant data:   $TENANT_DATA_ROOT"
-say "Tenant db:     $TENANT_DB"
-
-if [[ -e "$CLONE_DIR" ]]; then
-  die "Clone target already exists: $CLONE_DIR"
-fi
-
-if [[ -n "$SOURCE_ROOT" ]]; then
-  say "Copying source tree from $SOURCE_ROOT to $CLONE_DIR"
-  mkdir -p "$CLONE_DIR"
-  rsync -a --delete \
-    --exclude '.git/' \
-    --exclude 'node_modules/' \
-    --exclude '.tmp/' \
-    --exclude 'tmp/' \
-    --exclude 'artifacts/' \
-    --exclude 'logs/' \
-    --exclude '.pytest_cache/' \
-    "$SOURCE_ROOT"/ "$CLONE_DIR"/
+if [[ -f "$STATE_FILE" ]]; then
+  :
 else
-  say "Cloning repo to $CLONE_DIR"
-  git clone "$REPO_URL" "$CLONE_DIR"
+  cat > "$STATE_FILE" <<EOF
+{
+  "install_root": "$INSTALL_ROOT",
+  "hostname": "$HOST_SLUG",
+  "label_base": "$LABEL_BASE",
+  "cdp_port": $CDP_PORT,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
 fi
 
-bootstrap_db "$TENANT_DB" "$CLONE_DIR"
+say "Install root: $INSTALL_ROOT"
+say "Data root:    $DATA_ROOT"
+say "Labels:       $LABEL_BASE.*"
+say "CDP port:     $CDP_PORT"
 
-HEARTBEAT_LABEL="ai.rick-${TENANT_ID}.heartbeat"
-DAEMON_LABEL="ai.rick-${TENANT_ID}.daemon"
-TELEGRAM_LABEL="ai.rick-${TENANT_ID}.telegram-bridge"
+if [[ "$FORCE_MODE" != "update-keys" ]]; then
+  bootstrap_db "$DB_FILE" "$INSTALL_ROOT" "$DATA_ROOT"
+fi
 
-HEARTBEAT_PLIST="$LAUNCHD_DIR/${HEARTBEAT_LABEL}.plist"
-DAEMON_PLIST="$LAUNCHD_DIR/${DAEMON_LABEL}.plist"
-TELEGRAM_PLIST="$LAUNCHD_DIR/${TELEGRAM_LABEL}.plist"
+say "Validating keys..."
+validate_openai
+validate_anthropic
+validate_resend
+if [[ -n "$ELEVENLABS_KEY" ]]; then
+  validate_elevenlabs
+fi
+if [[ -n "$GMAIL_APP_PASSWORD" ]]; then
+  validate_gmail_app_password "$GMAIL_IMAP_USER"
+fi
+if [[ -n "$MEMELORD_KEY" ]]; then
+  validate_memelord
+fi
 
-render_plist "$HEARTBEAT_LABEL" "scripts/run-heartbeat.sh" "$HEARTBEAT_PLIST" "$CLONE_DIR" "$TENANT_DATA_ROOT" 1800 0
-render_plist "$DAEMON_LABEL" "scripts/run-daemon.sh" "$DAEMON_PLIST" "$CLONE_DIR" "$TENANT_DATA_ROOT" "" 1
-render_plist "$TELEGRAM_LABEL" "scripts/run-telegram-bridge.sh" "$TELEGRAM_PLIST" "$CLONE_DIR" "$TENANT_DATA_ROOT" "" 1
-chmod 644 "$HEARTBEAT_PLIST" "$DAEMON_PLIST" "$TELEGRAM_PLIST"
+render_plist "$LABEL_BASE.heartbeat" "scripts/run-heartbeat.sh" "$PLIST_HEARTBEAT" "$INSTALL_ROOT" "$DATA_ROOT" "{}" 1800 0
+render_plist "$LABEL_BASE.daemon" "scripts/run-daemon.sh" "$PLIST_DAEMON" "$INSTALL_ROOT" "$DATA_ROOT" "{}" "" 1
+chmod 644 "$PLIST_HEARTBEAT" "$PLIST_DAEMON"
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  say "DRY-RUN: rendered launchd plists but skipped bootstrap/kickstart."
+  say "DRY-RUN: wrote env + plists, skipped launchd + smoke tests."
 else
-  bootstrap_launch_agent "$HEARTBEAT_PLIST" "$HEARTBEAT_LABEL"
-  bootstrap_launch_agent "$DAEMON_PLIST" "$DAEMON_LABEL"
-  bootstrap_launch_agent "$TELEGRAM_PLIST" "$TELEGRAM_LABEL"
+  bootstrap_launch_agent "$PLIST_HEARTBEAT" "$LABEL_BASE.heartbeat"
+  bootstrap_launch_agent "$PLIST_DAEMON" "$LABEL_BASE.daemon"
 fi
 
 say "Heartbeat smoke test:"
-  if smoke_heartbeat "$CLONE_DIR" "$ENV_FILE" >/tmp/rick-install-heartbeat.out 2>/tmp/rick-install-heartbeat.err; then
+if smoke_heartbeat "$INSTALL_ROOT" "$ENV_FILE" >/tmp/rick-install-heartbeat.out 2>/tmp/rick-install-heartbeat.err; then
   sed -n '1,40p' /tmp/rick-install-heartbeat.out
 else
-  cat /tmp/rick-install-heartbeat.err >&2
+  cat /tmp/rick-install-heartbeat.err >&2 || true
   die "Heartbeat smoke test failed"
 fi
 rm -f /tmp/rick-install-heartbeat.out /tmp/rick-install-heartbeat.err
 
-if [[ -n "$TEST_EMAIL" ]]; then
-  if [[ "$DRY_RUN" == "1" ]]; then
-    say "Cold-email smoke path: would send to $TEST_EMAIL"
-  else
-    say "Cold-email smoke test to $TEST_EMAIL:"
-    WORKSPACE_ROOT="$CLONE_DIR" ENV_FILE="$ENV_FILE" TEST_EMAIL="$TEST_EMAIL" TENANT_ID="$TENANT_ID" smoke_email "$CLONE_DIR" "$ENV_FILE" "$TEST_EMAIL" "$TENANT_ID"
-  fi
+say "Digest smoke test:"
+if smoke_digest "$INSTALL_ROOT" "$ENV_FILE" >/tmp/rick-install-digest.out 2>/tmp/rick-install-digest.err; then
+  sed -n '1,40p' /tmp/rick-install-digest.out
 else
-  warn "No smoke-test email provided; email path not exercised."
+  cat /tmp/rick-install-digest.err >&2 || true
+  die "Digest smoke test failed"
+fi
+rm -f /tmp/rick-install-digest.out /tmp/rick-install-digest.err
+
+if [[ -n "$TEST_EMAIL" ]]; then
+  say "Cold-email smoke test to $TEST_EMAIL:"
+  smoke_email "$ENV_FILE" "$TEST_EMAIL"
+else
+  warn "No smoke-test email provided; skipped cold-email send."
 fi
 
 cat <<EOF
-Rick installed. Run /status to verify.
-Tenant id: $TENANT_ID
-Workspace:  $CLONE_DIR
+Rick installed. Run /status to see your daemon.
+Workspace: $INSTALL_ROOT
+Env:       $ENV_FILE
+Logs:      $DATA_ROOT/logs/${LABEL_BASE}.out.log
+           $DATA_ROOT/logs/${LABEL_BASE}.err.log
 EOF
