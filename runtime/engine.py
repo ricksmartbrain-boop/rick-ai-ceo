@@ -5719,6 +5719,69 @@ def escalate_stuck_workflows(connection: sqlite3.Connection, days: int = 3) -> i
     return escalated_n
 
 
+def reap_ghost_completed_workflows(connection: sqlite3.Connection) -> int:
+    """Auto-finalize workflows whose every job is done but status is still active.
+
+    Root cause: runner exits between the last job.status='done' write and the
+    workflow finalization write (crash, kill, or timeout).  These ghost-completed
+    workflows have zero pending work — they just missed the status flip.
+
+    Safe to auto-close: if all jobs are done there is nothing left to execute.
+    No approval, no escalation needed.
+    """
+    try:
+        candidates = connection.execute(
+            """
+            SELECT id, kind, title, project, lane, stage
+              FROM workflows
+             WHERE status = 'active'
+               AND id NOT IN (
+                   SELECT DISTINCT workflow_id FROM jobs
+                    WHERE status NOT IN ('done','cancelled','published','fulfilled')
+               )
+            """
+        ).fetchall()
+    except Exception:
+        return 0
+    if not candidates:
+        return 0
+    now = now_iso()
+    closed = 0
+    for w in candidates:
+        try:
+            # Double-check: must have at least one job (not a brand-new empty workflow)
+            job_count = connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE workflow_id = ?", (w["id"],)
+            ).fetchone()[0]
+            if job_count == 0:
+                continue
+            connection.execute(
+                "UPDATE workflows SET status='done', stage='completed', finished_at=?, updated_at=? WHERE id=?",
+                (now, now, w["id"]),
+            )
+            append_execution_ledger(
+                "completed",
+                f"Ghost-completed workflow auto-finalized: {w['title']}",
+                status="done",
+                area="runtime",
+                project=w["project"],
+                route="heartbeat",
+                notes=f"ghost_completed:{w['id']} kind={w['kind']} stage={w['stage']}",
+            )
+            closed += 1
+        except Exception:
+            pass
+    if closed:
+        try:
+            from runtime.log import get_logger
+            get_logger("rick.engine").info(
+                "reap_ghost_completed_workflows: closed %d ghost workflow(s)", closed
+            )
+        except Exception:
+            pass
+    return closed
+
+
 def reap_stuck_subagents(connection: sqlite3.Connection, grace_min: int = 20) -> int:
     """Flip subagent_heartbeat rows that missed their lease to status='ghosted'.
 
@@ -5828,6 +5891,13 @@ def merge_completed_subagents(connection: sqlite3.Connection, limit: int = 50) -
 def heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     # Sweep stale running jobs first to unblock lanes
     sweep_stale_running_jobs(connection)
+    # Auto-close workflows whose jobs all completed but status flip was missed
+    # (crash/kill between last job write and workflow finalization).
+    try:
+        reap_ghost_completed_workflows(connection)
+    except Exception as exc:
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning("Ghost-completed workflow reaper failed: %s", exc)
     # Reap ghosted subagent runs + merge completed ones into parent workflows.
     # Before Wave 2B these never happened — completed agents' output rotted in
     # SQL with merged_at=NULL, orphans stayed in 'running' forever.
