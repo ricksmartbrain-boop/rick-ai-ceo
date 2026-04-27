@@ -330,6 +330,21 @@ def gather() -> dict:
             "by_arm": {"control": 0, "treatment": 0}, "by_skill": {},
         }
 
+    # Pattern lift (close-rate delta control vs treatment) — only renders
+    # when N>=30 per arm; until then the digest shows raw counts only.
+    # Opens its own short-lived connection because the main `con` above is
+    # already closed by this point in gather().
+    try:
+        from runtime.patterns import compute_pattern_lift
+        from runtime.db import connect as _lift_connect
+        _lift_con = _lift_connect()
+        try:
+            summary["pattern_lift_14d"] = compute_pattern_lift(_lift_con, window_hours=336, min_per_arm=30)
+        finally:
+            _lift_con.close()
+    except Exception:
+        summary["pattern_lift_14d"] = None
+
     # Fenix accept-rate (live + observe). Reads unified decisions log written
     # by runtime/fenix_gate.py preflight() for every needs_review=True outcome.
     try:
@@ -526,6 +541,19 @@ def render(s: dict) -> str:
         lines.append(
             f"  ↳ A/B 14d: control={ctrl} ({ctrl_pct:.0f}%) · treatment={treat} "
             f"(target ~10%, lift query pending downstream join)"
+        )
+
+    pl = s.get("pattern_lift_14d") or {}
+    # Only render when N>=30 per arm crossed — the existing A/B line already
+    # shows progress toward the threshold, so silent until stats are stable.
+    if pl.get("sufficient_data") and pl.get("lift_pct") is not None:
+        cr_c = pl.get("control_close_rate", 0.0) * 100
+        cr_t = pl.get("treatment_close_rate", 0.0) * 100
+        lift = pl.get("lift_pct", 0.0)
+        sign = "+" if lift >= 0 else ""
+        lines.append(
+            f"  ↳ Lift 14d: control {cr_c:.1f}% close · treatment {cr_t:.1f}% close · "
+            f"{sign}{lift:.0f}% (n={pl.get('control_n', 0)}/{pl.get('treatment_n', 0)})"
         )
 
     nd = s.get("notification_dedup") or {}

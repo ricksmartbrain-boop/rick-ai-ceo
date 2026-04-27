@@ -141,6 +141,110 @@ def arm_assignments_summary(window_hours: int = 336) -> dict[str, Any]:
     return out
 
 
+def compute_pattern_lift(
+    connection: sqlite3.Connection,
+    window_hours: int = 336,
+    min_per_arm: int = 30,
+) -> dict[str, Any]:
+    """Close-rate delta between control vs treatment arms — the actual lift.
+
+    Raw assignment counts (arm_assignments_summary) only show throughput;
+    they don't tell Rick whether pattern injection actually moves the needle.
+    This joins each first-seen lead_id in the arm log to its terminal
+    prospect_pipeline.status (the ONLY place close_or_escalate writes 'won')
+    and computes per-arm close-rate.
+
+    Sufficient-data gate (N>=min_per_arm both sides) is non-negotiable:
+    statistical theater on tiny samples is worse than no number, so
+    lift_pct stays None until both arms cross the threshold.
+
+    Returns: {window_hours, control_n, treatment_n, control_close_rate,
+              treatment_close_rate, lift_pct, sufficient_data}.
+    """
+    out: dict[str, Any] = {
+        "window_hours": window_hours,
+        "control_n": 0,
+        "treatment_n": 0,
+        "control_close_rate": 0.0,
+        "treatment_close_rate": 0.0,
+        "lift_pct": None,
+        "sufficient_data": False,
+    }
+    if not ARM_LOG.exists():
+        return out
+    cutoff = datetime.now() - timedelta(hours=window_hours)
+    # First-arm-per-lead dedupe: same lead may appear across multiple skills
+    # and ticks. Subsequent assignments are deterministic (same hash → same
+    # arm) but the controlled experiment is the FIRST observation.
+    first_arm: dict[str, tuple[str, str]] = {}  # lead_id -> (ts, arm)
+    try:
+        text = ARM_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("ts", "")
+        try:
+            if datetime.fromisoformat(ts) < cutoff:
+                continue
+        except (ValueError, TypeError):
+            continue
+        lead_id = str(entry.get("lead_id") or "").strip()
+        if not lead_id:
+            continue
+        arm = entry.get("arm", "treatment")
+        prior = first_arm.get(lead_id)
+        if prior is None or ts < prior[0]:
+            first_arm[lead_id] = (ts, arm)
+    # Per-arm tallies
+    by_arm_leads: dict[str, list[str]] = {"control": [], "treatment": []}
+    for lead_id, (_ts, arm) in first_arm.items():
+        if arm in by_arm_leads:
+            by_arm_leads[arm].append(lead_id)
+    # Join: prospect_pipeline.username==lead_id with status='won' is the
+    # terminal positive marker (set by handle_close_or_escalate). 'lost' /
+    # 'escalated' / 'pitched' / 'intake' all count as not-won.
+    def _wins_for(leads: list[str]) -> int:
+        if not leads:
+            return 0
+        try:
+            placeholders = ",".join("?" * len(leads))
+            row = connection.execute(
+                f"SELECT COUNT(*) AS c FROM prospect_pipeline "
+                f"WHERE status='won' AND username IN ({placeholders})",
+                leads,
+            ).fetchone()
+            return int(row["c"] or 0) if row else 0
+        except sqlite3.OperationalError:
+            return 0
+    try:
+        ctrl_leads = by_arm_leads["control"]
+        treat_leads = by_arm_leads["treatment"]
+        ctrl_n = len(ctrl_leads)
+        treat_n = len(treat_leads)
+        ctrl_wins = _wins_for(ctrl_leads)
+        treat_wins = _wins_for(treat_leads)
+    except Exception:
+        return out
+    out["control_n"] = ctrl_n
+    out["treatment_n"] = treat_n
+    out["control_close_rate"] = (ctrl_wins / ctrl_n) if ctrl_n > 0 else 0.0
+    out["treatment_close_rate"] = (treat_wins / treat_n) if treat_n > 0 else 0.0
+    out["sufficient_data"] = min(ctrl_n, treat_n) >= int(min_per_arm)
+    if out["sufficient_data"] and out["control_close_rate"] > 0:
+        out["lift_pct"] = (
+            (out["treatment_close_rate"] - out["control_close_rate"])
+            / out["control_close_rate"] * 100.0
+        )
+    # lift_pct stays None when control rate is zero (div/0) or N insufficient.
+    return out
+
+
 def pick_patterns(
     connection: sqlite3.Connection,
     skill_name: str,

@@ -10,6 +10,7 @@ required Vlad to diagnose by hand.
 """
 from __future__ import annotations
 
+import glob as _glob
 import json
 import os
 from datetime import datetime
@@ -47,12 +48,11 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     ("RICK_OUTBOUND_MOLTBOOK_LIVE", "outbound-dispatcher.jsonl", 26.0,
         lambda e: e.get("channel") == "moltbook"
         and e.get("status") in ("sent", "observed-only")),
-    # TODO(2026-04-25): RICK_EMAIL_SEND_LIVE probe pulled — Rick TUI
-    # confirmed email sends bypass outbound-dispatcher.jsonl and resolve
-    # via the Resend API directly (verified Apr 25: 5 deliveries in last
-    # 4h despite this log showing 95h stale). Re-add once we identify the
-    # right log surface — likely a Resend webhook log or
-    # skills/email-automation/scripts/email-sequence-dispatch.py output.
+    # campaign-engine.py calls Resend directly and appends to email-sends.jsonl
+    # (ops surface added 2026-04-27). email-sequence-send.py also writes there
+    # via its own append_log. 26h gives 2h slack on the daily send cadence.
+    ("RICK_EMAIL_SEND_LIVE", "email-sends.jsonl", 26.0,
+        lambda e: e.get("status") == "sent"),
     ("RICK_OUTBOUND_THREADS_LIVE", "outbound-dispatcher.jsonl", 26.0,
         lambda e: e.get("channel") == "threads"
         and e.get("status") in ("sent", "observed-only")),
@@ -67,6 +67,35 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     ("RICK_OUTBOUND_LINKEDIN_LIVE", "outbound-dispatcher.jsonl", 26.0,
         lambda e: e.get("channel") == "linkedin"
         and e.get("status") in ("sent", "observed-only")),
+    # feed-poll runs hourly (ai.rick.feed-poll.plist StartInterval=3600).
+    # 2h = one-cycle slack. Fixed OPS path; filter on terminal run.done event
+    # so partial/interrupted runs don't mask a stalled loop.
+    ("RICK_FEED_POLL_LIVE", "feed-poll.jsonl", 2.0,
+        lambda e: e.get("event") == "run.done"),
+    # roast-lead-poll runs every 5 min (ai.rick.roast-lead-poll.plist
+    # StartInterval=300). 0.5h = 6 missed cycles before alerting — enough
+    # hysteresis to survive a brief machine sleep without false positives.
+    # run.start + run.no_leads both confirm a completed poll cycle.
+    ("RICK_ROAST_LEAD_POLL_LIVE", "roast-lead-poll.jsonl", 0.5,
+        lambda e: e.get("event", "").startswith("run.")),
+    # founder-graph runs daily at 04:00 PT (ai.rick.founder-graph.plist
+    # StartCalendarInterval Hour=4). Logs to date-rotating
+    # ~/rick-vault/data/founder-graph-YYYY-MM-DD.jsonl; glob in scan_flags()
+    # resolves to the most-recent file. 26h = 2h slack on a 24h cadence.
+    ("RICK_FOUNDER_GRAPH_LIVE", "../data/founder-graph-*.jsonl", 26.0,
+        lambda e: e.get("action") in ("upsert", "would-upsert")),
+    # whois-firehose runs daily at 03:15 PT (ai.rick.whois-firehose.plist
+    # StartCalendarInterval Hour=3 Minute=15). Date-rotating log same dir as
+    # founder-graph above; 26h slack on 24h cadence, same rationale.
+    ("RICK_WHOIS_LIVE", "../data/whois-firehose-*.jsonl", 26.0,
+        lambda e: e.get("domain") is not None),
+    # google-maps-firehose has no LaunchAgent — runs manually / ad-hoc.
+    # Last log: 2026-04-22 (CDP captcha hit that day). 168h (7-day window)
+    # avoids permanently red-lining a probe for an infrequently-run job.
+    # Filter excludes captcha/error outcomes so only genuine scrape activity
+    # resets the clock; error entries alone would mask a broken setup.
+    ("RICK_GOOGLE_MAPS_LIVE", "../data/google-maps-firehose-*.jsonl", 168.0,
+        lambda e: e.get("outcome") in ("inserted", "duplicate-or-bad")),
 ]
 
 
@@ -75,6 +104,9 @@ def _parse_ts(entry: dict) -> Optional[datetime]:
     if not raw:
         return None
     try:
+        # Python <3.11 fromisoformat rejects "Z" suffix; normalise to +00:00.
+        if isinstance(raw, str) and raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
         return datetime.fromisoformat(raw)
     except (ValueError, TypeError):
         return None
@@ -118,6 +150,13 @@ def scan_flags() -> list[dict]:
     now = datetime.now()
     for flag, rel_path, max_age_h, filt in FLAG_PROBES:
         log_path = OPS / rel_path
+        # Resolve glob patterns (date-rotating logs like ../data/NAME-YYYY-MM-DD.jsonl).
+        # Pick the lexicographically-last match so YYYY-MM-DD ordering selects
+        # the most recent file without importing dateutil.
+        if "*" in rel_path:
+            matches = sorted(_glob.glob(str(log_path)))
+            if matches:
+                log_path = Path(matches[-1])
         on = _flag_is_on(flag)
         record = {
             "flag": flag,
