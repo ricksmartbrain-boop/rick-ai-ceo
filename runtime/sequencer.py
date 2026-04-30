@@ -65,6 +65,12 @@ CALL_ENDPOINT = f"{ELEVEN_API_BASE}/convai/twilio/outbound-call"
 # Blog proof post for Day 8
 PROOF_POST_URL = "https://meetrick.ai/blog"
 
+# Quickstart install CTA — used in follow-up email touches (Day 5+) to give
+# prospects a zero-friction path to see Rick run on their own machine in 60 s.
+# Intentionally excluded from Day-0 cold opener (pure pitch, no install ask).
+QUICKSTART_URL = "https://meetrick.ai/quickstart"
+QUICKSTART_CMD = "curl meetrick.ai/quickstart | sh"
+
 # Sequence definition: list of {day, kind, channel, label}
 # Sorted by day ascending. The sequencer dispatches the FIRST touch whose
 # day threshold has been reached and that has NOT been logged yet.
@@ -299,65 +305,123 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
         body = "\n".join(body_lines).strip() or content
         return subject, body
 
-    # ---- Day 5: personal note ----
-    if touch_kind == "email-personal":
-        subject = f"Re: {company} — just checking in"
-        body = (
-            f"Hi {name},\n\n"
-            "Circling back — wanted to make sure my last note didn't get buried.\n\n"
-            "No pitch. Just one honest question: what's the revenue bottleneck at "
-            f"{company} right now that you haven't had time to tackle?\n\n"
-            "Takes 30 seconds to reply. I'll build something useful around the answer.\n\n"
-            "Rick\n"
-            "meetrick.ai"
-        )
-        return subject, body
+    # ---- Follow-up email touches: opus-personalized with quickstart CTA ----
+    # Covers Day 5 (email-personal), Day 8 (email-proof), Day 15 (email-nudge),
+    # Day 21 (email-breakup). Day 0 (email-cold-1) is handled above and
+    # intentionally excluded — cold opener stays pure pitch, no install CTA.
+    if touch_kind in {"email-personal", "email-proof", "email-nudge", "email-breakup"}:
+        _day_context = {
+            "email-personal": (
+                "This is Day 5 — a personal follow-up after no reply to the cold opener. "
+                "Tone: warm, human, no-pressure. Different subject and angle from Day 0."
+            ),
+            "email-proof": (
+                "This is Day 8 — lead with a real outcome or concrete metric. "
+                f"You may reference the blog post at {PROOF_POST_URL} as supporting proof. "
+                "Brief and outcome-focused."
+            ),
+            "email-nudge": (
+                "This is Day 15 — a final gentle nudge before the sequence ends. "
+                "Honest tone. Give them an easy out ('not now' reply is fine)."
+            ),
+            "email-breakup": (
+                "This is Day 21 — the breakup email. Close the loop gracefully. "
+                "No pressure. Warm and brief. Leave the door open."
+            ),
+        }.get(touch_kind, "This is a follow-up outreach email.")
 
-    # ---- Day 8: proof email ----
-    if touch_kind == "email-proof":
-        subject = f"Real numbers from an AI CEO: {company}?"
-        body = (
-            f"Hi {name},\n\n"
-            "I know you're busy, so I'll keep this short.\n\n"
-            "We published the real operating numbers from running an AI CEO: "
-            f"what works, what burned cash, and what's compounding. "
-            f"→ {PROOF_POST_URL}\n\n"
-            f"Worth 3 minutes if you're thinking about where AI actually fits in {company}'s stack.\n\n"
-            "Still happy to connect if the timing works.\n\n"
-            "Rick\n"
-            "meetrick.ai"
+        # Hardcoded fallback bodies — include quickstart link so the CTA survives
+        # even when the LLM call fails.  Parsed by the SUBJECT/BODY splitter below.
+        _fallback = {
+            "email-personal": (
+                f"SUBJECT: Re: {company} -- just checking in\n"
+                f"BODY:\nHi {name},\n\n"
+                "Circling back in case my last note got buried. No pitch.\n\n"
+                f"If you want to see what an AI CEO stack actually does for a company like {company}, "
+                "the fastest way is to watch it run on your own machine -- no commitment, 60 seconds:\n\n"
+                f"{QUICKSTART_CMD}\n\n"
+                "Happy to talk specifics if that sparks anything.\n\n"
+                f"Rick\nmeetrick.ai  |  {QUICKSTART_URL}"
+            ),
+            "email-proof": (
+                f"SUBJECT: Real numbers from an AI CEO: {company}?\n"
+                f"BODY:\nHi {name},\n\n"
+                "Published the real operating numbers from running an AI CEO. Worth 3 minutes "
+                f"if you're thinking about where AI fits in {company}'s stack:\n{PROOF_POST_URL}\n\n"
+                "If you'd rather just see it work -- run this and watch Rick operate for 60 seconds:\n\n"
+                f"{QUICKSTART_CMD}\n\n"
+                f"Rick\nmeetrick.ai  |  {QUICKSTART_URL}"
+            ),
+            "email-nudge": (
+                f"SUBJECT: Last check-in -- {company}\n"
+                f"BODY:\nHi {name},\n\n"
+                "Haven't heard back -- totally understand, inboxes are brutal.\n\n"
+                "If the timing is off, just reply 'not now' and I'll leave you alone.\n\n"
+                "If you're even slightly curious what this looks like in practice, "
+                "the zero-friction path is to run it yourself:\n\n"
+                f"{QUICKSTART_CMD}\n\n"
+                f"Rick\nmeetrick.ai  |  {QUICKSTART_URL}"
+            ),
+            "email-breakup": (
+                f"SUBJECT: Closing the loop -- {company}\n"
+                f"BODY:\nHi {name},\n\n"
+                "Closing the loop on my end. Clearly the timing isn't right -- I get it.\n\n"
+                f"If anything changes and you want to see what an AI CEO stack could do for {company}, "
+                f"meetrick.ai will be there. Fastest way to see it: {QUICKSTART_URL}\n\n"
+                "Wishing you a strong quarter.\n\n"
+                "Rick\nmeetrick.ai"
+            ),
+        }.get(
+            touch_kind,
+            f"SUBJECT: Following up -- {company}\nBODY:\nHi {name},\n\nJust following up.\n\nRick\nmeetrick.ai",
         )
-        return subject, body
 
-    # ---- Day 15: nudge ----
-    if touch_kind == "email-nudge":
-        subject = f"Last check-in — {company}"
-        body = (
-            f"Hi {name},\n\n"
-            "I've reached out a few times and haven't heard back — totally understand, inboxes are brutal.\n\n"
-            "If the timing is off or this isn't relevant, just reply 'not now' and I'll leave you alone.\n\n"
-            "If the timing is actually right and you'd like to see what an AI CEO stack "
-            f"could do for {company} in 30 days — reply and we can talk specifics.\n\n"
-            "Either way, no hard feelings.\n\n"
-            "Rick\n"
-            "meetrick.ai"
-        )
-        return subject, body
+        try:
+            from runtime.llm import generate_text
 
-    # ---- Day 21: breakup ----
-    if touch_kind == "email-breakup":
-        subject = f"Closing the loop — {company}"
-        body = (
-            f"Hi {name},\n\n"
-            "I'm going to close the loop on my end.\n\n"
-            "I've sent a few notes over the past few weeks — clearly the timing or fit isn't right. "
-            "I respect that.\n\n"
-            "If anything changes — you're scaling, hitting an ops ceiling, or just curious what "
-            f"an AI CEO could unlock for {company} — meetrick.ai is there when you're ready.\n\n"
-            "Wishing you a strong quarter.\n\n"
-            "Rick\n"
-            "meetrick.ai"
-        )
+            prompt = (
+                "TASK: Write a follow-up outbound sales email. Output only the email -- "
+                "no analysis, no review commentary, no caveats.\n\n"
+                "You are Rick, AI CEO at meetrick.ai. Context for this touch:\n"
+                f"{_day_context}\n\n"
+                f"Lead name/company: {name}\n"
+                f"Email: {email}\n"
+                f"Company domain: {company}\n\n"
+                "QUICKSTART CTA INSTRUCTION:\n"
+                "Somewhere natural in the email body, organically weave in a low-friction "
+                "install CTA that gives the prospect a way to see Rick run on their own "
+                "machine in 60 seconds -- no commitment, no demo call required.\n"
+                f"Install URL: {QUICKSTART_URL}\n"
+                f"Optional curl variant: {QUICKSTART_CMD}\n"
+                "Let tone and context drive exact phrasing -- do NOT force a template phrase. "
+                "The goal is a natural, non-pushy path to the product.\n\n"
+                "Output format (exactly this structure):\n"
+                "SUBJECT: <subject line, max 8 words>\n"
+                "BODY:\n"
+                "<2-3 paragraphs, plain text, no markdown, no em dashes>\n\n"
+                "Rules:\n"
+                "- Plain text only -- no markdown, no em dashes\n"
+                "- Sign off: Rick / meetrick.ai\n"
+                "- Do NOT include disclaimers, analysis, or refusals\n"
+                "Write the email now."
+            )
+            result = generate_text("review", prompt, _fallback)
+            content = result.content.strip()
+        except Exception as exc:
+            _log({"event": "llm_error", "touch": touch_kind, "error": str(exc)})
+            content = _fallback
+
+        subject = f"Following up -- {company}"
+        body_lines: list[str] = []
+        in_body = False
+        for line in content.splitlines():
+            if line.startswith("SUBJECT:"):
+                subject = line[len("SUBJECT:"):].strip()
+            elif line.startswith("BODY:"):
+                in_body = True
+            elif in_body:
+                body_lines.append(line)
+        body = "\n".join(body_lines).strip() or content
         return subject, body
 
     # Fallback
