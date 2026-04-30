@@ -121,16 +121,20 @@ def _fence_untrusted(label: str, text: str) -> str:
 
 
 def build_task_prompt(spec: SubagentSpec, task: str, context: dict[str, Any] | None = None) -> str:
-    """Build a full prompt for a sub-agent task."""
+    """Build a full prompt for a sub-agent task.
+
+    task is a trusted runtime directive from Rick's engine -- do NOT fence it.
+    Only external/untrusted data (lead info, email content) in context gets fenced.
+    """
     ctx_block = ""
     if context:
-        ctx_block = f"\n\n## Context\n```json\n{json.dumps(context, indent=2)}\n```"
+        ctx_block = _fence_untrusted('context', f"\n\n## Context\n```json\n{json.dumps(context, indent=2)}\n```")
 
     return f"""{spec.persona}
 
 ## Your Assignment
-{_fence_untrusted('task', task)}
-{_fence_untrusted('context', ctx_block) if ctx_block else ''}
+{task}
+{ctx_block}
 
 ## Operating Rules
 - You are {spec.name}, reporting to Rick (CEO agent).

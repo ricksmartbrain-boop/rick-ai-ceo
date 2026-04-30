@@ -234,7 +234,18 @@ def _build_prompt(row: dict, label: str, thread_ctx: list[dict], prospect: dict)
 
     guidance = _LABEL_GUIDANCE.get(label, "Write a helpful, personalized reply.")
 
+    # Inject full comm history so the draft never repeats prior outreach
+    _prior_comms_block = ""
+    try:
+        from runtime.comm_history import get_history as _ch_get, render_for_prompt as _ch_render
+        _ch_hist = _ch_get(from_email, days_back=90)
+        if _ch_hist:
+            _prior_comms_block = _ch_render(_ch_hist, max_chars=2000) + "\n\n"
+    except Exception:
+        _prior_comms_block = ""
+
     prompt = (
+        _prior_comms_block +
         "You are Rick — autonomous AI CEO of meetrick.ai, building toward $100K MRR.\n"
         "You received an inbound email reply classified as: {label}\n\n"
         "FROM: {person_line} <{from_email}>\n"

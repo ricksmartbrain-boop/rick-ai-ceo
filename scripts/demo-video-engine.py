@@ -251,8 +251,43 @@ def build_narration_prompt(summary: LogSummary) -> str:
     )
 
 
+def _anthropic_chat_completion(prompt: str) -> str:
+    """Fallback: call Anthropic Messages API directly."""
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    model = "claude-sonnet-4-5" if "opus" in OPENROUTER_MODEL else "claude-haiku-3-5"
+    payload = {
+        "model": model,
+        "system": "You write concise founder-voice demo narration.",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.35,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    content = data.get("content") or []
+    text = " ".join(block.get("text", "") for block in content if block.get("type") == "text")
+    text = " ".join(text.split()).strip().strip('"').strip("'")
+    if not text:
+        raise RuntimeError("Anthropic narration response was empty")
+    return text
+
+
 def _openrouter_chat_completion(prompt: str) -> str:
-    api_key = require_env("OPENROUTER_API_KEY")
+    # Try Anthropic direct first if OpenRouter creds absent or busted
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_key:
+        return _anthropic_chat_completion(prompt)
     last_error: str | None = None
     for token_budget in (OPENROUTER_MAX_TOKENS, 192, 128):
         payload = {
@@ -268,7 +303,7 @@ def _openrouter_chat_completion(prompt: str) -> str:
             "https://openrouter.ai/api/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {openrouter_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://meetrick.ai",
                 "X-Title": "Rick Demo Video Engine",
@@ -292,8 +327,16 @@ def _openrouter_chat_completion(prompt: str) -> str:
             except Exception:
                 body = ""
             last_error = f"HTTP {exc.code}: {exc.reason} {body}".strip()
-            if exc.code != 402 or token_budget == 128:
+            if exc.code == 402:
+                # Out of credits — fall through to Anthropic direct
                 break
+            if token_budget == 128:
+                break
+    # Fallback to Anthropic direct
+    try:
+        return _anthropic_chat_completion(prompt)
+    except Exception as anth_err:
+        raise RuntimeError(f"OpenRouter failed ({last_error}); Anthropic fallback also failed: {anth_err}")
     raise RuntimeError(last_error or "OpenRouter narration generation failed")
 
 

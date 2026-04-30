@@ -173,7 +173,8 @@ def _has_replied(conn: sqlite3.Connection, workflow: sqlite3.Row, ctx: dict) -> 
     1. email_threads table for any last_inbound_at after sequence_started_at
     2. Inbound IMAP watcher log if available
     """
-    email = (ctx.get("email") or "").strip().lower()
+    _tp = ctx.get("trigger_payload") or {}
+    email = (ctx.get("email") or _tp.get("email") or "").strip().lower()
     if not email:
         return False
 
@@ -221,15 +222,28 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
     """Return (subject, body_md) for a touch. Uses generate_text for Day 0 (opus).
     Other days use lightweight writing-route templates with context substitution.
     """
-    company = ctx.get("company") or ctx.get("name") or "there"
-    email = ctx.get("email") or ""
-    name = ctx.get("name") or company
+    _tp = ctx.get("trigger_payload") or {}
+    company = ctx.get("company") or _tp.get("domain") or ctx.get("name") or _tp.get("name") or "there"
+    email = ctx.get("email") or _tp.get("email") or ""
+    name = ctx.get("name") or _tp.get("name") or company
 
     # ---- Day 0: opus-personalized cold opener ----
     if touch_kind == "email-cold-1":
         try:
             from runtime.llm import generate_text
+
+            # Inject prior communication history so opus avoids repetition
+            _prior_comms_block = ""
+            try:
+                from runtime.comm_history import get_history as _ch_get, render_for_prompt as _ch_render
+                _ch_hist = _ch_get(email, days_back=90)
+                if _ch_hist:
+                    _prior_comms_block = _ch_render(_ch_hist, max_chars=2000) + "\n\n"
+            except Exception:
+                _prior_comms_block = ""
+
             prompt = (
+                _prior_comms_block +
                 "TASK: Write a cold outreach email. Output only the email — no analysis, "
                 "no review commentary, no caveats.\n\n"
                 "You are Rick, AI CEO at meetrick.ai. Write a short, sharp cold outreach email "
@@ -246,6 +260,8 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 "- Reference Rick (meetrick.ai) and one concrete outcome\n"
                 "- CTA: single question, not a pitch\n"
                 "- Sign off: Rick\n"
+                "- If PRIOR COMMUNICATIONS are shown above, do NOT repeat angles, "
+                "subjects, or CTAs already used\n"
                 "- Do NOT include disclaimers, analysis, or refusals\n"
                 "Write the email now."
             )
@@ -441,8 +457,11 @@ def _dispatch_touch(
     if _touch_done(seq, kind):
         return False
 
-    lead_name = ctx.get("name") or ctx.get("company") or "there"
-    lead_email = (ctx.get("email") or "").strip().lower()
+    # Lead fields may be at top-level OR under trigger_payload (ICP-scorer format).
+    # Always resolve with fallback to trigger_payload to avoid false "no email" skips.
+    _tp = ctx.get("trigger_payload") or {}
+    lead_name = ctx.get("name") or _tp.get("name") or ctx.get("company") or _tp.get("domain") or "there"
+    lead_email = (ctx.get("email") or _tp.get("email") or "").strip().lower()
 
     result_meta: dict[str, Any] = {"kind": kind, "channel": channel}
 
