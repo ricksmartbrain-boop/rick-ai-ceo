@@ -551,6 +551,55 @@ def _channel_reply_rate_24h() -> dict:
     return result
 
 
+def _sequencer_24h() -> dict:
+    """Pull the most recent day0-fire-monitor.jsonl row written in the last 2h.
+
+    Returns empty dict when no fresh data is available (monitor not yet run or
+    no qualified_lead outbound jobs in window).
+    """
+    path = DATA_ROOT / "operations" / "day0-fire-monitor.jsonl"
+    if not path.exists():
+        return {}
+    cutoff_iso = (datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+    freshness_cutoff = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds") + "Z"
+    best: dict = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                # Accept rows written in the last 2h that cover a >=24h window
+                if r.get("ts", "") >= freshness_cutoff and r.get("window_hours", 0) >= 24:
+                    best = r
+            except (json.JSONDecodeError, KeyError):
+                pass
+    except OSError:
+        pass
+    if not best:
+        # Fallback: compute live from DB + flat files (no alert, read-only)
+        try:
+            import sqlite3 as _sq
+            _db_path = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
+            _conn = _sq.connect(str(_db_path))
+            _conn.row_factory = _sq.Row
+            _cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+            from scripts.day0_fire_monitor_lib import run as _d0run  # noqa: F401
+        except Exception:
+            pass
+        # If fallback import unavailable, return empty — digest will skip section
+        return {}
+    return {
+        "dispatch_count":     best.get("dispatch_count", 0),
+        "send_count":         best.get("send_count", 0),
+        "bounce_count":       best.get("bounce_count", 0),
+        "reply_count":        best.get("reply_count", 0),
+        "deliverability_pct": best.get("deliverability_pct"),
+        "ts":                 best.get("ts", ""),
+    }
+
+
 def _suppression_count() -> int:
     if not SUPPRESSION_FILE.is_file():
         return 0
@@ -747,6 +796,7 @@ def gather() -> dict:
 
     summary["drafts_pending"] = _count_drafts()
     summary["suppression_total"] = _suppression_count()
+    summary["sequencer_24h"] = _sequencer_24h()
     summary["funnel"] = _funnel_24h()
     summary["email_bounce_health"] = _email_bounce_health()
     summary["channel_reply_rates"] = _channel_reply_rate_24h()
@@ -1093,6 +1143,26 @@ def render(s: dict) -> str:
                 f"  ⚠️ *Throttle candidates* (rate <0.5%): {', '.join(_throttled)} "
                 f"— smart-spray sequencer will back off when live"
             )
+
+    # ── Multi-touch sequencer 24h ─────────────────────────────────────────
+    seq = s.get("sequencer_24h") or {}
+    if seq.get("dispatch_count", 0) > 0:
+        _sd = seq.get("dispatch_count", 0)
+        _ss = seq.get("send_count", 0)
+        _sb = seq.get("bounce_count", 0)
+        _sr = seq.get("reply_count", 0)
+        _dp = seq.get("deliverability_pct")
+        _dp_str = f" · {_dp:.0f}% deliverable" if _dp is not None else ""
+        if _sr >= 1:
+            _seq_icon = "🟢"
+        elif _sb > 0:
+            _seq_icon = "🔴"
+        else:
+            _seq_icon = "🟡"
+        lines.append(
+            f"{_seq_icon} *Multi-touch sequencer 24h*: {_sd} dispatched / "
+            f"{_ss} sent / {_sb} bounced / {_sr} replied{_dp_str}"
+        )
 
     f = s.get("funnel") or {}
     if f.get("inbound"):

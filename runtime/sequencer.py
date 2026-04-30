@@ -65,6 +65,35 @@ CALL_ENDPOINT = f"{ELEVEN_API_BASE}/convai/twilio/outbound-call"
 # Blog proof post for Day 8
 PROOF_POST_URL = "https://meetrick.ai/blog"
 
+# Demo video for Day 8 email-proof — lets prospects watch Rick work in 60 s.
+# Auto-resolves to the most-recent MP4 in ~/meetrick-content/videos/ so future
+# renders are picked up without code edits.  Defaults to 2026-04-30 recording.
+_DEMO_VIDEO_DEFAULT = "https://meetrick.ai/videos/2026-04-30-rick-demo.mp4"
+_MEETRICK_CONTENT_VIDEOS = Path.home() / "meetrick-content" / "videos"
+
+
+def get_latest_demo_video_url(
+    videos_dir: Path = _MEETRICK_CONTENT_VIDEOS,
+    default: str = _DEMO_VIDEO_DEFAULT,
+) -> str:
+    """Return the public URL for the most-recent MP4 in videos_dir.
+
+    Scans for *.mp4 files, sorts by filename descending (YYYY-MM-DD prefix
+    means lexicographic == chronological), and maps the stem to its public URL
+    under https://meetrick.ai/videos/.  Falls back to *default* when the
+    directory is absent, empty, or the scan raises any exception.
+    """
+    try:
+        mp4s = sorted(videos_dir.glob("*.mp4"), key=lambda p: p.name, reverse=True)
+        if mp4s:
+            return f"https://meetrick.ai/videos/{mp4s[0].name}"
+    except Exception:
+        pass
+    return default
+
+
+DEMO_VIDEO_URL: str = get_latest_demo_video_url()
+
 # Quickstart install CTA — used in follow-up email touches (Day 5+) to give
 # prospects a zero-friction path to see Rick run on their own machine in 60 s.
 # Intentionally excluded from Day-0 cold opener (pure pitch, no install ask).
@@ -318,7 +347,10 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
             "email-proof": (
                 "This is Day 8 — lead with a real outcome or concrete metric. "
                 f"You may reference the blog post at {PROOF_POST_URL} as supporting proof. "
-                "Brief and outcome-focused."
+                "Also weave in a single natural line inviting the prospect to watch Rick "
+                "at work in 60 seconds -- the demo video URL is "
+                f"{DEMO_VIDEO_URL} -- let tone drive the exact phrasing, "
+                "do not force it verbatim. Brief and outcome-focused."
             ),
             "email-nudge": (
                 "This is Day 15 — a final gentle nudge before the sequence ends. "
@@ -348,7 +380,8 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 f"BODY:\nHi {name},\n\n"
                 "Published the real operating numbers from running an AI CEO. Worth 3 minutes "
                 f"if you're thinking about where AI fits in {company}'s stack:\n{PROOF_POST_URL}\n\n"
-                "If you'd rather just see it work -- run this and watch Rick operate for 60 seconds:\n\n"
+                f"Watch Rick at work in 60 seconds: {DEMO_VIDEO_URL}\n\n"
+                "Or run it yourself:\n\n"
                 f"{QUICKSTART_CMD}\n\n"
                 f"Rick\nmeetrick.ai  |  {QUICKSTART_URL}"
             ),

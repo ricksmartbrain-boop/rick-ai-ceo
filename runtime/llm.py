@@ -9,9 +9,11 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -871,6 +873,37 @@ def _emit_silent_failure_event(route: str, refs_failed: list[tuple[str, str]], p
         pass
 
 
+def _run_chain_once(
+    route: str,
+    prompt: str,
+    refs: list[tuple[str, str]],
+    primary_provider: str,
+    primary_model: str,
+    notes: list[str],
+) -> GenerationResult | None:
+    """Attempt every ref in order; return result on first success, None on full exhaustion.
+
+    Appends live_failed / route_fallback_used entries to *notes* in-place so the
+    caller accumulates failure history across retry attempts.
+    """
+    failed: list[tuple[str, str]] = []
+    for index, (provider, model) in enumerate(refs):
+        live = run_live_generation(provider, model, route, prompt)
+        if live and live.text.strip():
+            if index > 0:
+                notes.append(f"route_fallback_used={provider}:{model}")
+                _emit_silent_failure_event(route, failed, (primary_provider, primary_model))
+            return finalize(
+                route, model, live.runner, "live", prompt, live.text, live.provider,
+                usage=live.usage, notes=notes,
+            )
+        notes.append(f"live_failed={provider}:{model}")
+        failed.append((provider, model))
+    # Full exhaustion — emit event and signal caller.
+    _emit_silent_failure_event(route, failed, (primary_provider, primary_model))
+    return None
+
+
 def generate_route_with_fallbacks(
     route: str,
     prompt: str,
@@ -883,22 +916,36 @@ def generate_route_with_fallbacks(
 
     notes: list[str] = []
     refs = [(primary_provider, primary_model), *route_fallback_refs(route, primary_provider, primary_model)]
-    failed_refs: list[tuple[str, str]] = []
 
-    for index, (provider, model) in enumerate(refs):
-        live = run_live_generation(provider, model, route, prompt)
-        if live and live.text.strip():
-            if index > 0:
-                notes.append(f"route_fallback_used={provider}:{model}")
-                # Primary failed but a fallback caught it — surface the silent
-                # failure so daily ops can grep llm-fallback-events.jsonl.
-                _emit_silent_failure_event(route, failed_refs, (primary_provider, primary_model))
-            return finalize(route, model, live.runner, "live", prompt, live.text, live.provider, usage=live.usage, notes=notes)
-        notes.append(f"live_failed={provider}:{model}")
-        failed_refs.append((provider, model))
+    # First attempt — existing behaviour.
+    result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes)
+    if result is not None:
+        return result
 
-    # All refs failed — fully silent fallback. Loud log.
-    _emit_silent_failure_event(route, failed_refs, (primary_provider, primary_model))
+    # All refs failed.  Record in the sliding window, then check whether enough
+    # recent failures have accumulated to justify sleeping before a retry.
+    # This prevents burning sleep budget on a one-off transient miss.
+    _record_chain_failure()
+
+    retried = 0
+    for retry_num in range(1, MAX_RETRIES_PER_CALL + 1):
+        if not _should_sleep_and_retry():
+            break  # window below threshold — don't burn sleep budget
+        retried += 1
+        _log_retry_event(route, retry_num, len(refs), RETRY_SLEEP_SECS, outcome="retrying")
+        time.sleep(RETRY_SLEEP_SECS)
+        # Smart-models invariant: retry always walks the FULL chain, not just
+        # the cheapest model.  Notes accumulate across attempts for auditability.
+        result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes)
+        if result is not None:
+            _log_retry_event(route, retry_num, len(refs), 0, outcome="recovered")
+            return result
+        _record_chain_failure()
+
+    if retried > 0:
+        _log_retry_event(route, retried, len(refs), 0, outcome="exhausted")
+
+    # Hard fallback — all attempts including retries exhausted.
     return finalize(route, primary_model, "fallback", "fallback", prompt, fallback, primary_provider, notes=notes)
 
 
@@ -1060,6 +1107,87 @@ def _circuit_record_success(provider: str) -> None:
     """Reset a provider's circuit breaker on success."""
     with _circuit_breaker_lock:
         _circuit_breaker.pop(provider, None)
+
+
+# ── Chain-failure retry layer ─────────────────────────────────────────────────
+# During transient full-provider outages (e.g. Anthropic billing-skip + Google
+# + OpenAI all failing simultaneously — seen 2026-04-30 02:59, 80 consecutive
+# review-route exhaustions), the full chain can exhaust without any result.
+# Most billing-skips clear within 30–90 s, so a single 60 s sleep + retry
+# catches the majority of incidents.
+#
+# Smart-models invariant: each retry always attempts the FULL chain in order;
+# never retries only the cheapest model. Cap: MAX_RETRIES_PER_CALL per call to
+# prevent cost storms during extended outages.
+#
+# Retry log: ~/rick-vault/operations/llm-retry-events.jsonl
+
+_chain_fail_window: deque = deque()  # monotonic timestamps of full-chain exhaustions
+_chain_fail_lock = threading.Lock()
+_CHAIN_FAIL_WINDOW_SECS = 300  # 5-minute sliding window
+_CHAIN_FAIL_THRESHOLD = 3      # ≥N exhaustions in window → sleep+retry eligible
+
+RETRY_LOG_FILE = Path(
+    os.path.expanduser(
+        os.getenv(
+            "RICK_LLM_RETRY_LOG_FILE",
+            str(DATA_ROOT / "operations" / "llm-retry-events.jsonl"),
+        )
+    )
+)
+MAX_RETRIES_PER_CALL = 3
+RETRY_SLEEP_SECS = int(os.getenv("RICK_LLM_RETRY_SLEEP_SECS", "60"))
+
+
+def _record_chain_failure() -> None:
+    """Record a full-chain exhaustion in the sliding window."""
+    with _chain_fail_lock:
+        now = time.monotonic()
+        _chain_fail_window.append(now)
+        # Prune entries older than the window.
+        while _chain_fail_window and now - _chain_fail_window[0] > _CHAIN_FAIL_WINDOW_SECS:
+            _chain_fail_window.popleft()
+
+
+def _should_sleep_and_retry() -> bool:
+    """Return True if ≥3 full-chain exhaustions occurred in the last 5 min."""
+    with _chain_fail_lock:
+        now = time.monotonic()
+        while _chain_fail_window and now - _chain_fail_window[0] > _CHAIN_FAIL_WINDOW_SECS:
+            _chain_fail_window.popleft()
+        return len(_chain_fail_window) >= _CHAIN_FAIL_THRESHOLD
+
+
+def _log_retry_event(
+    route: str,
+    retry_num: int,
+    n_refs: int,
+    slept_secs: int,
+    outcome: str = "retrying",
+) -> None:
+    """Append one retry event to llm-retry-events.jsonl.
+
+    outcome: "retrying" | "recovered" | "exhausted"
+    """
+    try:
+        RETRY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with RETRY_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "event": "chain_retry",
+                        "route": route,
+                        "retry_num": retry_num,
+                        "n_refs_in_chain": n_refs,
+                        "slept_secs": slept_secs,
+                        "outcome": outcome,
+                    }
+                )
+                + "\n"
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def daily_spend_usd() -> float:

@@ -164,6 +164,77 @@ def _flag_is_on(flag: str) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _probe_llm_fallback_health() -> dict:
+    """Rate probe: what fraction of LLM calls landed in hardcoded fallback last hour?
+
+    Reads llm-usage.jsonl (total calls) and llm-fallback-events.jsonl (full-chain
+    exhaustions, n_failed ≥4) to compute a 1-hour rate.
+
+    Status:
+      fresh    → hardcoded-fallback rate < 10 %
+      degraded → 10–25 %  (warning band — surfaces in digest, not pager)
+      stale    → > 25 %   (alert)
+      no_data  → fewer than 5 total calls in the window (too quiet to rate)
+    """
+    from datetime import timedelta
+
+    now = datetime.now()
+    cutoff = now - timedelta(hours=1)
+
+    # --- total LLM calls in last hour ---
+    usage_log = OPS / "llm-usage.jsonl"
+    total_calls = 0
+    for entry in _iter_jsonl_reverse(usage_log, max_lines=20_000):
+        ts = _parse_ts(entry)
+        if ts is None:
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.astimezone().replace(tzinfo=None)
+        if ts < cutoff:
+            break
+        total_calls += 1
+
+    # --- full-chain exhaustions (hardcoded fallback) in last hour ---
+    fallback_log = OPS / "llm-fallback-events.jsonl"
+    hardcoded = 0
+    for entry in _iter_jsonl_reverse(fallback_log, max_lines=5_000):
+        ts = _parse_ts(entry)
+        if ts is None:
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.astimezone().replace(tzinfo=None)
+        if ts < cutoff:
+            break
+        if entry.get("n_failed", 0) >= 4:
+            hardcoded += 1
+
+    rate = hardcoded / max(1, total_calls)
+
+    if total_calls < 5:
+        status = "no_data"
+    elif rate < 0.10:
+        status = "fresh"
+    elif rate > 0.25:
+        status = "stale"
+    else:
+        status = "degraded"  # 10–25 %: warn band
+
+    return {
+        "flag": "RICK_LLM_FALLBACK_HEALTH",
+        "on": True,  # always-on computed metric — no env gate
+        "last_success_ts": now.isoformat(timespec="seconds"),
+        "age_hours": 0.0,
+        "status": status,
+        "log_path": str(fallback_log),
+        "max_age_hours": 1.0,
+        "meta": {
+            "total_calls_1h": total_calls,
+            "hardcoded_fallback_1h": hardcoded,
+            "rate_pct": round(rate * 100, 1),
+        },
+    }
+
+
 def scan_flags() -> list[dict]:
     """Return per-flag status records.
 
@@ -173,6 +244,8 @@ def scan_flags() -> list[dict]:
     """
     results = []
     now = datetime.now()
+    # Computed rate probes (not env-flag gated, always evaluated).
+    results.append(_probe_llm_fallback_health())
     for flag, rel_path, max_age_h, filt in FLAG_PROBES:
         log_path = OPS / rel_path
         # Resolve glob patterns (date-rotating logs like ../data/NAME-YYYY-MM-DD.jsonl).
@@ -233,7 +306,8 @@ def scan_flags() -> list[dict]:
 
 
 def stale_flags() -> list[dict]:
-    return [r for r in scan_flags() if r["status"] == "stale"]
+    # Include "degraded" so the 10–25 % warning band also surfaces in digests.
+    return [r for r in scan_flags() if r["status"] in ("stale", "degraded")]
 
 
 if __name__ == "__main__":
