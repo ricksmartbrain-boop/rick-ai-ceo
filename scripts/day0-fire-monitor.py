@@ -12,7 +12,7 @@ Writes one row per run to ~/rick-vault/operations/day0-fire-monitor.jsonl.
 Fires notify_operator_deduped when the first reply arrives from any qualified_lead.
 
 Usage:
-    python3 scripts/day0-fire-monitor.py             # 24h window (default)
+    python3 scripts/day0-fire-monitor.py             # 36h window (default — covers morning fire + next-morning monitor)
     python3 scripts/day0-fire-monitor.py --hours 2   # 2h window
     python3 scripts/day0-fire-monitor.py --dry-run   # no DB writes / no alert
 """
@@ -46,18 +46,25 @@ def _now_iso() -> str:
 
 
 def _load_qualified_lead_jobs(conn, cutoff_iso: str) -> list[dict]:
-    """Return email outbound_jobs linked to qualified_lead workflows since cutoff."""
+    """Return email outbound_jobs linked to qualified_lead workflows since cutoff.
+
+    Filter uses finished_at (actual dispatch/fire time) not created_at (queue
+    insertion time).  Jobs queued hours before their send window were returning
+    created_at < cutoff even though they fired inside the window.
+    """
     rows = conn.execute(
         """
         SELECT oj.id AS job_id, oj.lead_id, oj.status AS job_status,
-               oj.scheduled_at, oj.created_at, oj.payload_json, oj.result_json,
+               oj.scheduled_at, oj.created_at, oj.finished_at,
+               oj.payload_json, oj.result_json,
                w.title AS lead_title, w.context_json AS lead_ctx
         FROM   outbound_jobs oj
         JOIN   workflows w ON w.id = oj.lead_id
-        WHERE  oj.channel = 'email'
-          AND  w.kind     = 'qualified_lead'
-          AND  oj.created_at >= ?
-        ORDER  BY oj.created_at ASC
+        WHERE  oj.channel    = 'email'
+          AND  w.kind        = 'qualified_lead'
+          AND  oj.finished_at IS NOT NULL
+          AND  oj.finished_at >= ?
+        ORDER  BY oj.finished_at ASC
         """,
         (cutoff_iso,),
     ).fetchall()
@@ -76,6 +83,7 @@ def _load_qualified_lead_jobs(conn, cutoff_iso: str) -> list[dict]:
                 "job_status":   r["job_status"],
                 "scheduled_at": r["scheduled_at"],
                 "created_at":   r["created_at"],
+                "finished_at":  r["finished_at"],
             }
         )
     return leads
@@ -223,10 +231,18 @@ def _fire_first_reply_alert(
 # Core run
 # ---------------------------------------------------------------------------
 
-def run(hours: int = 24, dry_run: bool = False) -> dict:
+def run(hours: int = 36, dry_run: bool = False) -> dict:
+    """Run the day-0 fire monitor.
+
+    Default window is 36h (not 24h) so that a morning campaign fire on day N
+    is still visible when the monitor runs the morning of day N+1 (~31h later).
+    The cutoff uses local wall-clock time (datetime.now()) to match the
+    timestamp format written by the job runner — using utcnow() produced a
+    UTC cutoff string that compared wrong against local-time DB values.
+    """
     import sqlite3
 
-    cutoff_dt  = datetime.utcnow() - timedelta(hours=hours)
+    cutoff_dt  = datetime.now() - timedelta(hours=hours)  # FIX: was utcnow()
     cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
 
     conn = sqlite3.connect(str(DB_PATH))
@@ -277,6 +293,41 @@ def run(hours: int = 24, dry_run: bool = False) -> dict:
                     dry_run,
                 )
 
+        # BONUS: catch first-reply from ANY historical ql dispatch outside the window.
+        # Without this, a reply to an older batch is invisible until that batch
+        # re-enters the window — defeating the purpose of a reply alert.
+        if first_reply_alert_result == "none" and reply_map:
+            known_emails = {l["email"] for l in per_lead}
+            extra_rows = conn.execute(
+                """
+                SELECT DISTINCT oj.lead_id AS wf_id, oj.payload_json,
+                       w.title AS lead_title, w.context_json AS lead_ctx
+                FROM   outbound_jobs oj
+                JOIN   workflows w ON w.id = oj.lead_id
+                WHERE  oj.channel    = 'email'
+                  AND  w.kind        = 'qualified_lead'
+                  AND  oj.finished_at IS NOT NULL
+                  AND  oj.finished_at < ?
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+            for r in extra_rows:
+                xpayload = json.loads(r["payload_json"]) if r["payload_json"] else {}
+                xctx     = json.loads(r["lead_ctx"])     if r["lead_ctx"]     else {}
+                xemail   = (xpayload.get("to") or xctx.get("email") or "").lower().strip()
+                if xemail and xemail not in known_emails:
+                    xreply = reply_map.get(xemail)
+                    if xreply:
+                        first_reply_alert_result = _fire_first_reply_alert(
+                            conn,
+                            r["lead_title"],
+                            xemail,
+                            r["wf_id"],
+                            xreply["label"],
+                            dry_run,
+                        )
+                        break
+
         # Aggregate metrics
         dispatch_count = len(leads)
         send_count     = sum(1 for l in per_lead if l["sent"])
@@ -319,7 +370,7 @@ def run(hours: int = 24, dry_run: bool = False) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Day-0 multi-touch sequencer fire monitor")
-    parser.add_argument("--hours",   type=int, default=24, help="Look-back window in hours (default 24)")
+    parser.add_argument("--hours",   type=int, default=36, help="Look-back window in hours (default 36; covers morning fire + next-morning monitor cycle)")
     parser.add_argument("--dry-run", action="store_true",  help="Don't write output or send alerts")
     args = parser.parse_args()
 

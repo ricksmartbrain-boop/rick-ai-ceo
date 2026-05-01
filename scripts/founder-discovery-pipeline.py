@@ -44,6 +44,7 @@ for _ec in ENV_CANDIDATES:
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
 from runtime.llm import generate_text  # noqa: E402
+from runtime.email_validator import validate_for_outbound  # noqa: E402
 
 VAULT = Path.home() / "rick-vault"
 LEADS_DIR = VAULT / "projects" / "qualified-leads"
@@ -685,6 +686,20 @@ def main() -> None:
         if args.dry_run:
             print(f"    [DRY RUN] Would generate opener + create wf_{make_wf_id(email)}.json")
             continue
+
+        # ── MX + validity gate (2026-05-01) ──────────────────────────────
+        if email:
+            _mx_ok, _mx_reason = validate_for_outbound(email)
+            if not _mx_ok:
+                print(f"    [SKIP-INVALID-EMAIL] {email} — {_mx_reason}")
+                skip_counts["invalid_email"] = skip_counts.get("invalid_email", 0) + 1
+                # Append to suppression so we never retry this address
+                _supp_file = VAULT / "mailbox" / "suppression.txt"
+                _supp_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(_supp_file, "a", encoding="utf-8") as _sf:
+                    _sf.write(f"{email}  # {_mx_reason} — auto-suppressed by email_validator\n")
+                continue
+        # ────────────────────────────────────────────────────────────────────
 
         opener = generate_opener(lead)
         result = create_workflow(lead, opener)

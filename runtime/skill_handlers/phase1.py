@@ -139,6 +139,35 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
                     workflow_stage="auto-suppressed",
                 )
 
+    # 2026-05-01: MX-record + email-validity gate — runs BEFORE LLM dossier build
+    # to prevent spending on hallucinated / bouncing addresses.
+    # Checks: disposable domain, role account, no MX record.
+    if lead_email:
+        try:
+            from runtime.email_validator import validate_for_outbound as _validate_email
+            _mx_ok, _mx_reason = _validate_email(lead_email)
+            if not _mx_ok:
+                # Append to suppression.txt to prevent future retries
+                try:
+                    _supp_path = Path(os.path.expanduser("~/rick-vault/mailbox/suppression.txt"))
+                    _supp_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_supp_path, "a", encoding="utf-8") as _sf:
+                        _sf.write(f"{lead_email.lower()}  # {_mx_reason} — auto-suppressed by email_validator\n")
+                except Exception:
+                    pass
+                return StepOutcome(
+                    summary=f"auto_suppressed: email validation failed ({lead_email}) — {_mx_reason}",
+                    artifacts=[{
+                        "kind": "suppression-record",
+                        "title": "Lead intake auto-suppressed (invalid email)",
+                        "metadata": {"reason": _mx_reason, "email": lead_email, "source": lead_source},
+                    }],
+                    workflow_status="cancelled",
+                    workflow_stage="auto-suppressed",
+                )
+        except ImportError:
+            pass  # validator not yet available — degrade gracefully
+
     # 2026-04-24: pattern READ side fanned out to lead_intake. Surfaces top-3
     # most-effective patterns so the dossier-building LLM benefits from
     # accumulated intake lessons. Same shielded shape as ship 6.

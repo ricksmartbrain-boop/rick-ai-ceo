@@ -685,11 +685,43 @@ def _check_and_handle_reply(
 # Per-workflow processor
 # ---------------------------------------------------------------------------
 
+def _load_suppression() -> frozenset[str]:
+    """Load suppression.txt from the ops directory. Returns lowercase email set."""
+    try:
+        supp_path = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "suppression.txt"
+        if supp_path.exists():
+            return frozenset(l.strip().lower() for l in supp_path.read_text().splitlines() if l.strip())
+    except Exception:
+        pass
+    return frozenset()
+
+
 def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
     """Evaluate and dispatch due touches for one workflow. Returns 1 if dispatched, else 0."""
     wf_id = workflow["id"]
     ctx = _parse_context(workflow)
     seq = _seq_state(ctx)
+
+    # ------------------------------------------------------------------
+    # Bounce-suppression guard (added 2026-05-01 — emergency throttle)
+    # If the lead email is in suppression.txt (bounced address), mark the
+    # workflow stage='bounced-paused' and halt all future touches.
+    # Does NOT cancel the workflow — Vlad decides whether to bulk-cancel.
+    # ------------------------------------------------------------------
+    _tp = ctx.get("trigger_payload") or {}
+    lead_email_check = (ctx.get("email") or _tp.get("email") or "").strip().lower()
+    if lead_email_check and lead_email_check in _load_suppression():
+        if workflow["stage"] != "bounced-paused":
+            _set_stage(conn, wf_id, "bounced-paused")
+            _log({
+                "event": "touch_suppressed",
+                "wf_id": wf_id,
+                "reason": "lead email in suppression list (bounced)",
+                "lead_email": lead_email_check,
+                "stage_set": "bounced-paused",
+            })
+            conn.commit()
+        return 0
 
     # Stop if reply detected
     if _check_and_handle_reply(conn, workflow, ctx):
@@ -748,7 +780,7 @@ def tick(connection: sqlite3.Connection) -> int:
             SELECT * FROM workflows
              WHERE kind = 'qualified_lead'
                AND stage NOT IN ('replied','done','closed','unsubscribed',
-                                  'disqualified','sequence-complete')
+                                  'disqualified','sequence-complete','bounced-paused')
                AND status NOT IN ('done','cancelled','failed')
              ORDER BY created_at ASC
             """,
