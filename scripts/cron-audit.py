@@ -47,8 +47,9 @@ SEND_PATTERNS = [
 ]
 
 # Known kill-switch env flags (complete)
+# Matches both positive gates (RICK_*_LIVE) and negative gates (RICK_*_DISABLED)
 KILL_SWITCH_PATTERNS = [
-    r"RICK_\w+_LIVE", r"DRY_RUN", r"--dry-run", r"--live",
+    r"RICK_\w+_LIVE", r"RICK_\w+_DISABLED", r"DRY_RUN", r"--dry-run", r"--live",
     r"dry_run\s*=", r"RICK_OUTBOUND_ENABLED",
 ]
 
@@ -128,6 +129,25 @@ def schedule_str(p: dict) -> str:
     return "on-load/keepalive"
 
 
+def stale_threshold_hours(p: dict) -> float:
+    """Return max expected silence in hours before a loaded cron is flagged STALE."""
+    si = p.get("StartInterval")
+    sci = p.get("StartCalendarInterval")
+    if si:
+        # Interval jobs: flag if silent for >3× their interval, capped at 24h
+        return min((si / 3600) * 3, 24.0)
+    if sci:
+        if isinstance(sci, list):
+            first = sci[0] if sci else {}
+            if isinstance(first, dict) and "Weekday" in first:
+                return 9 * 24.0  # weekly (list form): allow up to 9 days silence
+            return 36.0  # multi-time calendar: treat as daily
+        if "Weekday" in sci:
+            return 9 * 24.0  # weekly: allow up to 9 days silence
+        return 36.0  # plain daily
+    return 48.0  # on-load/keepalive
+
+
 def get_prog(p: dict) -> str:
     prog = p.get("ProgramArguments") or p.get("Program") or []
     if isinstance(prog, list):
@@ -157,29 +177,65 @@ def log_freshness(log_path: str) -> tuple[str, int, str]:
     return status, lines, last_mod
 
 
+# Directories to search when resolving `-m module.name` invocations
+_MODULE_ROOTS = [
+    Path.home() / "clawd",
+    Path.home() / ".openclaw" / "workspace",
+    Path.home() / "rick-vault",
+]
+# Prefixes that indicate a non-script binary (Chrome, system tools, etc.)
+_NON_SCRIPT_BINARY_PREFIXES = (
+    "/Applications/",
+    "/System/",
+    "/usr/bin/env",
+)
+
+
+def _resolve_module_path(module_name: str) -> Path | None:
+    """Try to find the .py file for a `-m module.name` invocation."""
+    rel = Path(module_name.replace(".", "/") + ".py")
+    for root in _MODULE_ROOTS:
+        candidate = root / rel
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def scan_script_body(prog_str: str) -> tuple[list[str], list[str], bool]:
     """
     Returns (kill_switches_found, send_patterns_found, script_exists).
     Scans the first resolved Python/shell script path in the prog string.
-    """
-    # Find the script path(s)
-    paths = re.findall(r"(/[\w./\-]+\.(?:py|sh))", prog_str)
-    kill_found = []
-    send_found = []
-    exists = False
 
-    for script_path in paths:
-        p = Path(script_path)
-        if not p.exists():
-            continue
-        exists = True
-        try:
-            body = p.read_text(errors="replace")
-        except Exception:
-            continue
+    script_exists=True when:
+      - at least one .py/.sh path resolves on disk, OR
+      - the command is a -m module invocation whose module file exists, OR
+      - the command launches a known non-script binary (Chrome, /usr/bin/env, etc.)
+    script_exists=False ONLY when paths are found but NONE of them exist on disk.
+    (Empty path list = non-script binary → treated as exists to avoid false-positive BROKEN.)
+    """
+    # 1. Expand tilde paths before regex matching
+    expanded = prog_str.replace("~/", str(Path.home()) + "/")
+
+    # 2. Check for non-script binary invocations (Chrome, /System, etc.)
+    for prefix in _NON_SCRIPT_BINARY_PREFIXES:
+        if prefix in expanded:
+            # Scan the full prog string for kill-switch patterns (no body to read)
+            return [], [], True  # binary exists; can't scan body
+
+    # 3. Find explicit .py / .sh paths
+    paths = re.findall(r"(/[\w./\-]+\.(?:py|sh))", expanded)
+
+    # 4. Check for -m module invocations
+    module_match = re.search(r"-m\s+([\w.]+)", expanded)
+
+    kill_found: list[str] = []
+    send_found: list[str] = []
+    found_any_file = False
+
+    # Helper: scan a single file body for patterns
+    def scan_body(body: str) -> None:
         for pattern in KILL_SWITCH_PATTERNS:
-            hits = re.findall(pattern, body)
-            for h in hits:
+            for h in re.findall(pattern, body):
                 if h not in kill_found:
                     kill_found.append(h)
         for pattern in SEND_PATTERNS:
@@ -188,7 +244,30 @@ def scan_script_body(prog_str: str) -> tuple[list[str], list[str], bool]:
                 if label not in send_found:
                     send_found.append(label)
 
-    return kill_found, send_found, exists
+    for script_path in paths:
+        p = Path(script_path)
+        if not p.exists():
+            continue
+        found_any_file = True
+        try:
+            scan_body(p.read_text(errors="replace"))
+        except Exception:
+            pass
+
+    if module_match and not found_any_file:
+        mod_path = _resolve_module_path(module_match.group(1))
+        if mod_path:
+            found_any_file = True
+            try:
+                scan_body(mod_path.read_text(errors="replace"))
+            except Exception:
+                pass
+
+    # If we found explicit paths but NONE existed → truly broken
+    # If we found NO paths AND no module match → unknown binary, treat as exists
+    if paths and not found_any_file:
+        return kill_found, send_found, False  # truly BROKEN
+    return kill_found, send_found, True  # exists (found, module-based, or unknown binary)
 
 
 def get_outbound_db_stats() -> dict[str, dict]:
@@ -238,9 +317,11 @@ def risk_level(record: dict) -> str:
     status = record.get("log_status", "")
     loaded = record.get("loaded", False)
     script_exists = record.get("script_exists", True)
-    has_global_kill = any(
-        k in kills for k in ["RICK_OUTBOUND_ENABLED", "DRY_RUN"] or
-        any("RICK_" in k and "_LIVE" in k for k in kills)
+    # BUG FIX: was `any(gen for k in list or any(...))` — the `or` never evaluated
+    has_global_kill = (
+        any(k in kills for k in ["RICK_OUTBOUND_ENABLED", "DRY_RUN"])
+        or any("RICK_" in k and "_LIVE" in k for k in kills)
+        or any("RICK_" in k and "_DISABLED" in k for k in kills)  # negative kill-switches
     )
 
     if not loaded:
@@ -281,10 +362,42 @@ def audit() -> list[dict]:
         sched = schedule_str(p)
         stdout, stderr = get_log(p)
         log_status, log_lines, log_mtime = log_freshness(stdout)
+
+        # Also check work logs redirected inside the -lc command (>> /path/to/file)
+        # Many crons redirect output inside zsh -lc, so StandardOutPath may be stale
+        # while the actual work log is fresh.
+        if log_status in ("STALE", "MISSING", "NO_LOG"):
+            expanded_prog = prog.replace("~/", str(Path.home()) + "/")
+            work_logs = re.findall(r">>\s*([/~][\w./\-]+\.log)", expanded_prog)
+            work_logs = [wl.replace("~/", str(Path.home()) + "/") for wl in work_logs]
+            for wl in work_logs:
+                wl_status, wl_lines, wl_mtime = log_freshness(wl)
+                if wl_status == "FRESH" or (wl_mtime and wl_mtime > log_mtime):
+                    # Work log is fresher — use it
+                    log_status, log_lines, log_mtime = wl_status, wl_lines, wl_mtime
+                    break
+
         kill_switches, send_patterns, script_exists = scan_script_body(prog)
         is_loaded = label in loaded
         pid = pids.get(label, "-")
         disabled = p.get("Disabled", False)
+        # Schedule-aware stale threshold
+        stale_hours = stale_threshold_hours(p)
+        # Re-evaluate FRESH/STALE using schedule-aware threshold
+        if log_mtime and log_mtime != "":
+            try:
+                # Recompute age in hours from mtime string (MM-DD HH:MM)
+                log_dt = datetime.strptime(f"{datetime.now().year}-{log_mtime}", "%Y-%m-%d %H:%M")
+                age_hours = (datetime.now() - log_dt).total_seconds() / 3600
+                # Handle year rollover for Jan logs checked in Dec
+                if age_hours < -1:
+                    log_dt = log_dt.replace(year=datetime.now().year - 1)
+                    age_hours = (datetime.now() - log_dt).total_seconds() / 3600
+                effective_status = "FRESH" if age_hours <= stale_hours else "STALE"
+            except Exception:
+                effective_status = log_status
+        else:
+            effective_status = log_status
 
         # Determine live_flags from env
         live_flags_set = [k for k in kill_switches if "RICK_" in k and "_LIVE" in k and env.get(k) == "1"]
@@ -297,9 +410,11 @@ def audit() -> list[dict]:
             "schedule": sched,
             "prog": prog[:120],
             "script_exists": script_exists,
-            "log_status": log_status,
+            "log_status": effective_status,
+            "log_status_raw": log_status,  # original 24h threshold status
             "log_lines": log_lines,
             "log_mtime": log_mtime,
+            "stale_threshold_h": stale_hours,
             "kill_switches": kill_switches,
             "live_flags_set": live_flags_set,
             "send_patterns": send_patterns,
@@ -332,6 +447,7 @@ def render_markdown(records: list[dict], db_stats: dict) -> str:
     danger = [r for r in records if r.get("risk") == "DANGER"]
     watch = [r for r in records if r.get("risk") == "WATCH"]
     broken = [r for r in records if r.get("risk") == "BROKEN"]
+    # Schedule-aware stale: use effective_status (already computed per-schedule threshold)
     stale = [r for r in records if r.get("log_status") in ("STALE", "MISSING") and r.get("loaded")]
 
     lines += [

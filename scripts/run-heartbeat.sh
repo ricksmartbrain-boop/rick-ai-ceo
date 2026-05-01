@@ -184,5 +184,11 @@ if additions:
     print(f"[heartbeat] Promoted {len(additions)} patterns to MEMORY.md")
 PYEOF
 
+# --- Sender rep digest ---
+SENDER_DIGEST=$(python3 "$ROOT_DIR/scripts/sender-warmup-schedule.py" --digest 2>/dev/null)
+if [ -n "$SENDER_DIGEST" ]; then
+  echo "$SENDER_DIGEST"
+fi
+
 echo "Heartbeat complete."
 echo "Daily note: $TODAY_FILE"

@@ -89,6 +89,31 @@ def _is_local_smb(text: str) -> bool:
     return any(s in low for s in LOCAL_SMB_SIGNALS)
 
 
+# ── Role-account strict filter ───────────────────────────────────────────────────
+ROLE_ACCOUNT_PREFIXES: frozenset = frozenset({
+    "hello", "hi", "info", "contact", "admin", "support", "help",
+    "team", "no-reply", "noreply", "privacy", "legal", "security",
+    "abuse", "billing", "sales", "marketing", "press", "media",
+    "careers", "jobs", "feedback", "service", "office", "mail",
+    "post", "data", "gdpr", "ops", "operations", "general",
+    "enquiries", "enquiry", "inquiry", "inquiries",
+})
+
+# Leads with role-account emails that survive discovery go here for manual triage.
+NO_FOUNDER_EMAIL_QUEUE: Path = VAULT / "projects" / "outreach" / "no-founder-email-queue.jsonl"
+
+
+def is_role_account(email: str) -> bool:
+    """Return True if email looks like a role/shared inbox rather than a named person."""
+    local = email.lower().split("@")[0] if "@" in email else email.lower()
+    if local in ROLE_ACCOUNT_PREFIXES:
+        return True
+    for prefix in ROLE_ACCOUNT_PREFIXES:
+        if local.startswith(f"{prefix}+") or local.startswith(f"{prefix}.") or local.startswith(f"{prefix}_"):
+            return True
+    return False
+
+
 # ── Suppression loading ──────────────────────────────────────────────────────
 
 def load_suppression_set() -> set[str]:
@@ -366,20 +391,13 @@ def fetch_hn_show_hn() -> list[dict[str, Any]]:
             if _is_local_smb(title):
                 continue
 
-            # Try common email patterns
-            email_candidates = [
-                f"hello@{domain}",
-                f"hi@{domain}",
-                f"contact@{domain}",
-            ]
-
             context = f"Show HN: {title}. {points} points. HN user: {author}. URL: {url_field}"
             leads.append({
-                "email": email_candidates[0],
-                "email_candidates": email_candidates,
+                "email": "",  # named-founder discovery attempted in [3/6] filter pass
+                "hn_author": author,  # preserved for name-derived email discovery
                 "name": author,
                 "company": domain,
-                "domain": url_field,
+                "domain": domain,  # extracted domain, not full URL
                 "context": context,
                 "source": "hn-show-hn",
                 "homepage_url": url_field,
@@ -393,6 +411,178 @@ def fetch_hn_show_hn() -> list[dict[str, Any]]:
     return leads
 
 
+# ── Named-founder email discovery ───────────────────────────────────────────
+
+def discover_named_founder_email(
+    domain: str, name: str = "", context: str = "", hn_author: str = "",
+) -> tuple[str, str]:
+    """
+    Attempt to discover a named-founder email for a domain.
+    Returns (email, discovery_source) or ("", "") if not found.
+
+    Strategy order (cheapest/fastest first):
+    (a) Name-derived: {firstname}@, {firstname}.{lastname}@, {f}{lastname}@ from dossier
+    (b) GitHub: search users whose blog/email profile contains this domain
+    (c) ProductHunt GraphQL: search by domain → maker name → derive email
+    """
+    domain_clean = re.sub(r"^https?://(www\.)?" , "", domain.strip().rstrip("/")).split("/")[0]
+    if not domain_clean or "." not in domain_clean:
+        return "", ""
+
+    # ── (a) Name-derived patterns ───────────────────────────────────────────────────
+    primary_name = name or hn_author or ""
+    if primary_name:
+        name_parts = re.sub(r"[^a-z\s]", "", primary_name.lower()).split()
+        name_parts = [p for p in name_parts if len(p) >= 2]
+        first = name_parts[0] if name_parts else ""
+        last = name_parts[-1] if len(name_parts) > 1 else ""
+
+        candidates: list[str] = []
+        if first:
+            candidates.append(f"{first}@{domain_clean}")
+        if first and last and first != last:
+            candidates.append(f"{first}.{last}@{domain_clean}")
+            candidates.append(f"{first[0]}{last}@{domain_clean}")
+
+        for candidate in candidates:
+            if not re.match(r"^[a-z][a-z0-9.]{0,30}@[a-z0-9.-]+\.[a-z]{2,}$", candidate):
+                continue
+            if is_role_account(candidate):
+                continue
+            try:
+                mx_ok, _mx_reason = validate_for_outbound(candidate)
+                if mx_ok:
+                    return candidate, "name-derived"
+            except Exception:
+                # Validator unavailable — return best-guess candidate
+                return candidate, "name-derived-unvalidated"
+
+    # ── (b) GitHub user search by domain ───────────────────────────────────────────
+    gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    if gh_token:
+        try:
+            url = (
+                f"https://api.github.com/search/users"
+                f"?q={urllib.parse.quote(domain_clean)}+in:email+type:user&per_page=5"
+            )
+            data = _gh_fetch(url)
+            for item in data.get("items", []):
+                login = item.get("login", "")
+                if not login:
+                    continue
+                try:
+                    user = _gh_fetch(f"https://api.github.com/users/{login}")
+                    gh_email = (user.get("email") or "").strip().lower()
+                    gh_blog = (user.get("blog") or "").lower()
+                    if gh_email and "@" in gh_email and not is_role_account(gh_email):
+                        if domain_clean in gh_blog or domain_clean in gh_email:
+                            return gh_email, "github-user-email"
+                except Exception:
+                    continue
+            time.sleep(0.4)
+
+            url2 = (
+                f"https://api.github.com/search/users"
+                f"?q={urllib.parse.quote(domain_clean)}+type:user&per_page=5"
+            )
+            data2 = _gh_fetch(url2)
+            for item in data2.get("items", []):
+                login = item.get("login", "")
+                if not login:
+                    continue
+                try:
+                    user = _gh_fetch(f"https://api.github.com/users/{login}")
+                    gh_email = (user.get("email") or "").strip().lower()
+                    gh_blog = (user.get("blog") or "").lower()
+                    if domain_clean in gh_blog and gh_email and "@" in gh_email and not is_role_account(gh_email):
+                        return gh_email, "github-blog-match"
+                except Exception:
+                    continue
+            time.sleep(0.4)
+        except Exception:
+            pass  # GitHub search failed — fall through
+
+    # ── (c1) X/Twitter best-effort lookup ─────────────────────────────────────────
+    # Current X auth is often blocked; this is best-effort and safe to fail open.
+    try:
+        import subprocess
+        x_search = subprocess.run(
+            ["xurl", "search", domain_clean, "-n", "10"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            cwd=str(ROOT),
+        )
+        if x_search.returncode == 0 and x_search.stdout.strip():
+            blob = x_search.stdout.strip()
+            usernames = set(re.findall(r"@([A-Za-z0-9_]{1,15})", blob))
+            # Some responses are JSON-ish; also capture username fields directly.
+            usernames.update(re.findall(r'"username"\s*:\s*"([A-Za-z0-9_]{1,15})"', blob))
+            for username in list(usernames)[:5]:
+                try:
+                    x_user = subprocess.run(
+                        ["xurl", "user", username],
+                        capture_output=True,
+                        text=True,
+                        timeout=12,
+                        cwd=str(ROOT),
+                    )
+                    if x_user.returncode != 0:
+                        continue
+                    profile = x_user.stdout or ""
+                    emails = re.findall(r"[A-Za-z0-9._%+-]+@" + re.escape(domain_clean), profile, flags=re.I)
+                    for candidate in emails:
+                        cand = candidate.lower().strip()
+                        if cand and not is_role_account(cand):
+                            return cand, f"x-profile:{username}"
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # ── (c2) ProductHunt maker search ───────────────────────────────────────────────
+    ph_token = os.environ.get("PRODUCTHUNT_API_TOKEN") or os.environ.get("PH_API_TOKEN") or ""
+    if ph_token:
+        try:
+            gql = (
+                '{ posts(first: 3, query: "' + domain_clean + '") {'
+                ' edges { node { name makers { edges { node { name username websiteUrl } } } } } } }'
+            )
+            payload = json.dumps({"query": gql}).encode()
+            req = urllib.request.Request(
+                "https://api.producthunt.com/v2/api/graphql",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {ph_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            for edge in resp.get("data", {}).get("posts", {}).get("edges", []):
+                node = edge.get("node", {})
+                for maker_edge in node.get("makers", {}).get("edges", []):
+                    maker = maker_edge.get("node", {})
+                    maker_name = (maker.get("name") or "").strip()
+                    if not maker_name:
+                        continue
+                    ph_parts = re.sub(r"[^a-z\s]", "", maker_name.lower()).split()
+                    ph_parts = [p for p in ph_parts if len(p) >= 2]
+                    ph_first = ph_parts[0] if ph_parts else ""
+                    if ph_first and not is_role_account(f"{ph_first}@{domain_clean}"):
+                        candidate = f"{ph_first}@{domain_clean}"
+                        try:
+                            mx_ok, _ = validate_for_outbound(candidate)
+                            if mx_ok:
+                                return candidate, f"ph-maker-derived:{maker_name}"
+                        except Exception:
+                            return candidate, f"ph-maker-derived-unvalidated:{maker_name}"
+        except Exception:
+            pass
+
+    return "", ""
+
+
 # ── Scoring ──────────────────────────────────────────────────────────────────
 
 def heuristic_pre_filter(lead: dict[str, Any]) -> bool:
@@ -403,9 +593,10 @@ def heuristic_pre_filter(lead: dict[str, Any]) -> bool:
 
     if _is_local_smb(context + " " + domain):
         return False
-    if any(x in email for x in ["noreply", "no-reply", "info@", "support@", "admin@", "hello@"]):
-        # These generic emails are ok for cold outreach but flag for scoring
-        pass
+    # Role-account emails are rejected upstream by discover_named_founder_email,
+    # but double-check here as a defence-in-depth safety net.
+    if email and is_role_account(email):
+        return False
     tld = domain.split(".")[-1].split("/")[0] if "." in domain else ""
     if tld in ("gov", "edu", "mil"):
         return False
@@ -613,23 +804,64 @@ def main() -> None:
     print(f"  → Total raw candidates: {len(all_candidates)}")
 
     # 3. Deduplicate + filter suppressed + heuristic pre-filter
-    print("[3/6] Deduplicating and filtering...")
+    # Role-account emails trigger named-founder discovery before scoring.
+    print("[3/6] Deduplicating and filtering (role-account strict-mode ON)...")
     seen_emails: set[str] = set()
     filtered: list[dict[str, Any]] = []
     skip_counts = {"suppressed": 0, "no_email": 0, "dup": 0, "smb": 0, "heuristic": 0}
+    role_only_skipped = 0
+    named_founder_found = 0
+    no_founder_queue: list[dict[str, Any]] = []
 
     for lead in all_candidates:
         email = (lead.get("email") or "").strip().lower()
-        if not email or "@" not in email:
-            skip_counts["no_email"] += 1
-            continue
+        original_email = email
+
+        # ── Named-founder discovery gate ─────────────────────────────────────────
+        if not email or "@" not in email or is_role_account(email):
+            domain_raw = (lead.get("domain") or lead.get("homepage_url") or "").strip()
+            disc_domain = re.sub(r"^https?://(www\.)?", "", domain_raw.rstrip("/")).split("/")[0]
+            disc_email, disc_source = "", ""
+            if disc_domain and "." in disc_domain:
+                disc_email, disc_source = discover_named_founder_email(
+                    domain=disc_domain,
+                    name=lead.get("name") or "",
+                    context=lead.get("context") or "",
+                    hn_author=lead.get("hn_author") or "",
+                )
+            if disc_email and not is_role_account(disc_email):
+                lead = {**lead, "email": disc_email,
+                        "email_discovery_source": disc_source,
+                        "original_email": original_email}
+                email = disc_email
+                named_founder_found += 1
+                print(f"    [DISCOVERED] {email} via {disc_source} "
+                      f"(was: '{original_email or 'none'}')")
+            elif not disc_domain or "." not in disc_domain:
+                skip_counts["no_email"] += 1
+                continue
+            else:
+                # Had a domain but couldn't find a named email → queue for manual triage
+                role_only_skipped += 1
+                no_founder_queue.append({
+                    **lead,
+                    "role_only_reason": original_email or "no-email",
+                    "queued_at": NOW_UTC,
+                })
+                continue
+        # ─────────────────────────────────────────────────────────────────────────
+
         if email in suppressed:
             skip_counts["suppressed"] += 1
             continue
         if email in seen_emails:
             skip_counts["dup"] += 1
             continue
-        context_combined = (lead.get("context") or "") + " " + (lead.get("company") or "") + " " + (lead.get("domain") or "")
+        context_combined = (
+            (lead.get("context") or "") + " " +
+            (lead.get("company") or "") + " " +
+            (lead.get("domain") or "")
+        )
         if _is_local_smb(context_combined):
             skip_counts["smb"] += 1
             continue
@@ -639,8 +871,18 @@ def main() -> None:
         seen_emails.add(email)
         filtered.append(lead)
 
+    # Write no-founder-email queue for manual triage
+    if no_founder_queue:
+        NO_FOUNDER_EMAIL_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        with open(NO_FOUNDER_EMAIL_QUEUE, "a", encoding="utf-8") as _nfq:
+            for _entry in no_founder_queue:
+                _nfq.write(json.dumps(_entry, ensure_ascii=False) + "\n")
+        print(f"  → {len(no_founder_queue)} role-only leads written to {NO_FOUNDER_EMAIL_QUEUE.name}")
+
     print(f"  → After filter: {len(filtered)} candidates")
     print(f"  → Skipped: {skip_counts}")
+    print(f"  → Role-only (queued for triage): {role_only_skipped}")
+    print(f"  → Named-founder emails discovered: {named_founder_found}")
 
     if not filtered:
         print("  ⚠ No candidates after filtering — check data sources")
@@ -749,6 +991,24 @@ def main() -> None:
         print(f"\nAll lead emails:")
         for wf in created:
             print(f"  {wf['icp_score']:.2f} | {wf['lead_email']} | {wf['company']} | {wf['workflow_id']}")
+
+    # ── ICP strict-mode digest (for heartbeat/briefing ingestion) ───────────────
+    _queued_count = len(created)
+    print(f"\n── ICP STRICT-MODE DIGEST ────────────────────────────────────────────")
+    _digest_line = (
+        f"ICP strict-mode 24h: candidates_scored={len(scored)}, "
+        f"role-only_skipped={role_only_skipped}, "
+        f"named-founder_found={named_founder_found}, "
+        f"queued={_queued_count}"
+    )
+    print(_digest_line)
+    print(f"────────────────────────────────────────────────────────────────────")
+
+    # Write digest to briefing file for heartbeat ingestion
+    _briefing_dir = VAULT / "control" / "briefings"
+    _briefing_dir.mkdir(parents=True, exist_ok=True)
+    _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    (_briefing_dir / f"icp-strict-mode-{_today}.txt").write_text(_digest_line + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

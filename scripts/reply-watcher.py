@@ -751,6 +751,12 @@ def main() -> int:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
+    # Kill-switch: set RICK_REPLY_WATCHER_LIVE=1 in rick.env to enable DB writes + alerts
+    live_flag = os.getenv("RICK_REPLY_WATCHER_LIVE", "0").strip() == "1"
+    if not live_flag and not args.dry_run:
+        print("[reply-watcher] RICK_REPLY_WATCHER_LIVE not set — forcing dry-run. Set RICK_REPLY_WATCHER_LIVE=1 to enable.")
+        args.dry_run = True
+
     result = run(dry_run=args.dry_run, verbose=args.verbose)
     mode   = "[DRY-RUN] " if args.dry_run else ""
     print(

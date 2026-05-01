@@ -215,6 +215,11 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=10)
     args = ap.parse_args()
 
+    # Kill-switch: even with --live, require RICK_REPLY_ROUTER_LIVE=1
+    if not args.dry_run and os.getenv("RICK_REPLY_ROUTER_LIVE", "0").strip() != "1":
+        print("[reply-classifier] RICK_REPLY_ROUTER_LIVE not set — forcing dry-run. Set RICK_REPLY_ROUTER_LIVE=1 to enable.")
+        args.dry_run = True
+
     TRIAGE_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(TRIAGE_DIR.glob("inbound-*.jsonl"))
     if not files:

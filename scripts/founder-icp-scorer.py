@@ -89,6 +89,55 @@ SOCIAL_TERMS = {
     "building in public", "#buildinpublic", "#indiehackers", "#startup", "#ship",
 }
 
+# ── Role-account pre-filter ───────────────────────────────────────────────────
+# NEVER score role/shared inboxes — they are never a named founder.
+# Adding a new prefix here is the single source of truth (scorer + pipeline share this pattern).
+ROLE_ACCOUNT_PREFIXES: frozenset = frozenset({
+    "hello", "hi", "info", "contact", "admin", "support", "help",
+    "team", "no-reply", "noreply", "privacy", "legal", "security",
+    "abuse", "billing", "sales", "marketing", "press", "media",
+    "careers", "jobs", "feedback", "service", "office", "mail",
+    "post", "data", "gdpr", "ops", "operations", "general",
+    "enquiries", "enquiry", "inquiry", "inquiries",
+})
+
+
+def is_role_account(email: str) -> bool:
+    """Return True if email looks like a role/shared inbox rather than a named person."""
+    local = email.lower().split("@")[0] if "@" in email else email.lower()
+    if local in ROLE_ACCOUNT_PREFIXES:
+        return True
+    for prefix in ROLE_ACCOUNT_PREFIXES:
+        if local.startswith(f"{prefix}+") or local.startswith(f"{prefix}.") or local.startswith(f"{prefix}_"):
+            return True
+    return False
+
+
+def _role_account_rejection(
+    email: str, domain: str = "", homepage_url: str = "", extra: dict | None = None
+) -> dict[str, Any]:
+    """Standard rejection record for role/shared-inbox emails — zero LLM cost incurred."""
+    result: dict[str, Any] = {
+        "email": email,
+        "domain": domain,
+        "homepage_url": homepage_url,
+        "homepage_excerpt": "",
+        "score": 0.0,
+        "label": "role-account",
+        "reasoning": f"Pre-filtered: '{email.split('@')[0]}@' is a role/shared inbox — not a named founder.",
+        "confidence": 1.0,
+        "positive_signals": [],
+        "negative_signals": ["role-account email"],
+        "recommended_action": "skip",
+        "model_used": "pre-filter",
+        "route": "pre-filter",
+        "heuristic": {},
+        "role_account": True,
+    }
+    if extra:
+        result.update(extra)
+    return result
+
 
 def _strip_html(raw: str) -> str:
     text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
@@ -296,6 +345,12 @@ def llm_score(email: str, domain: str, homepage_text: str, heuristic: dict[str, 
 
 
 def score_lead(email: str = "", domain: str = "", homepage_text: str = "", homepage_url: str = "") -> dict[str, Any]:
+    # ── Role-account gate: bail out before any network fetch or LLM spend ─────
+    # file:scripts/founder-icp-scorer.py (this line) is the strict filter point.
+    _ec = (email or "").lower().strip()
+    if _ec and is_role_account(_ec):
+        return _role_account_rejection(_ec, domain, homepage_url)
+    # ─────────────────────────────────────────────────────────────────────────
     if not homepage_text and homepage_url:
         homepage_text, source_url = fetch_homepage_text(homepage_url)
     else:
@@ -364,6 +419,14 @@ def _as_row(record: dict[str, Any]) -> dict[str, Any]:
     domain = record.get("domain") or record.get("website") or ""
     homepage_text = record.get("homepage_text") or record.get("homepage") or record.get("context") or ""
     homepage_url = record.get("homepage_url") or record.get("website") or record.get("url") or ""
+    _extra = {
+        "name": record.get("name") or record.get("lead_name") or record.get("company") or "",
+        "company": record.get("company") or record.get("product") or "",
+        "source": record.get("source") or record.get("source_kind") or "",
+    }
+    _ec = (email or "").lower().strip()
+    if _ec and is_role_account(_ec):
+        return _role_account_rejection(_ec, domain, homepage_url, _extra)
     scored = score_lead(email=email, domain=domain, homepage_text=homepage_text, homepage_url=homepage_url)
     scored.update({
         "name": record.get("name") or record.get("lead_name") or record.get("company") or "",
@@ -388,11 +451,21 @@ def main() -> int:
     if args.input_file:
         rows = _load_input_file(args.input_file)
         results = [_as_row(row) for row in rows]
+        _role_skipped = sum(1 for r in results if r.get("role_account"))
+        if _role_skipped:
+            print(
+                f"[role-account-filter] dropped {_role_skipped}/{len(results)} role-inbox emails "
+                f"(0 opus calls used for those)",
+                file=sys.stderr,
+            )
         if args.jsonl or args.json_only:
             for row in results:
                 print(json.dumps(row, ensure_ascii=False))
         else:
-            print(json.dumps({"count": len(results), "results": results}, indent=2, ensure_ascii=False))
+            print(json.dumps(
+                {"count": len(results), "role_account_skipped": _role_skipped, "results": results},
+                indent=2, ensure_ascii=False,
+            ))
         return 0
 
     scored = score_lead(

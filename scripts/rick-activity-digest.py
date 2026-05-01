@@ -1338,7 +1338,7 @@ def main() -> int:
     text = render(summary)
 
     dry = args.dry_run or args.print_only
-    if not dry and os.getenv("RICK_ACTIVITY_DIGEST_LIVE", "1").strip().lower() not in ("1", "true", "yes"):
+    if not dry and os.getenv("RICK_ACTIVITY_DIGEST_LIVE", "0").strip().lower() not in ("1", "true", "yes"):
         dry = True
 
     result = post_to_telegram(text, dry)
