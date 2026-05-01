@@ -121,6 +121,18 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     ("RICK_GMAIL_PERSONAL_LIVE", "outbound-dispatcher.jsonl", 48.0,
         lambda e: e.get("channel") == "gmail_personal"
         and e.get("status") == "sent"),
+    # funnel-pulse: 30m dashboard pulse (ad hoc or half-hour cron).
+    # 1h window = one missed cycle + slack. Snapshot file is the heartbeat
+    # source of truth for last successful run.
+    ("RICK_FUNNEL_PULSE_LIVE", "funnel-pulse.jsonl", 1.0,
+        lambda e: e.get("event") == "funnel.snapshot"),
+    # vlad-action-board: runs on-demand and via morning digest cron.
+    # 2h freshness window matches morning digest (08:00 PT) + 1h slack.
+    # Probe: run.done sentinel written by vlad-action-board.py --mark-flag
+    # or any normal run. If board hasn't run in >2h, surface as stale so
+    # Vlad knows the digest section may be outdated.
+    ("RICK_VLAD_ACTIONS_LIVE", "vlad-action-board.jsonl", 2.0,
+        lambda e: e.get("event") == "run.done"),
 ]
 
 

@@ -885,6 +885,24 @@ def gather() -> dict:
     except Exception:
         summary["flag_health"] = []
 
+    # Vlad Action Board — what Vlad needs to do right now.
+    # Gathered here so the digest can embed it as the last section.
+    try:
+        import importlib.util as _ilu
+        _vab_path = ROOT / "scripts" / "vlad-action-board.py"
+        _spec = _ilu.spec_from_file_location("vlad_action_board", _vab_path)
+        _vab = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_vab)
+        _tasks = _vab.gather_all()
+        summary["vlad_action_board"] = {
+            "tasks": [t.to_dict() for t in _tasks],
+            "p0_count": sum(1 for t in _tasks if t.priority == "P0"),
+            "overdue_count": sum(1 for t in _tasks if t.overdue),
+            "telegram_section": _vab.render_brief_telegram(_tasks),
+        }
+    except Exception as _vab_err:
+        summary["vlad_action_board"] = {"error": str(_vab_err)[:200], "tasks": []}
+
     # Media factory output split by provider (last 24h) — shows the hybrid in action.
     try:
         media_log = DATA_ROOT / "operations" / "media-factory.jsonl"
@@ -1304,6 +1322,17 @@ def render(s: dict) -> str:
 
     lines.append("")
     lines.append(f"_Suppression list: {s.get('suppression_total', 0)} entries_")
+
+    # ── Vlad Action Board (last section) ────────────────────────────────────────────
+    vab = s.get("vlad_action_board") or {}
+    vab_section = vab.get("telegram_section", "")
+    vab_err = vab.get("error")
+    if vab_section and vab_section.strip():
+        lines.append(vab_section)
+    elif vab_err:
+        lines.append(f"\n\u26a0\ufe0f Vlad Action Board error: {vab_err[:120]}")
+    elif vab.get("tasks") == []:
+        lines.append("\n\u2705 *Vlad Action Board*: nothing needs your attention today")
 
     return "\n".join(lines)
 
