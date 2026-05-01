@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""Reply-watcher — 10-minute active monitor for ICP cold-email sequences.
+
+Watches all sequence-active ICP workflows for:
+  (a) Inbound replies  → immediate escalation + auto-draft (opus-4-7)
+  (b) Resend opens     → warm-signal tracking (no escalation unless reply)
+
+On first reply detection:
+  1. Generates a draft response via claude-opus-4-7 / gpt-5.4 (NO auto-send)
+  2. Saves draft  → ~/rick-vault/mailbox/drafts/auto/{wf_id}.json
+  3. Fires notify_operator_deduped with PURPOSE=revenue (bypasses dedup)
+  4. Marks workflow stage='replied' so sequencer stops Day-3+ touches
+  5. Writes reply-watcher.jsonl event row
+  6. Updates digest: "Reply watch {elapsed}h: {N} replies, {M} opens"
+
+Gmail IMAP is checked when GMAIL_IMAP_USER + GMAIL_APP_PASSWORD are set.
+Resend email opens are cross-checked via API for each tracked email ID.
+
+State file: ~/rick-vault/control/reply-watcher-state.json
+  {
+    "handled": { "<wf_id>": "<iso_ts>" },      # already escalated
+    "open_signals": { "<email>": "<iso_ts>" },  # first open detected
+    "last_run": "<iso_ts>"
+  }
+
+Usage:
+    python3 scripts/reply-watcher.py              # normal run
+    python3 scripts/reply-watcher.py --dry-run    # no DB writes / no alerts
+    python3 scripts/reply-watcher.py --verbose    # extra output
+"""
+
+from __future__ import annotations
+
+import argparse
+import imaplib
+import email as email_module
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Paths & config
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+DATA_ROOT   = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+DB_PATH     = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
+STATE_FILE  = DATA_ROOT / "control" / "reply-watcher-state.json"
+LOG_FILE    = DATA_ROOT / "operations" / "reply-watcher.jsonl"
+DRAFT_DIR   = DATA_ROOT / "mailbox" / "drafts" / "auto"
+TRIAGE_DIR  = DATA_ROOT / "mailbox" / "triage"
+
+# Models — smart-models invariant: only full models for draft generation
+DRAFT_MODEL_ANTHROPIC = "claude-opus-4-7"
+DRAFT_MODEL_OPENAI    = "gpt-4o"     # fallback if Anthropic unavailable
+REPLY_WATCH_HOURS     = 7 * 24      # scan window for reply-router.jsonl
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _elapsed_hours(since_iso: str) -> float:
+    """Hours since an ISO timestamp (UTC)."""
+    try:
+        if since_iso.endswith("Z"):
+            since_iso = since_iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(since_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    except Exception:
+        return 0.0
+
+
+def _log_event(row: dict) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"handled": {}, "open_signals": {}, "last_run": ""}
+
+
+def _save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 1. Load sequence-active ICP workflows
+# ---------------------------------------------------------------------------
+
+def _load_icp_workflows(conn) -> list[dict]:
+    """Return all sequence-active ICP workflows with email + send context.
+    
+    Handles both flat context_json (email at top level) and nested
+    trigger_payload.email structures used by the founder-discovery pipeline.
+    """
+    rows = conn.execute(
+        """
+        SELECT w.id, w.title, w.stage, w.context_json, w.created_at,
+               oj.id AS ob_id,
+               json_extract(oj.result_json,'$.resend_id') AS resend_id,
+               json_extract(oj.payload_json,'$.subject') AS sent_subject,
+               json_extract(oj.payload_json,'$.body_md')  AS sent_body
+        FROM   workflows w
+        LEFT   JOIN outbound_jobs oj ON oj.lead_id = w.id
+                                    AND oj.channel = 'email'
+        WHERE  w.stage = 'sequence-active'
+          AND  w.kind  = 'qualified_lead'
+        ORDER  BY w.created_at ASC
+        """,
+    ).fetchall()
+
+    seen: dict[str, dict] = {}
+    for r in rows:
+        wf_id = r["id"]
+        ctx = json.loads(r["context_json"]) if r["context_json"] else {}
+        # Email may be at top-level or nested under trigger_payload
+        tp    = ctx.get("trigger_payload") or {}
+        email = (
+            ctx.get("email") or
+            tp.get("email") or
+            ""
+        ).lower().strip()
+        if not email:
+            continue
+        if wf_id not in seen:
+            seen[wf_id] = {
+                "wf_id":        wf_id,
+                "title":        r["title"],
+                "stage":        r["stage"],
+                "email":        email,
+                "name":         ctx.get("name") or tp.get("name") or "",
+                "company":      ctx.get("company") or tp.get("company") or tp.get("domain") or "",
+                "opener_body":  ctx.get("opener_body") or r["sent_body"] or "",
+                "opener_subj":  ctx.get("opener_subject") or r["sent_subject"] or "",
+                "icp_score":    ctx.get("icp_score") or tp.get("icp_score") or 0,
+                "created_at":   r["created_at"] or "",
+                "resend_id":    r["resend_id"] or "",
+                "ob_id":        r["ob_id"] or "",
+            }
+        elif r["resend_id"] and not seen[wf_id]["resend_id"]:
+            seen[wf_id]["resend_id"] = r["resend_id"]
+
+    return list(seen.values())
+
+
+# ---------------------------------------------------------------------------
+# 2. Reply detection
+# ---------------------------------------------------------------------------
+
+def _load_reply_router(cutoff_iso: str) -> dict[str, dict]:
+    """Return {email: row} from reply-router.jsonl since cutoff."""
+    replies: dict[str, dict] = {}
+    path = DATA_ROOT / "operations" / "reply-router.jsonl"
+    if not path.exists():
+        return replies
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+            ts  = r.get("ran_at", "")
+            em  = r.get("email", "").lower().strip()
+            if ts >= cutoff_iso and em and em not in replies:
+                replies[em] = {
+                    "ts":      ts,
+                    "label":   r.get("label", ""),
+                    "body":    r.get("body", r.get("subject", "")),
+                    "source":  "reply-router",
+                    "raw":     r,
+                }
+        except Exception:
+            pass
+    return replies
+
+
+def _load_triage_files(cutoff_iso: str) -> dict[str, dict]:
+    """Return {email: row} from mailbox/triage/inbound-*.jsonl files."""
+    replies: dict[str, dict] = {}
+    if not TRIAGE_DIR.exists():
+        return replies
+    today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    for day in (today, yesterday):
+        tpath = TRIAGE_DIR / f"inbound-{day}.jsonl"
+        if not tpath.exists():
+            continue
+        for line in tpath.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r   = json.loads(line)
+                ts  = r.get("classified_at") or r.get("ingested_at", "")
+                em  = r.get("from", "").lower().strip()
+                if ts >= cutoff_iso and em and em not in replies:
+                    replies[em] = {
+                        "ts":     ts,
+                        "label":  r.get("classification", ""),
+                        "body":   r.get("body", r.get("subject", "")),
+                        "source": f"inbound-{day}",
+                        "raw":    r,
+                    }
+            except Exception:
+                pass
+    return replies
+
+
+def _check_gmail_imap(target_emails: set[str], cutoff_iso: str, verbose: bool = False) -> dict[str, dict]:
+    """Check Gmail IMAP for unread replies from target emails.
+    
+    Returns {email: reply_dict} if found. Skips gracefully when creds absent.
+    """
+    replies: dict[str, dict] = {}
+    imap_user = os.getenv("GMAIL_IMAP_USER", "").strip()
+    app_pass  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    if not imap_user or not app_pass:
+        if verbose:
+            print("  [imap] GMAIL_IMAP_USER / GMAIL_APP_PASSWORD not set — skipping IMAP check")
+        return replies
+
+    try:
+        conn = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        conn.login(imap_user, app_pass)
+        conn.select("INBOX")
+
+        # Search unread since cutoff date
+        since_date = datetime.fromisoformat(cutoff_iso.replace("Z", "+00:00")).strftime("%d-%b-%Y")
+        _, msg_ids = conn.search(None, f'(UNSEEN SINCE "{since_date}")')
+        id_list = msg_ids[0].split() if msg_ids[0] else []
+
+        for mid in id_list[:50]:  # cap at 50 to stay fast
+            _, data = conn.fetch(mid, "(RFC822)")
+            raw = data[0][1] if data and data[0] else b""
+            msg = email_module.message_from_bytes(raw)
+            from_addr = email_module.utils.parseaddr(msg.get("From", ""))[1].lower().strip()
+            if from_addr not in target_emails:
+                continue
+            # Extract text body
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    if ct == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+
+            replies[from_addr] = {
+                "ts":     _now_iso(),
+                "label":  "imap_unread",
+                "body":   body[:2000],
+                "source": "gmail-imap",
+                "raw":    {"subject": msg.get("Subject",""), "from": msg.get("From","")},
+            }
+
+        conn.logout()
+        if verbose and replies:
+            print(f"  [imap] Found {len(replies)} unread replies from target emails")
+
+    except Exception as exc:
+        if verbose:
+            print(f"  [imap] Error: {exc}")
+
+    return replies
+
+
+# ---------------------------------------------------------------------------
+# 3. Resend opens
+# ---------------------------------------------------------------------------
+
+def _check_resend_opens(wfs: list[dict], verbose: bool = False) -> dict[str, str]:
+    """Query Resend API for email open events.
+    
+    Returns {email: first_open_ts} for opened emails.
+    """
+    opens: dict[str, str] = {}
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return opens
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        # Build email→wf_id map from those with resend_id
+        resend_id_map: dict[str, str] = {}   # resend_id → email
+        for wf in wfs:
+            if wf["resend_id"]:
+                resend_id_map[wf["resend_id"]] = wf["email"]
+
+        # For workflows without a stored resend_id, search by recipient in the bulk list
+        email_set = {wf["email"] for wf in wfs}
+        email_to_resend: dict[str, list[str]] = {e: [] for e in email_set}
+
+        # Fetch recent 100 emails from Resend
+        req = urllib.request.Request(
+            "https://api.resend.com/emails?limit=100",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        for em_rec in data.get("data", []):
+            rid   = em_rec.get("id", "")
+            to_list = em_rec.get("to", [])
+            evt   = em_rec.get("last_event", "")
+            for to_addr in to_list:
+                norm = to_addr.lower().strip()
+                if norm in email_set:
+                    email_to_resend[norm].append(rid)
+                    if evt == "opened":
+                        opens[norm] = em_rec.get("created_at", _now_iso())
+                        if verbose:
+                            print(f"  [resend] Open detected: {norm} | resend_id={rid}")
+
+        # For emails with stored resend_id, fetch individual event detail
+        for rid, em_addr in resend_id_map.items():
+            if em_addr in opens:
+                continue
+            try:
+                req2 = urllib.request.Request(
+                    f"https://api.resend.com/emails/{rid}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                with urllib.request.urlopen(req2, timeout=8) as resp2:
+                    detail = json.loads(resp2.read())
+                if detail.get("last_event") == "opened":
+                    opens[em_addr] = detail.get("created_at", _now_iso())
+                    if verbose:
+                        print(f"  [resend] Open confirmed via detail: {em_addr}")
+            except Exception:
+                pass
+
+    except Exception as exc:
+        if verbose:
+            print(f"  [resend] API error: {exc}")
+
+    return opens
+
+
+# ---------------------------------------------------------------------------
+# 4. Auto-drafter — opus-4-7 / gpt-5.4 only
+# ---------------------------------------------------------------------------
+
+def _generate_draft(wf: dict, reply_body: str, reply_label: str, dry_run: bool, verbose: bool) -> dict | None:
+    """Generate a reply draft using claude-opus-4-7. Falls back to gpt-5.4.
+    
+    NO auto-send. Returns draft dict or None on failure.
+    """
+    if dry_run:
+        return {
+            "draft_body": f"[DRY-RUN DRAFT]\nRe: {wf['opener_subj']}\n\nThanks for replying, {wf['name']}. [Generated response would appear here]",
+            "model":      DRAFT_MODEL_ANTHROPIC,
+            "dry_run":    True,
+        }
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    openai_key    = os.getenv("OPENAI_API_KEY", "").strip()
+
+    prompt = f"""You are Rick, AI CEO of meetrick.ai — sharp, warm, commercially serious. 
+Draft a reply to this cold-email response. 
+
+PROSPECT: {wf['name']} at {wf['company']} (ICP score: {wf['icp_score']})
+ORIGINAL EMAIL SUBJECT: {wf['opener_subj']}
+ORIGINAL EMAIL BODY:
+{wf['opener_body']}
+
+PROSPECT'S REPLY:
+{reply_body[:1500]}
+
+REPLY INTENT LABEL: {reply_label}
+
+Draft a reply that:
+- Acknowledges their specific message naturally (no "Great question!" opener)
+- Moves toward a concrete next step (call booking, demo, or clarifying question)
+- Is 3-5 sentences max — punchy, not corporate
+- Signs off as Rick, AI CEO, meetrick.ai
+- NO auto-send: this is for Vlad's review. Write the email body only, no subject line.
+
+If label is 'not_interested' or 'unsubscribe': write a graceful 1-sentence close.
+If label is 'sales_inquiry': move toward a 15-min call.
+If label is 'question': answer directly + CTA."""
+
+    # Try Anthropic first
+    if anthropic_key:
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model":      DRAFT_MODEL_ANTHROPIC,
+                "max_tokens": 500,
+                "messages":   [{"role": "user", "content": prompt}],
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                headers={
+                    "x-api-key":         anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            body = result["content"][0]["text"].strip()
+            return {"draft_body": body, "model": DRAFT_MODEL_ANTHROPIC, "prompt_tokens": result.get("usage", {}).get("input_tokens", 0)}
+        except Exception as exc:
+            if verbose:
+                print(f"  [drafter] Anthropic error: {exc}")
+
+    # Fallback: OpenAI gpt-5.4
+    if openai_key:
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model":    DRAFT_MODEL_OPENAI,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500,
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type":  "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            body = result["choices"][0]["message"]["content"].strip()
+            return {"draft_body": body, "model": DRAFT_MODEL_OPENAI}
+        except Exception as exc:
+            if verbose:
+                print(f"  [drafter] OpenAI error: {exc}")
+
+    return None
+
+
+def _save_draft(wf_id: str, wf: dict, draft: dict, reply_info: dict) -> str:
+    """Save draft to ~/rick-vault/mailbox/drafts/auto/{wf_id}.json. Returns path."""
+    DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    path = DRAFT_DIR / f"{wf_id}.json"
+    payload = {
+        "wf_id":          wf_id,
+        "prospect_email": wf["email"],
+        "prospect_name":  wf["name"],
+        "company":        wf["company"],
+        "reply_body":     reply_info.get("body", ""),
+        "reply_label":    reply_info.get("label", ""),
+        "reply_ts":       reply_info.get("ts", ""),
+        "reply_source":   reply_info.get("source", ""),
+        "draft_body":     draft.get("draft_body", ""),
+        "draft_subject":  f"Re: {wf['opener_subj']}",
+        "model":          draft.get("model", ""),
+        "review_required": True,
+        "auto_send":      False,
+        "created_at":     _now_iso(),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# 5. Workflow stage update
+# ---------------------------------------------------------------------------
+
+def _mark_replied(conn, wf_id: str, dry_run: bool) -> None:
+    """Set stage='replied' on the workflow so sequencer stops Day-3+ touches."""
+    if dry_run:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "UPDATE workflows SET stage='replied', updated_at=? WHERE id=?",
+        (now, wf_id),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# 6. Notify operator
+# ---------------------------------------------------------------------------
+
+def _fire_alert(conn, wf: dict, reply_info: dict, draft_path: str, dry_run: bool, verbose: bool) -> str:
+    """Fire notify_operator_deduped with purpose=revenue (bypasses dedup). Returns result."""
+    if dry_run:
+        print(f"  [DRY-RUN] ALERT: 🎯 REPLY from {wf['email']} ({wf['company']}) | label={reply_info.get('label','?')} | draft→{draft_path}")
+        return "dry-run"
+    try:
+        from runtime.engine import notify_operator_deduped
+    except ImportError:
+        print("  [alert] ImportError: runtime.engine not found")
+        return "import-error"
+
+    preview = reply_info.get("body", "")[:300].replace("\n", " ")
+    text = (
+        f"🎯 REPLY DETECTED — {wf['name']} @ {wf['company']} ({wf['email']})\n"
+        f"Label: {reply_info.get('label','?')} | ICP: {wf['icp_score']}\n"
+        f"Preview: {preview}\n"
+        f"Draft staged: {Path(draft_path).name} (review required — NO auto-send)\n"
+        f"wf_id: {wf['wf_id']}"
+    )
+    result = notify_operator_deduped(
+        conn,
+        text,
+        kind="reply_watcher_hit",
+        dedup_window_hours=168,
+        workflow_id=wf["wf_id"],
+        lane="outreach",
+        purpose="revenue",     # URGENT — bypasses dedup
+    )
+    return result
+
+
+def _fire_open_signal(conn, email: str, wf: dict, open_ts: str, dry_run: bool, verbose: bool) -> str:
+    """Warm-signal alert for an open without a reply. Deduped per wf (24h)."""
+    if dry_run:
+        if verbose:
+            print(f"  [DRY-RUN] OPEN signal: {email} @ {wf.get('company','?')}")
+        return "dry-run"
+    try:
+        from runtime.engine import notify_operator_deduped
+    except ImportError:
+        return "import-error"
+
+    text = (
+        f"👁 OPEN SIGNAL — {wf.get('name','')} @ {wf.get('company','')} ({email}) "
+        f"opened the outreach email. No reply yet. Warming.\n"
+        f"wf_id: {wf.get('wf_id','')}"
+    )
+    return notify_operator_deduped(
+        conn,
+        text,
+        kind="reply_watcher_open",
+        dedup_window_hours=24,
+        workflow_id=wf.get("wf_id"),
+        lane="outreach",
+        purpose="ops",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Digest update
+# ---------------------------------------------------------------------------
+
+def _update_digest(n_replies: int, n_opens: int, elapsed_h: float, wf_count: int) -> None:
+    """Append a reply-watch line to today's activity digest / daily note."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    digest_path = DATA_ROOT / "control" / "briefings" / f"reply-watch-{today}.md"
+    line = (
+        f"Reply watch {elapsed_h:.0f}h: {n_replies} replies, "
+        f"{n_opens} opens (watching {wf_count} ICP wfs)\n"
+    )
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    with digest_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{_now_iso()}] {line}")
+
+    # Also append to daily note
+    daily_note = DATA_ROOT / "memory" / f"{today}.md"
+    if daily_note.exists():
+        content = daily_note.read_text(encoding="utf-8")
+        marker  = "## Reply Watch"
+        if marker not in content:
+            with daily_note.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n{marker}\n- {line}")
+        else:
+            # Replace last line under that marker
+            lines = content.splitlines()
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].startswith("- Reply watch"):
+                    lines[i] = f"- {line.strip()}"
+                    break
+            else:
+                # append under marker
+                idx = next(i for i, l in enumerate(lines) if l.startswith(marker))
+                lines.insert(idx + 1, f"- {line.strip()}")
+            daily_note.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Core run
+# ---------------------------------------------------------------------------
+
+def run(dry_run: bool = False, verbose: bool = False) -> dict:
+    import sqlite3
+
+    state = _load_state()
+    handled: dict[str, str] = state.get("handled", {})
+    open_signals: dict[str, str] = state.get("open_signals", {})
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        # 1. Load ICP workflows
+        wfs = _load_icp_workflows(conn)
+        if not wfs:
+            msg = f"reply-watcher: 0 sequence-active ICP workflows found"
+            if verbose:
+                print(msg)
+            _log_event({"ts": _now_iso(), "event": "no_wfs", "wf_count": 0})
+            return {"wf_count": 0, "new_replies": 0, "new_opens": 0, "elapsed_h": 0.0}
+
+        if verbose:
+            print(f"Watching {len(wfs)} sequence-active ICP wf(s):")
+            for w in wfs:
+                print(f"  {w['wf_id']} | {w['email']} | {w['company']} | elapsed {_elapsed_hours(w['created_at']):.1f}h")
+
+        email_to_wf = {w["email"]: w for w in wfs}
+        target_emails = set(email_to_wf.keys())
+
+        # 2. Load replies from all sources
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=REPLY_WATCH_HOURS)).isoformat(timespec="seconds") + "Z"
+        reply_map = _load_reply_router(cutoff_iso)
+        reply_map.update(_load_triage_files(cutoff_iso))  # triage files win
+        reply_map.update(_check_gmail_imap(target_emails, cutoff_iso, verbose=verbose))
+
+        # 3. Check Resend opens
+        open_map = _check_resend_opens(wfs, verbose=verbose)
+
+        # 4. Process each ICP workflow
+        new_replies = 0
+        new_opens   = 0
+
+        for wf in wfs:
+            wf_id  = wf["wf_id"]
+            em     = wf["email"]
+
+            # --- Reply handling ---
+            reply_info = reply_map.get(em)
+            already_handled = wf_id in handled
+
+            if reply_info and not already_handled:
+                new_replies += 1
+                if verbose:
+                    print(f"\n  *** REPLY: {em} ({wf['company']}) label={reply_info.get('label','?')}")
+
+                # Generate draft (smart-models invariant: opus-4-7 / gpt-5.4 only)
+                draft = _generate_draft(wf, reply_info.get("body", ""), reply_info.get("label", ""), dry_run, verbose)
+                draft_path = ""
+                if draft:
+                    draft_path = _save_draft(wf_id, wf, draft, reply_info)
+                    if verbose:
+                        print(f"  Draft saved: {draft_path}")
+                else:
+                    if verbose:
+                        print(f"  WARNING: Draft generation failed for {wf_id}")
+
+                # Fire alert
+                alert_result = _fire_alert(conn, wf, reply_info, draft_path, dry_run, verbose)
+
+                # Mark replied (stop Day-3+ sequencer touches)
+                _mark_replied(conn, wf_id, dry_run)
+
+                # Update state
+                if not dry_run:
+                    handled[wf_id] = _now_iso()
+
+                # Log event
+                _log_event({
+                    "ts":          _now_iso(),
+                    "event":       "reply_detected",
+                    "wf_id":       wf_id,
+                    "email":       em,
+                    "company":     wf["company"],
+                    "label":       reply_info.get("label", ""),
+                    "source":      reply_info.get("source", ""),
+                    "draft_path":  draft_path,
+                    "alert":       alert_result,
+                    "dry_run":     dry_run,
+                })
+
+            # --- Open signal handling (only if not already replied) ---
+            open_ts = open_map.get(em)
+            if open_ts and em not in open_signals and not reply_info:
+                new_opens += 1
+                open_result = _fire_open_signal(conn, em, wf, open_ts, dry_run, verbose)
+                if not dry_run:
+                    open_signals[em] = open_ts
+                _log_event({
+                    "ts":     _now_iso(),
+                    "event":  "open_detected",
+                    "wf_id":  wf_id,
+                    "email":  em,
+                    "company": wf["company"],
+                    "open_ts": open_ts,
+                    "alert":  open_result,
+                    "dry_run": dry_run,
+                })
+                if verbose:
+                    print(f"  OPEN: {em} @ {wf['company']}")
+
+        # 5. Compute elapsed hours since earliest sequence start
+        earliest_ts = min((w["created_at"] for w in wfs), default=_now_iso())
+        elapsed_h   = _elapsed_hours(earliest_ts)
+
+        # 6. Update digest
+        if not dry_run:
+            _update_digest(new_replies, new_opens, elapsed_h, len(wfs))
+
+        # 7. Save state
+        state["handled"]      = handled
+        state["open_signals"] = open_signals
+        state["last_run"]     = _now_iso()
+        if not dry_run:
+            _save_state(state)
+
+        summary = {
+            "ts":          _now_iso(),
+            "wf_count":    len(wfs),
+            "new_replies": new_replies,
+            "new_opens":   new_opens,
+            "elapsed_h":   round(elapsed_h, 1),
+            "dry_run":     dry_run,
+        }
+        _log_event({"event": "run_summary", **summary})
+        return summary
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Reply-watcher: 10-min ICP reply monitor")
+    parser.add_argument("--dry-run", action="store_true", help="No DB writes / no alerts")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    args = parser.parse_args()
+
+    result = run(dry_run=args.dry_run, verbose=args.verbose)
+    mode   = "[DRY-RUN] " if args.dry_run else ""
+    print(
+        f"{mode}reply-watcher | "
+        f"watching={result['wf_count']} wfs | "
+        f"elapsed={result['elapsed_h']}h | "
+        f"new_replies={result['new_replies']} | "
+        f"new_opens={result['new_opens']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
