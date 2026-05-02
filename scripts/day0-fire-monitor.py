@@ -33,9 +33,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
-DB_PATH   = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
-OUT_FILE  = DATA_ROOT / "operations" / "day0-fire-monitor.jsonl"
+DATA_ROOT        = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+DB_PATH          = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
+OUT_FILE         = DATA_ROOT / "operations" / "day0-fire-monitor.jsonl"
+ALERTED_FILE     = DATA_ROOT / "control" / "day0-first-reply-alerted.json"
+
+
+def _load_alerted_wf_ids() -> set:
+    """Return set of wf_ids already alerted so we don't re-fire on every cron run."""
+    if ALERTED_FILE.exists():
+        try:
+            return set(json.loads(ALERTED_FILE.read_text(encoding="utf-8")).get("alerted", []))
+        except Exception:
+            return set()
+    return set()
+
+
+def _mark_wf_alerted(wf_id: str) -> None:
+    """Persist wf_id so future runs skip re-alerting."""
+    try:
+        existing = _load_alerted_wf_ids()
+        existing.add(wf_id)
+        ALERTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ALERTED_FILE.write_text(json.dumps({"alerted": sorted(existing)}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,6 +228,9 @@ def _fire_first_reply_alert(
     """Send notify_operator_deduped for the first sequencer reply. Returns result string."""
     if dry_run:
         return "dry-run"
+    # Skip if already alerted for this wf_id (prevents repeat-fire on every cron cycle)
+    if wf_id in _load_alerted_wf_ids():
+        return "already-alerted"
     try:
         from runtime.engine import notify_operator_deduped  # noqa: PLC0415
     except ImportError:
@@ -224,6 +249,8 @@ def _fire_first_reply_alert(
         lane="outreach",
         purpose="revenue",               # bypasses dedup (URGENT_PURPOSES list)
     )
+    if result in ("sent_first", "sent_with_count"):
+        _mark_wf_alerted(wf_id)         # persist so future runs skip re-alerting
     return result
 
 

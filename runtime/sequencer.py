@@ -34,6 +34,8 @@ fire_call() pattern) rather than subprocess, so we can capture the result.
 
 from __future__ import annotations
 
+import importlib.util
+import hashlib
 import json
 import os
 import sqlite3
@@ -41,6 +43,7 @@ import sys
 import urllib.request
 import urllib.error
 import uuid
+from functools import lru_cache
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -55,6 +58,7 @@ if str(REPO_ROOT) not in sys.path:
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 LOG_FILE = DATA_ROOT / "operations" / "sequencer.jsonl"
+WARMUP_SCRIPT = REPO_ROOT / "scripts" / "sender-warmup-schedule.py"
 
 # ElevenLabs outbound call (from MEMORY.md)
 ELEVEN_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_2101km115w7wfb4b198k8khthfnb")
@@ -115,10 +119,9 @@ SEQUENCE: list[dict[str, Any]] = [
 
 TERMINAL_TOUCH_KINDS = {"email-breakup"}  # after this, sequence is done
 
-# Max touches dispatched per tick — keeps heartbeat from blocking on N LLM calls.
-# With opus personalization at ~25s/call, 3 touches = ~75s max per heartbeat beat.
-# Remaining workflows are picked up on the next heartbeat tick.
-MAX_DISPATCHES_PER_TICK = 3
+# Max touches dispatched per tick — warmup Day 1 is 5, so the sequencer can
+# clear a full daily email allotment in one heartbeat if needed.
+MAX_DISPATCHES_PER_TICK = 5
 QUALIFYING_STAGES = {
     "cold-email-pending",
     "sequence-active",
@@ -172,6 +175,66 @@ def _touch_done(seq: dict, kind: str) -> bool:
     return False
 
 
+def _has_sent_touch(seq: dict, kind: str) -> bool:
+    """Return True if touch_log contains a sent record for *kind*."""
+    for entry in seq.get("touch_log", []):
+        if entry.get("kind") == kind and entry.get("status") == "sent":
+            return True
+    return False
+
+
+@lru_cache(maxsize=1)
+def _warmup_module():
+    spec = importlib.util.spec_from_file_location("sender_warmup_schedule", WARMUP_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load warmup schedule script: {WARMUP_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _today_warmup_cap() -> int:
+    try:
+        return int(_warmup_module().get_today_cap())
+    except Exception:
+        return 5
+
+
+def _count_email_dispatches_today(conn: sqlite3.Connection) -> int:
+    """Count email touches already attempted today in workflow touch_log."""
+    today = _now_iso()[:10]
+    total = 0
+    try:
+        rows = conn.execute(
+            """
+            SELECT context_json
+              FROM workflows
+             WHERE kind = 'qualified_lead'
+            """
+        ).fetchall()
+    except Exception:
+        return 0
+
+    for row in rows:
+        try:
+            ctx = json.loads(row[0] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(ctx, dict):
+            continue
+        seq = ctx.get("seq")
+        if not isinstance(seq, dict):
+            continue
+        for entry in seq.get("touch_log", []):
+            if entry.get("channel") != "email":
+                continue
+            if entry.get("status") in {"skipped", "error"}:
+                continue
+            if str(entry.get("sent_at", ""))[:10] == today:
+                total += 1
+    return total
+
+
 def _days_since_start(seq: dict) -> int:
     """Days elapsed since sequence_started_at (0 if not set = Day 0 ready)."""
     started = seq.get("sequence_started_at")
@@ -181,6 +244,23 @@ def _days_since_start(seq: dict) -> int:
         return (_now() - datetime.fromisoformat(started)).days
     except (ValueError, TypeError):
         return 0
+
+
+def _cold_opener_variant(ctx: dict) -> str:
+    """Deterministically split Day-0 cold openers into v1/v2."""
+    _tp = ctx.get("trigger_payload") or {}
+    key = (
+        ctx.get("email")
+        or _tp.get("email")
+        or ctx.get("company")
+        or _tp.get("domain")
+        or ctx.get("name")
+        or _tp.get("name")
+        or ""
+    ).strip().lower()
+    if not key:
+        return "v1"
+    return "v2" if hashlib.sha1(key.encode("utf-8")).digest()[0] % 2 else "v1"
 
 
 def _save_context(conn: sqlite3.Connection, workflow_id: str, ctx: dict) -> None:
@@ -277,38 +357,68 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
             except Exception:
                 _prior_comms_block = ""
 
-            prompt = (
-                _prior_comms_block +
-                "TASK: Write a cold outreach email. Output only the email — no analysis, "
-                "no review commentary, no caveats.\n\n"
-                "You are Rick, AI CEO at meetrick.ai. Write a short, sharp cold outreach email "
-                "for this B2B lead. Goal: get ONE reply.\n\n"
-                f"Lead name/company: {name}\n"
-                f"Email: {email}\n"
-                f"Company domain: {company}\n\n"
-                "Output format (exactly this structure):\n"
-                "SUBJECT: <subject line, max 8 words>\n"
-                "BODY:\n"
-                "<2-3 paragraphs, plain text, no markdown, no em dashes>\n\n"
-                "Rules:\n"
-                "- Open with a specific observation about their business or market\n"
-                "- Reference Rick (meetrick.ai) and one concrete outcome\n"
-                "- CTA: single question, not a pitch\n"
-                "- Sign off: Rick\n"
-                "- If PRIOR COMMUNICATIONS are shown above, do NOT repeat angles, "
-                "subjects, or CTAs already used\n"
-                "- Do NOT include disclaimers, analysis, or refusals\n"
-                "Write the email now."
-            )
-            fallback = (
-                f"SUBJECT: Quick question for {company}\n"
-                f"BODY:\nHi {name},\n\nI've been watching what you're building at {company} — "
-                "the market is moving fast and the operators who wire AI into their ops early tend "
-                "to compound. I'm Rick, an AI CEO running meetrick.ai — we help founders and operators "
-                "deploy AI that actually drives revenue, not just demos.\n\n"
-                "One question: what's the part of your business where a faster feedback loop "
-                "would change the game the most right now?\n\nRick"
-            )
+            variant = _cold_opener_variant(ctx)
+            if variant == "v2":
+                prompt = (
+                    _prior_comms_block +
+                    "TASK: Write a cold outreach email. Output only the email — no analysis, "
+                    "no review commentary, no caveats.\n\n"
+                    "You are Rick, AI CEO at meetrick.ai. Write a very short cold email for this B2B lead. "
+                    "Goal: get ONE reply.\n\n"
+                    f"Lead name/company: {name}\n"
+                    f"Email: {email}\n"
+                    f"Company domain: {company}\n\n"
+                    "Variant v2 opener template:\n"
+                    "- Subject should preview the specific value or pain point, not 'quick question'\n"
+                    "- Body must be 45-60 words max\n"
+                    "- Open with one specific observation about their company, product, or workflow\n"
+                    "- Then one sentence linking that observation to a concrete outcome Rick can create\n"
+                    "- CTA must be exactly one specific question\n"
+                    "- No bullets, no multi-ask, no install CTA, no demo pitch, no generic AI intro\n"
+                    "- Sign off: Rick\n"
+                    "- If PRIOR COMMUNICATIONS are shown above, do NOT repeat angles, subjects, or CTAs already used\n"
+                    "Write the email now."
+                )
+                fallback = (
+                    f"SUBJECT: {company} — quick thought\n"
+                    f"BODY:\nHi {name},\n\n"
+                    f"{company} looks like the kind of team where speed to follow-up matters. I run meetrick.ai, "
+                    "and we help founders turn that into more replies and booked conversations without adding more manual work.\n\n"
+                    "Would it be crazy to compare notes on the one step in your flow that is slowing replies down most?\n\nRick"
+                )
+            else:
+                prompt = (
+                    _prior_comms_block +
+                    "TASK: Write a cold outreach email. Output only the email — no analysis, "
+                    "no review commentary, no caveats.\n\n"
+                    "You are Rick, AI CEO at meetrick.ai. Write a short, sharp cold outreach email "
+                    "for this B2B lead. Goal: get ONE reply.\n\n"
+                    f"Lead name/company: {name}\n"
+                    f"Email: {email}\n"
+                    f"Company domain: {company}\n\n"
+                    "Output format (exactly this structure):\n"
+                    "SUBJECT: <subject line, max 8 words>\n"
+                    "BODY:\n"
+                    "<2-3 paragraphs, plain text, no markdown, no em dashes>\n\n"
+                    "Rules:\n"
+                    "- Open with a specific observation about their business or market\n"
+                    "- Reference Rick (meetrick.ai) and one concrete outcome\n"
+                    "- CTA: single question, not a pitch\n"
+                    "- Sign off: Rick\n"
+                    "- If PRIOR COMMUNICATIONS are shown above, do NOT repeat angles, "
+                    "subjects, or CTAs already used\n"
+                    "- Do NOT include disclaimers, analysis, or refusals\n"
+                    "Write the email now."
+                )
+                fallback = (
+                    f"SUBJECT: Quick question for {company}\n"
+                    f"BODY:\nHi {name},\n\nI've been watching what you're building at {company} — "
+                    "the market is moving fast and the operators who wire AI into their ops early tend "
+                    "to compound. I'm Rick, an AI CEO running meetrick.ai — we help founders and operators "
+                    "deploy AI that actually drives revenue, not just demos.\n\n"
+                    "One question: what's the part of your business where a faster feedback loop "
+                    "would change the game the most right now?\n\nRick"
+                )
             result = generate_text("review", prompt, fallback)
             content = result.content.strip()
         except Exception as exc:
@@ -342,7 +452,8 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
         _day_context = {
             "email-personal": (
                 "This is Day 5 — a personal follow-up after no reply to the cold opener. "
-                "Tone: warm, human, no-pressure. Different subject and angle from Day 0."
+                "Tone: warm, human, no-pressure. Different subject and angle from Day 0. "
+                "Mention pricing naturally: pricing starts at $99/mo if you want to dig deeper."
             ),
             "email-proof": (
                 "This is Day 8 — lead with a real outcome or concrete metric. "
@@ -372,6 +483,7 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 f"If you want to see what an AI CEO stack actually does for a company like {company}, "
                 "the fastest way is to watch it run on your own machine -- no commitment, 60 seconds:\n\n"
                 f"{QUICKSTART_CMD}\n\n"
+                "If you want to dig deeper, pricing starts at $99/mo.\n\n"
                 "Happy to talk specifics if that sparks anything.\n\n"
                 f"Rick\nmeetrick.ai  |  {QUICKSTART_URL}"
             ),
@@ -426,6 +538,7 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 "machine in 60 seconds -- no commitment, no demo call required.\n"
                 f"Install URL: {QUICKSTART_URL}\n"
                 f"Optional curl variant: {QUICKSTART_CMD}\n"
+                "Pricing note: mention that pricing starts at $99/mo if you want to dig deeper.\n"
                 "Let tone and context drive exact phrasing -- do NOT force a template phrase. "
                 "The goal is a natural, non-pushy path to the product.\n\n"
                 "Output format (exactly this structure):\n"
@@ -561,6 +674,9 @@ def _dispatch_touch(
     lead_email = (ctx.get("email") or _tp.get("email") or "").strip().lower()
 
     result_meta: dict[str, Any] = {"kind": kind, "channel": channel}
+    prompt_variant = _cold_opener_variant(ctx) if kind == "email-cold-1" else None
+    if prompt_variant:
+        result_meta["prompt_variant"] = prompt_variant
 
     # ------------------------------------------------------------------ email
     if channel == "email":
@@ -577,6 +693,8 @@ def _dispatch_touch(
                 "lane": "distribution-lane",
                 "msg_id": f"seq-{wf_id[:8]}-{kind}",
             }
+            if prompt_variant:
+                payload["prompt_variant"] = prompt_variant
             try:
                 from runtime.outbound_dispatcher import fan_out
                 job_ids = fan_out(
@@ -735,6 +853,15 @@ def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
         return 0
 
     days = _days_since_start(seq)
+    warmup_cap = _today_warmup_cap()
+    warmup_remaining = max(0, warmup_cap - _count_email_dispatches_today(conn))
+
+    if warmup_remaining == 0:
+        _log({
+            "event": "email_warmup_cap_reached",
+            "wf_id": wf_id,
+            "today_cap": warmup_cap,
+        })
 
     # Find the FIRST touch that is due and not yet dispatched
     for touch in SEQUENCE:
@@ -743,6 +870,23 @@ def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
             break
         if _touch_done(seq, touch["kind"]):
             continue
+        if touch["kind"] != "email-cold-1" and not _has_sent_touch(seq, "email-cold-1"):
+            _log({
+                "event": "touch_deferred",
+                "wf_id": wf_id,
+                "kind": touch["kind"],
+                "reason": "awaiting_sent_email_cold_1",
+            })
+            return 0
+        if touch["channel"] == "email" and warmup_remaining <= 0:
+            _log({
+                "event": "touch_deferred",
+                "wf_id": wf_id,
+                "kind": touch["kind"],
+                "reason": "warmup_cap_reached",
+                "today_cap": warmup_cap,
+            })
+            return 0
         # This touch is due and not done — dispatch it
         # Ensure stage is 'sequence-active' once we start
         if workflow["stage"] == "cold-email-pending" and touch["kind"] == "email-cold-1":
@@ -750,6 +894,10 @@ def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
 
         dispatched = _dispatch_touch(conn, workflow, ctx, touch)
         if dispatched:
+            if touch["channel"] == "email":
+                warmup_remaining -= 1
+                if warmup_remaining < 0:
+                    raise RuntimeError(f"warmup budget overrun for {wf_id}: cap={warmup_cap}")
             conn.commit()
             return 1
 
@@ -790,8 +938,9 @@ def tick(connection: sqlite3.Connection) -> int:
         return 0
 
     total = 0
+    total_limit = max(MAX_DISPATCHES_PER_TICK, _today_warmup_cap())
     for wf in rows:
-        if total >= MAX_DISPATCHES_PER_TICK:
+        if total >= total_limit:
             break  # leave the rest for the next heartbeat tick
         try:
             total += _process_workflow(connection, wf)

@@ -29,11 +29,13 @@ Public entry points:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import importlib
 import json
 import os
 import sys
 import uuid
+from functools import lru_cache
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 LOG_FILE = DATA_ROOT / "operations" / "outbound-dispatcher.jsonl"
 MAX_ATTEMPTS = 4
 BACKOFF_SECS = {1: 60, 2: 600, 3: 3600}  # 1m, 10m, 1h
+WARMUP_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "sender-warmup-schedule.py"
 
 
 class AuthFailure(Exception):
@@ -76,6 +79,69 @@ def _log(event: dict) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+@lru_cache(maxsize=1)
+def _warmup_module():
+    spec = importlib.util.spec_from_file_location("sender_warmup_schedule", WARMUP_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load warmup schedule script: {WARMUP_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _warmup_remaining_today() -> int:
+    try:
+        mod = _warmup_module()
+        return max(0, int(mod.get_today_cap()) - int(mod.sends_today()))
+    except Exception:
+        return 5
+
+
+def _mark_touch_sent(conn, workflow_id: str, template_id: str, channel: str, result: dict | None) -> None:
+    """Promote the matching workflow touch_log entry to sent on successful send."""
+    try:
+        row = conn.execute("SELECT context_json FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+        if not row:
+            return
+        try:
+            ctx = json.loads(row[0] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(ctx, dict):
+            return
+        seq = ctx.get("seq")
+        if not isinstance(seq, dict):
+            seq = ctx.setdefault("seq", {})
+        touch_log = seq.setdefault("touch_log", [])
+        now = _now_iso()
+        matched = False
+        for entry in touch_log:
+            if entry.get("kind") == template_id and entry.get("channel") == channel:
+                entry["status"] = "sent"
+                entry["delivered_at"] = now
+                if result and result.get("status"):
+                    entry["delivery_result"] = result.get("status")
+                if result and result.get("message_id"):
+                    entry["message_id"] = result.get("message_id")
+                matched = True
+                break
+        if not matched:
+            touch_log.append({
+                "kind": template_id,
+                "channel": channel,
+                "status": "sent",
+                "sent_at": now,
+                "delivered_at": now,
+                "delivery_result": (result or {}).get("status", "sent"),
+            })
+        conn.execute(
+            "UPDATE workflows SET context_json=?, updated_at=? WHERE id=?",
+            (json.dumps(ctx), now, workflow_id),
+        )
+    except Exception:
+        return
 
 
 def fan_out(
@@ -256,6 +322,7 @@ def _process_one(conn, job) -> dict:
             (_now_iso(), attempts, json.dumps(result or {})[:8000], job["id"]),
         )
         kill_switches.record_send(conn, channel)
+        _mark_touch_sent(conn, job["lead_id"], job["template_id"], channel, result)
         conn.commit()
         summary["status"] = "sent"
         summary["result"] = (result or {}).get("status") or "sent"
@@ -331,14 +398,19 @@ def drain(conn=None, batch_size: int = 20, dry_run: bool = False) -> dict:
             (_now_iso(), int(batch_size)),
         ).fetchall()
         results = []
+        email_remaining = _warmup_remaining_today()
         if dry_run:
             for r in rows:
                 results.append({"job_id": r["id"], "channel": r["channel"], "status": "dry-run"})
         else:
             for row in rows:
+                if row["channel"] == "email" and email_remaining <= 0:
+                    break
                 summary = _process_one(conn, row)
                 results.append(summary)
                 _log({"ran_at": _now_iso(), **summary})
+                if row["channel"] == "email" and summary.get("status") == "sent":
+                    email_remaining -= 1
         return {
             "ran_at": _now_iso(),
             "picked": len(rows),

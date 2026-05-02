@@ -26,8 +26,19 @@ Options:
   --reinstall           Re-run install on an existing Rick
   --update-keys         Only update secrets on an existing Rick
   --dry-run             Render config and validate, but skip launchd + email send
+  --pricing, /pricing   Print PRICING.md and exit
   -h, --help            Show this help
 USAGE
+}
+
+PRICING_FILE="$ROOT_DIR/PRICING.md"
+
+print_pricing() {
+  if [[ -f "$PRICING_FILE" ]]; then
+    cat "$PRICING_FILE"
+  else
+    die "Pricing file not found at $PRICING_FILE"
+  fi
 }
 
 say() { printf '%s\n' "$*"; }
@@ -583,6 +594,10 @@ PY
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    /pricing|--pricing)
+      print_pricing
+      exit 0
+      ;;
     --install-dir)
       INSTALL_ROOT="${2:-}"
       shift 2
@@ -810,6 +825,7 @@ cat <<EOF
 Rick installed. Run /status to see your daemon.
 Workspace: $INSTALL_ROOT
 Env:       $ENV_FILE
+Pricing:   $ROOT_DIR/PRICING.md (or run bash scripts/install-rick.sh /pricing)
 Logs:      $DATA_ROOT/logs/${LABEL_BASE}.out.log
            $DATA_ROOT/logs/${LABEL_BASE}.err.log
 EOF

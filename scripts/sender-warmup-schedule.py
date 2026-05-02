@@ -23,6 +23,7 @@ DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OPS = DATA_ROOT / "operations"
 STATE_FILE = DATA_ROOT / "control" / "sender-warmup-state.json"
 SENDS_FILE = OPS / "email-sends.jsonl"
+SEQUENCE_SENDS_FILE = OPS / "email-sequence-send.jsonl"
 
 # ---------------------------------------------------------------------------
 # Warmup ramp schedule — day → max sends/day (cold outreach only)
@@ -42,6 +43,13 @@ def cap_for_day(day_number: int) -> int:
         if day_number >= day_thresh:
             cap = limit
     return cap
+
+
+def get_today_cap(state: dict | None = None) -> int:
+    """Return today's cap from the warmup state file (Day 1 = 5 if unstarted)."""
+    state = state if isinstance(state, dict) else _load_state()
+    day_num = current_day_number(state)
+    return cap_for_day(day_num) if day_num > 0 else RAMP[0][1]
 
 def full_schedule() -> list[dict]:
     """Return per-day rows for the full 14-day plan."""
@@ -106,12 +114,14 @@ def current_day_number(state: dict) -> int:
 def sends_today() -> int:
     today = _now_utc().date().isoformat()
     count = 0
-    if SENDS_FILE.exists():
-        for line in SENDS_FILE.read_text().splitlines():
+    for path in (SENDS_FILE, SEQUENCE_SENDS_FILE):
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
             try:
                 r = json.loads(line)
-                ts = r.get("ts", "")[:10]
-                if ts == today:
+                ts = (r.get("ts") or r.get("timestamp") or "")[:10]
+                if ts == today and r.get("status") == "sent":
                     count += 1
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -128,15 +138,19 @@ def sender_rep_7d() -> dict:
     complaints = 0
     sends = 0
 
-    if SENDS_FILE.exists():
-        for line in SENDS_FILE.read_text().splitlines():
+    for path in (SENDS_FILE, SEQUENCE_SENDS_FILE):
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
             try:
                 r = json.loads(line)
-                ts_raw = r.get("ts", "")
+                ts_raw = r.get("ts") or r.get("timestamp") or ""
                 if not ts_raw:
                     continue
                 ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                if ts >= cutoff:
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts >= cutoff and r.get("status") == "sent":
                     sends += 1
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -149,6 +163,8 @@ def sender_rep_7d() -> dict:
                 if not ts_raw:
                     continue
                 ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
                 if ts < cutoff:
                     continue
                 if r.get("event") == "bounced":

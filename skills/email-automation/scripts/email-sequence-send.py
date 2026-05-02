@@ -23,11 +23,13 @@ or `<sequence> step <N>`.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import urllib.error
 import urllib.request
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 
@@ -38,6 +40,7 @@ OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 SENT_DIR = DATA_ROOT / "mailbox" / "sent"
 LOG_FILE = DATA_ROOT / "operations" / "email-sequence-send.jsonl"
 SUPPRESSION_FILE = DATA_ROOT / "mailbox" / "suppression.txt"
+WARMUP_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "sender-warmup-schedule.py"
 
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 DEFAULT_FROM = os.getenv("RICK_EMAIL_FROM") or os.getenv("MEETRICK_FROM_EMAIL") or "Rick <hello@meetrick.ai>"
@@ -190,6 +193,16 @@ def append_log(events: list[dict]) -> None:
         for event in events:
             row = {"timestamp": now().isoformat(timespec="seconds"), **event}
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+@lru_cache(maxsize=1)
+def _warmup_module():
+    spec = importlib.util.spec_from_file_location("sender_warmup_schedule", WARMUP_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load warmup schedule script: {WARMUP_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def html_to_text(html: str) -> str:
@@ -352,8 +365,9 @@ def deliver_draft(
     }
 
 
-def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None) -> list[dict]:
+def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None, attempt_limit: int | None = None) -> list[dict]:
     results: list[dict] = []
+    attempt_count = 0
     if not OUTBOX_DIR.exists():
         return results
     for seq_dir in sorted(p for p in OUTBOX_DIR.iterdir() if p.is_dir()):
@@ -361,17 +375,19 @@ def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None) -
         config_path = SEQUENCES_DIR / sequence_name / "sequence.json"
         sequence_config = load_json(config_path) if config_path.exists() else None
         for md_path in sorted(seq_dir.glob("*.md")):
+            if attempt_limit is not None and attempt_count >= attempt_limit:
+                return results
             try:
-                results.append(
-                    deliver_draft(
-                        md_path,
-                        sequence_name,
-                        sequence_config,
-                        dry_run=dry_run,
-                        suppressions=suppressions,
-                        api_key=api_key,
-                    )
+                event = deliver_draft(
+                    md_path,
+                    sequence_name,
+                    sequence_config,
+                    dry_run=dry_run,
+                    suppressions=suppressions,
+                    api_key=api_key,
                 )
+                results.append(event)
+                attempt_count += 1
             except Exception as err:  # noqa: BLE001 — log and continue
                 results.append(
                     {
@@ -387,7 +403,9 @@ def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None) -
 def command_send(dry_run: bool) -> int:
     suppressions = load_suppressions()
     api_key = os.getenv("RESEND_API_KEY")
-    events = walk_outbox(dry_run=dry_run, suppressions=suppressions, api_key=api_key)
+    warmup = _warmup_module()
+    attempt_limit = None if dry_run else max(0, int(warmup.get_today_cap()) - int(warmup.sends_today()))
+    events = walk_outbox(dry_run=dry_run, suppressions=suppressions, api_key=api_key, attempt_limit=attempt_limit)
     if not dry_run:
         append_log(events)
     sent = sum(1 for e in events if e.get("status") == "sent")
@@ -398,6 +416,7 @@ def command_send(dry_run: bool) -> int:
                 "events": events,
                 "count": len(events),
                 "sent": sent,
+                "attempt_limit": attempt_limit,
                 "failed": failed,
                 "dry_run": dry_run,
             },

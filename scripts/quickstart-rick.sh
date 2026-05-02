@@ -7,6 +7,7 @@ Usage:
   sh quickstart-rick.sh <api_key>
   ANTHROPIC_API_KEY=... sh quickstart-rick.sh
   OPENAI_API_KEY=... sh quickstart-rick.sh
+  sh quickstart-rick.sh /pricing
 
 Runs a no-side-effects Rick demo:
 - 1 fixture inbound email
@@ -16,8 +17,25 @@ Runs a no-side-effects Rick demo:
 USAGE
 }
 
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PRICING_FILE="$ROOT_DIR/PRICING.md"
+
+print_pricing() {
+  if [ -f "$PRICING_FILE" ]; then
+    cat "$PRICING_FILE"
+  else
+    echo "ERROR: pricing file not found at $PRICING_FILE" >&2
+    exit 1
+  fi
+}
+
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   usage
+  exit 0
+fi
+
+if [ "${1:-}" = "/pricing" ] || [ "${1:-}" = "--pricing" ]; then
+  print_pricing
   exit 0
 fi
 
@@ -237,6 +255,7 @@ box("Cold email opener", [str(data.get("cold_email_opener", "(missing)"))])
 box("Meme prompt", [str(data.get("meme_prompt", "(missing)"))])
 
 print()
-print(color("Want this running 24/7? Run: ./install-rick.sh", "1;33"))
+print(color("Want this running 24/7? Run: bash scripts/install-rick.sh", "1;33"))
+print(color("Want pricing? Run: sh scripts/quickstart-rick.sh /pricing", "1;33"))
 print()
 PY

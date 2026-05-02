@@ -137,16 +137,31 @@ def _pct(num: int, denom: int) -> str:
     return f"{100 * num / denom:.0f}%"
 
 
-def _rate_arrow(pct_str: str) -> str:
+def _transition_label(prev: int, cur: int) -> str:
+    """Render a conversion label.
+
+    If a later stage is broader than the previous one (mixed-scope queues),
+    cap at 100% and annotate the overflow so the dashboard stays readable.
+    """
+    if not prev:
+        return "n/a"
+    if cur <= prev:
+        return _pct(cur, prev)
+    return f"100% mix+{cur - prev}"
+
+
+def _rate_arrow(label: str) -> str:
     """Colour-code conversion rate for terminal output."""
-    if pct_str == "n/a":
+    if label == "n/a":
         return "   -"
-    val = int(pct_str.rstrip("%"))
+    if label.startswith("100% mix+"):
+        return f"\033[33m{label:>12}\033[0m"
+    val = int(label.rstrip("%"))
     if val >= 20:
-        return f"\033[32m{pct_str:>5}\033[0m"  # green
+        return f"\033[32m{label:>5}\033[0m"  # green
     if val >= 8:
-        return f"\033[33m{pct_str:>5}\033[0m"   # yellow
-    return f"\033[31m{pct_str:>5}\033[0m"        # red
+        return f"\033[33m{label:>5}\033[0m"   # yellow
+    return f"\033[31m{label:>5}\033[0m"        # red
 
 
 # ──────────────────────────────────────────────────────────────
@@ -335,21 +350,59 @@ def collect_deliverability(days: int) -> dict:
     resend_total = 0
     resend_ok = False
 
-    # Resend sample (recent page) matched by recipient address against cold sends.
-    # This is a floor, not a perfect historical backfill.
-    recent = _resend_get("/emails?limit=100")
-    if recent:
+    def _norm_email(raw: str) -> str:
+        raw = (raw or "").strip().lower()
+        if "<" in raw and ">" in raw:
+            raw = raw.split("<", 1)[1].split(">", 1)[0]
+        return raw
+
+    def _norm_subject(raw: str) -> str:
+        return re.sub(r"\s+", " ", (raw or "").strip().lower())
+
+    # Build the local sent set from the actual outbox files so we can match
+    # Resend records by both recipient and subject (recipient-only matching
+    # collapses follow-up touches and undercounts opens).
+    local_keys: set[tuple[str, str]] = set()
+    outbox_dir = MAILBOX / "outbox"
+    if outbox_dir.exists():
+        for f in outbox_dir.glob("**/*.md"):
+            try:
+                to = ""
+                subject = ""
+                for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("to:"):
+                        to = line.split(":", 1)[1].strip()
+                    elif line.startswith("subject:"):
+                        subject = line.split(":", 1)[1].strip()
+                    elif line.strip() == "---" and to and subject:
+                        break
+                if to and subject:
+                    local_keys.add((_norm_email(to), _norm_subject(subject)))
+            except OSError:
+                pass
+
+    # Paginate through Resend emails so we don't miss older touches.
+    before = None
+    for _page_num in range(20):
+        path = f"/emails?limit=100" + (f"&before={before}" if before else "")
+        recent = _resend_get(path)
+        if not recent:
+            break
         resend_ok = True
         batch = recent.get("data", []) or []
-        resend_total = len(batch)
-        by_to = {((e.get("to") or [""])[0].lower()): e for e in batch}
-        for s in cold_sends:
-            to = (s.get("to") or "").lower()
-            e = by_to.get(to)
-            if not e:
+        if not batch:
+            break
+        resend_total += len(batch)
+        for e in batch:
+            to = _norm_email((e.get("to") or [""])[0])
+            subject = _norm_subject(e.get("subject") or "")
+            if (to, subject) not in local_keys:
                 continue
             if e.get("last_event") in ("opened", "clicked"):
                 resend_opened += 1
+        if not recent.get("has_more"):
+            break
+        before = batch[-1].get("id")
 
     return {
         "bounces_log": bounce_count,
@@ -532,6 +585,15 @@ def build_funnel(days: int) -> dict:
     outbox = collect_outbox(days)
     demos = collect_demos()
     closes = collect_closes()
+    open_reply_rate = None
+    if deliverability["resend_opened"]:
+        open_reply_rate = replies["genuine_total"] / deliverability["resend_opened"]
+    open_reply = {
+        "opens": deliverability["resend_opened"],
+        "replies": replies["genuine_total"],
+        "rate": open_reply_rate,
+        "target": 0.03,
+    }
 
     # Canonical funnel counts (ordered top to bottom)
     stages = [
@@ -616,7 +678,7 @@ def build_funnel(days: int) -> dict:
         else:
             prev = stages[i - 1]["count"]
             cur_count = stage["count"]
-            stage["conv_to_next"] = _pct(cur_count, prev) if prev else "n/a"
+            stage["conv_to_next"] = _transition_label(prev, cur_count)
 
     # Identify leak across the primary funnel only (ignore operational queues
     # like drafts/outbox/demos so we don’t flag healthy downstream admin churn).
@@ -642,6 +704,7 @@ def build_funnel(days: int) -> dict:
         "leak_stage": leak_stage,
         "biggest_drop": biggest_drop,
         "resend_live": deliverability["resend_ok"],
+        "open_reply": open_reply,
         "_sources": {
             "discovery": "outreach/*.jsonl",
             "contacted": "projects/outreach/contacted.json",
@@ -649,7 +712,7 @@ def build_funnel(days: int) -> dict:
             "sends": "operations/email-sends.jsonl + email-sequence-send.jsonl",
             "deliverability": "Resend API /emails?limit=100",
             "replies": "operations/reply-router.jsonl",
-            "drafts": "projects/outreach/drafts-*.json",
+            "drafts": "mailbox/drafts/auto + operations/auto-draft-reply.jsonl",
             "outbox": "mailbox/outbox/*.json",
             "closes": "runtime/rick-runtime.db (deal_close kind)",
         },
@@ -711,13 +774,7 @@ def render_funnel(data: dict, no_colour: bool = False) -> str:
             if conv and conv != "n/a":
                 arrow_label = f"  {ARROW}  conv: {conv}"
                 if not no_colour:
-                    val = int(conv.rstrip("%"))
-                    if val >= 20:
-                        arrow_label = f"  \033[32m{ARROW}  conv: {conv}\033[0m"
-                    elif val >= 8:
-                        arrow_label = f"  \033[33m{ARROW}  conv: {conv}\033[0m"
-                    else:
-                        arrow_label = f"  \033[31m{ARROW}  conv: {conv}\033[0m"
+                    arrow_label = f"  {_rate_arrow(conv)}  {ARROW}  conv: {conv}" if conv.startswith("100% mix+") else f"  {_rate_arrow(conv)}  {ARROW}  conv: {conv}"
                 lines.append(arrow_label)
             else:
                 lines.append(f"  {ARROW}")
@@ -729,6 +786,22 @@ def render_funnel(data: dict, no_colour: bool = False) -> str:
         s["conv_to_next"] for s in stages[1:] if s.get("conv_to_next") and s["conv_to_next"] != "n/a"
     )
     lines.append(f"  Conversion chain:  {conv_chain}")
+    lines.append("")
+
+    # Open→reply benchmark
+    open_reply = data.get("open_reply") or {}
+    orate = open_reply.get("rate")
+    if orate is None:
+        lines.append("  Open→reply:      n/a (no opens recorded)")
+    else:
+        opens = open_reply.get("opens", 0)
+        replies_n = open_reply.get("replies", 0)
+        target = float(open_reply.get("target", 0.03))
+        gap = orate - target
+        lines.append(
+            f"  Open→reply:      {replies_n}/{opens} = {orate:.1%} "
+            f"(target {target:.1%}, gap {gap:+.1%})"
+        )
     lines.append("")
 
     # Leak diagnosis
@@ -744,7 +817,7 @@ def render_funnel(data: dict, no_colour: bool = False) -> str:
 
     lines.append("")
     lines.append("─" * 70)
-    lines.append("  Sources: outreach/*.jsonl · contacted.json · rick-runtime.db")
+    lines.append("  Sources: projects/qualified-leads/ · contacted.json · rick-runtime.db")
     lines.append("           email-sends.jsonl · Resend API · reply-router.jsonl · outbox/")
     lines.append("─" * 70)
     lines.append("")
@@ -778,6 +851,7 @@ def write_snapshot(data: dict) -> None:
         "leak_stage": data.get("leak_stage"),
         "biggest_drop": data.get("biggest_drop"),
         "resend_live": data.get("resend_live"),
+        "open_reply": data.get("open_reply"),
         "compact": render_compact(data),
     }
     try:
