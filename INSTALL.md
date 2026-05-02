@@ -27,6 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/ricksmartbrain-boop/rick-ai-ceo/mai
 5. initializes the SQLite DB via `runtime/db.py` migrations
 6. installs unique LaunchAgents per machine + install
 7. smoke-tests a heartbeat, renders a digest, and sends a test email when a recipient is provided
+8. TODO: ship endpoint at meetrick.ai/api/quickstart-ping; until then quickstart telemetry appends JSONL to `~/rick-vault/operations/quickstart-pings.jsonl` and can be pointed at `https://httpbin.org/get` (or RequestBin) via `RICK_QUICKSTART_PING_URL` to validate the flow
 
 ## Example
 

@@ -2,8 +2,8 @@
 """
 funnel-pulse.py — single-pane-of-glass cold-outreach funnel
 
-Discovery → CRM → Scoring → Workflows → Send → Delivered → Opened → Replied
-         → Drafts → Replied-out → Demo → Close
+Quickstart → Discovery → CRM → Scoring → Workflows → Send → Delivered → Opened → Replied
+          → Drafts → Replied-out → Demo → Close
 
 Usage:
   python3 scripts/funnel-pulse.py             # print funnel + write snapshot
@@ -224,6 +224,26 @@ def collect_discovery(days: int) -> dict:
         "with_email": with_email,
         "root_count": len(validated),
         "quarantine_count": len(dropped),
+    }
+
+
+def collect_quickstart_runs(days: int = 7) -> dict:
+    """Stage 0 – anonymous quickstart telemetry from operations/quickstart-pings.jsonl."""
+    rows = _read_jsonl(OPS / "quickstart-pings.jsonl")
+    cutoff = _cutoff(days) if days else None
+    recent = [
+        r for r in rows
+        if r.get("event") in {"start", "complete"}
+        and (cutoff is None or (r.get("ts", "") or "")[:10] >= cutoff)
+    ]
+    started = sum(1 for r in recent if r.get("event") == "start")
+    completed = sum(1 for r in recent if r.get("event") == "complete")
+
+    return {
+        "started": started,
+        "completed": completed,
+        "total": started,
+        "recent": len(recent),
     }
 
 
@@ -575,6 +595,7 @@ def collect_closes() -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def build_funnel(days: int) -> dict:
+    quickstart = collect_quickstart_runs(7)
     discovery = collect_discovery(days)
     contacted = collect_contacted(days)
     workflows = collect_icp_workflows(days)
@@ -597,6 +618,12 @@ def build_funnel(days: int) -> dict:
 
     # Canonical funnel counts (ordered top to bottom)
     stages = [
+        {
+            "id": "quickstart_runs",
+            "label": "Quickstart runs 7d",
+            "count": quickstart["started"],
+            "note": f"{quickstart['started']} started, {quickstart['completed']} completed",
+        },
         {
             "id": "discovery",
             "label": "Discovery candidates 7d",
@@ -682,7 +709,7 @@ def build_funnel(days: int) -> dict:
 
     # Identify leak across the primary funnel only (ignore operational queues
     # like drafts/outbox/demos so we don’t flag healthy downstream admin churn).
-    primary_ids = {"discovery", "validated", "icp", "crm_contacts", "emails_sent", "delivered", "opened", "replied", "closed"}
+    primary_ids = {"quickstart_runs", "discovery", "validated", "icp", "crm_contacts", "emails_sent", "delivered", "opened", "replied", "closed"}
     biggest_drop = 0
     leak_stage = ""
     for i in range(1, len(stages)):
@@ -706,6 +733,7 @@ def build_funnel(days: int) -> dict:
         "resend_live": deliverability["resend_ok"],
         "open_reply": open_reply,
         "_sources": {
+            "quickstart_runs": "operations/quickstart-pings.jsonl",
             "discovery": "outreach/*.jsonl",
             "contacted": "projects/outreach/contacted.json",
             "workflows": "runtime/rick-runtime.db (qualified_lead kind)",

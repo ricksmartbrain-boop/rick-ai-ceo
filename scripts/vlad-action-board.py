@@ -223,12 +223,30 @@ def _gather_auto_drafts() -> list[Task]:
         except Exception:
             froms.append("?")
     detail_str = ", ".join(froms) + ("…" if len(files) > 5 else "")
+    first_wf_id = files[0].stem
+    preferred_file = None
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        candidate = str(data.get("wf_id") or f.stem)
+        if candidate.startswith("wf_"):
+            preferred_file = f
+            first_wf_id = candidate
+            break
+    if preferred_file is None:
+        try:
+            first_data = json.loads(files[0].read_text(encoding="utf-8"))
+            first_wf_id = str(first_data.get("wf_id") or first_wf_id)
+        except Exception:
+            pass
 
     tasks.append(Task(
         section="APPROVALS NEEDED",
         priority="P0",
         label=f"Send or discard {len(files)} auto-drafted reply/replies",
-        detail=f"From: {detail_str}  |  Path: mailbox/drafts/auto/",
+        detail=f"From: {detail_str}  |  Path: mailbox/drafts/auto/  |  Run: python3 scripts/send-draft.py {first_wf_id}",
         est_mins=3 * len(files),
         blocked="Hot sales leads go cold — Rick can't advance these threads without approval",
         overdue=is_overdue,

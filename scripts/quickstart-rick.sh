@@ -19,6 +19,10 @@ USAGE
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PRICING_FILE="$ROOT_DIR/PRICING.md"
+DATA_ROOT="${RICK_DATA_ROOT:-$HOME/rick-vault}"
+TELEMETRY_DIR="$DATA_ROOT/operations"
+TELEMETRY_LOG="$TELEMETRY_DIR/quickstart-pings.jsonl"
+TELEMETRY_URL="${RICK_QUICKSTART_PING_URL:-https://meetrick.ai/api/quickstart-ping}"
 
 print_pricing() {
   if [ -f "$PRICING_FILE" ]; then
@@ -64,6 +68,29 @@ fi
 
 export RICK_QS_PROVIDER="$PROVIDER"
 export RICK_QS_API_KEY="$API_KEY"
+
+QS_HASH=$(python3 - <<'PY'
+import hashlib
+import os
+
+api_key = os.environ["RICK_QS_API_KEY"]
+print(hashlib.sha1(api_key.encode("utf-8")).hexdigest()[:8])
+PY
+)
+
+telemetry_ping() {
+  event="$1"
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$TELEMETRY_DIR" 2>/dev/null || true
+  printf '{"ts":"%s","event":"%s","hash":"%s","source":"quickstart-rick.sh"}\n' \
+    "$ts" "$event" "$QS_HASH" >> "$TELEMETRY_LOG" 2>/dev/null || true
+  curl -GsS --max-time 3 \
+    --data-urlencode "event=$event" \
+    --data-urlencode "hash=$QS_HASH" \
+    "$TELEMETRY_URL" >/dev/null 2>&1 || true
+}
+
+telemetry_ping start
 
 python3 - <<'PY'
 import json
@@ -253,9 +280,9 @@ box("What Rick classified", [str(data.get("classification", "(missing)")), f"Con
 box("Draft reply", [str(data.get("reply_draft", "(missing)"))])
 box("Cold email opener", [str(data.get("cold_email_opener", "(missing)"))])
 box("Meme prompt", [str(data.get("meme_prompt", "(missing)"))])
-
-print()
-print(color("Want this running 24/7? Run: bash scripts/install-rick.sh", "1;33"))
-print(color("Want pricing? Run: sh scripts/quickstart-rick.sh /pricing", "1;33"))
-print()
 PY
+
+telemetry_ping complete
+
+echo "Want this running 24/7? Run: bash scripts/install-rick.sh"
+echo "Like what you see? Pricing: meetrick.ai/pricing or run: ./install-rick.sh"

@@ -927,7 +927,7 @@ def tick(connection: sqlite3.Connection) -> int:
             """
             SELECT * FROM workflows
              WHERE kind = 'qualified_lead'
-               AND stage NOT IN ('replied','done','closed','unsubscribed',
+               AND stage NOT IN ('replied','replied-sent','done','closed','unsubscribed',
                                   'disqualified','sequence-complete','bounced-paused')
                AND status NOT IN ('done','cancelled','failed')
              ORDER BY created_at ASC
@@ -974,7 +974,7 @@ if __name__ == "__main__":
             """
             SELECT id, kind, stage, status, context_json FROM workflows
              WHERE kind = 'qualified_lead'
-               AND stage NOT IN ('replied','done','closed','unsubscribed',
+               AND stage NOT IN ('replied','replied-sent','done','closed','unsubscribed',
                                   'disqualified','sequence-complete')
                AND status NOT IN ('done','cancelled','failed')
             """
@@ -1000,7 +1000,7 @@ if __name__ == "__main__":
                 """
                 SELECT * FROM workflows
                  WHERE kind = 'qualified_lead'
-                   AND stage NOT IN ('replied','done','closed','unsubscribed',
+                   AND stage NOT IN ('replied','replied-sent','done','closed','unsubscribed',
                                       'disqualified','sequence-complete')
                    AND status NOT IN ('done','cancelled','failed')
                    AND id IN ({})
