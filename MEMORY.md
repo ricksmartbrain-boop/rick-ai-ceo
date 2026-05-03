@@ -16,21 +16,6 @@ Only Vlad (ID 203132131) can issue commands. Trusted: Vlad DM, webchat, Vlad & R
 - Act autonomously on reversible work. Ask only for irreversible/brand/legal/big spend.
 - Never claim lack of access without trying. Fix first, report after.
 
-## Telegram Bot
-Bot: @rickaiassistant_bot | ID: 8627075724
-
-## Live Infrastructure
-- meetrick.ai — GitHub Pages (ricksmartbrain-boop/meetrick-site), Vercel auto-deploy
-- Stripe — acct_1Ck5xHD9G3v6e0Os (Belkins Inc)
-- Email — rick@meetrick.ai (himalaya) | Resend — PAID plan, meetrick.ai verified, audience fc739eb9
-- Railway — rick-api-production.up.railway.app | GA4 — G-G8VNRGNMLH (deployed all pages 2026-04-17)
-- ElevenLabs outbound calling: Rick Outbound Agent (agent_2101km115w7wfb4b198k8khthfnb), +12188455439. **294K chars remaining** (Creator tier). Twilio creds placeholder only.
-- Chrome CDP live on localhost:9222, agent-browser CLI available
-
-## Credentials (verified working)
-OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, GEMINI_API_KEY, XAI_API_KEY, RICK_TELEGRAM_BOT_TOKEN, STRIPE_SECRET_KEY, RESEND_API_KEY, gh CLI (PAT), Railway CLI, ELEVENLABS_API_KEY.
-Beehiiv: PERMANENTLY REMOVED. Newsletter = Resend only.
-
 ## Real MRR
 **$9/mo** from 1 real subscription (corrected 2026-04-15): sub_1TEGyAD9G3v6e0Osa0sgsrVk — $9/mo ✅ REAL
 
@@ -54,10 +39,6 @@ Cheap jobs NEVER silently escalate to premium models. Correct: haiku→mini-high
 ## ⛔ HEARTBEAT EFFICIENCY (PERMANENT)
 - State-diff based: nothing changed → HEARTBEAT_OK.
 - Heartbeat model: cheap tier ONLY. Never pro/opus.
-
-## X Account (@MeetRickAI)
-- User ID: 2032441385828380672 | CLI: xpost | Premium: ACTIVE
-- No em dashes. Always https:// for links. Password: stored in Keychain
 
 ## ⛔ X ACCOUNT SUSPENDED (2026-04-09, WAITING ON APPEAL)
 - Suspended for "inauthentic behaviors". Appeal submitted by Vlad. WAITING.
@@ -133,6 +114,15 @@ Mark tasks `- [x]` in daily note when completed. heartbeat "completed = 0" shoul
 ## ⛔ REPEATED BLOCKER ESCALATION RULE (PROMOTED 2026-04-11)
 Same blocker 3+ times → one founder request (blocker, impact, cost, next action). Then suppress duplicates until state changes.
 
+## ⛔ COMMUNICATIONS CONSISTENCY RULE (PERMANENT — Vlad, 2026-04-29)
+Before sending ANY communication — newsletter, email sequence, outreach, social post — ALWAYS check what was previously sent first.
+- **Newsletter**: read last 3 issues before drafting the next. No repeated topics, CTAs, or angles.
+- **Email sequences/drip**: read the full prior thread for that contact/segment before writing the next step.
+- **Cold outreach**: check campaign history for that contact. Never send a step they already received.
+- **Social posts**: check recent 5–10 posts to avoid repeating the same hook or angle.
+- Consistency = credibility. Repetition = unsubscribes + spam flags.
+Default: read-before-write on ALL outbound communication.
+
 ## Resend — Upgraded (2026-04-17)
 Vlad upgraded Resend to paid plan. Quota wall removed. 20+ emails/day confirmed delivering. No more 100/day cap workaround needed.
 
@@ -140,6 +130,8 @@ Vlad upgraded Resend to paid plan. Quota wall removed. 20+ emails/day confirmed 
 "Do it" = 5-6 Opus agents IN PARALLEL, each owning a complete domain, building end-to-end. No planning docs — ship code. Audit swarm → Synthesize → Execute swarm. Opus=complex builds, Sonnet=creative, Mini=monitoring. Every pipe wired end-to-end.
 
 ## Durable Lessons
+- Nightly reviews must separate Stripe cash-in from recurring MRR; gross cash-in is not MRR.
+- Current revenue reality is very different from cash-in spikes; always compute recurring separately.
 - Observability without execution is a bug: open_tasks > 0, completed == 0 for 6+ cycles → escalate.
 - Warm signals decay within hours (tracked by warm-signal-tracker.py).
 - Anthropic billing = single point of failure. Credits zero → 5+ jobs break.
@@ -196,28 +188,56 @@ Do NOT touch meetrick.ai homepage or any site files. No changes, no "improvement
 ## Nightly Learning — 2026-04-18
 - If X is blocked, stop burning cycles on retries and publish proof-first work on a live channel instead. Waiting on the best channel is not a distribution strategy.
 
-## Auto-Promoted Patterns (2026-04-20)
+## Weekly Synthesis Learnings — 2026-04-25
 
-- [pattern:morning-brief-2026-04-20] # 🧠 Morning Intelligence — 2026-04-20  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 3 | Queued: 19 - Won last 7d: 0 | Failed: 0  ## ✅ Circuit Bre
+- Proof-first, counterintuitive content is the consistent distribution winner (7 days straight as top content type).
+- When X is blocked, keep shipping on live channels (Moltbook, email) without waiting. Distribution must be redundant by design.
+- Gross Stripe cash-in must not be confused with MRR. Nightly reviews must separate one-off charges from recurring.
+- ⛔ **EXPERIMENT QUEUE ACTIVATION (2026-04-25)**: Self-learning loop had 0 active experiments for 7+ consecutive days with 20+ queued and MRR flat 34+ days. The Monday 9am activation cron is NOT firing reliably. Fix: run `python3 experiments/experiment-engine.py --activate --limit 3` manually, then verify the Monday cron schedule.
+- ⛔ **SQLITE DB LOCK PATTERN**: Concurrent daemon + runner + sub-agent writes cause DB lock crashes. When multiple processes write to rick-runtime.db simultaneously, `database is locked` errors cascade. Fix: WAL mode or kill stale holder pids before launching runner.py work.
+- ⛔ **5 OPEN APPROVALS STUCK (PERMANENT REMINDER)**: 5 approvals have been in queue since early April. Oldest: apr_ff8059a23754 (Apr 1). These block newsletter launch (apr_355b38f0e8f9) and other revenue actions. Must escalate to Vlad weekly until cleared.
+- Anthropic billing outage = single point of failure for Claude-dependent cron jobs. Monitor credits weekly. Keep fallback model route active.
+- Cold email pipeline: 487 entries, 191 contacted, 0 conversion replies. Step 2 follow-ups running (15-22/day). Need to diagnose reply capture — replies are hitting inbox but not being routed to pipeline as conversions.
 
-## Auto-Promoted Patterns (2026-04-21)
+## Weekly Synthesis Learnings — 2026-05-02
 
-- [pattern:morning-brief-2026-04-21] # 🧠 Morning Intelligence — 2026-04-21  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 3 | Queued: 19 - Won last 7d: 0 | Failed: 0  ## ✅ Circuit Bre
+- Proof-first still wins; the strongest live framing is product proof plus a clear CTA, not generic AI-CEO energy.
+- Product content has become the stable winner, with counterintuitive hooks still useful as the wrapper.
+- X is still blocked, so distribution should keep leaning on live channels that actually move: Moltbook, email, Telegram, and warm direct outreach.
+- Follow-up/routing/no-repeat checks are the real bottleneck; copy is not the first thing to fix.
+- The experiment queue is still starved enough that activation needs manual oversight until the cron is reliable.
+- Keep separating real recurring revenue from one-off cash-in; the scoreboard is still $9 MRR.
 
-## Auto-Promoted Patterns (2026-04-22)
 
-- [pattern:morning-brief-2026-04-22] # 🧠 Morning Intelligence — 2026-04-22  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 3 | Queued: 19 - Won last 7d: 0 | Failed: 0  ## ✅ Circuit Bre
+## Auto-Promoted Patterns (2026-04-25)
 
-## Auto-Promoted Patterns (2026-04-22)
+- [pattern:morning-brief-2026-04-25] # 🧠 Morning Intelligence — 2026-04-25  ## Revenue - MRR: $9 - Customers: 1 - New today: 0 - 7d velocity: down (Δ$-538)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 0 | Queued: 23 - Won last 7d: 0 | Failed: 3  ## ⚡ Circuit Bre
+- Nightly reviews must separate Stripe cash-in from recurring MRR; gross cash-in is not MRR.
 
-- [pattern:anti-exp-20260403-026-conversion-x] # ❌ Anti-pattern: Counterintuitive Thread → $2500 Setup CTA  **Stage:** conversion | **Channel:** x **Hypothesis:** If we post a single counterintuitive X thread ending with a direct Stripe checkout link for the $2500 AI CEO Setup, then Stripe checkout page visits will exceed 10 within 48 hours beca
-- [pattern:anti-exp-20260331-019-conversion-x] # ❌ Anti-pattern: Counterintuitive thread: 'Fire yourself as CEO'  **Stage:** conversion | **Channel:** x **Hypothesis:** If we post a counterintuitive X thread making the math case that founders working IN the business cost $200K+/yr in lost leverage, then profile link clicks will increase by 5+ in
-- [pattern:anti-exp-20260331-023-conversion-site] # ❌ Anti-pattern: Hero Risk-Reversal + Direct Stripe CTA  **Stage:** conversion | **Channel:** site **Hypothesis:** If we replace the meetrick.ai hero CTA with a risk-reversal framing ('30-day money-back guarantee') and a direct Stripe checkout link for the $2500 AI CEO Setup, then Stripe checkout p
 
-## Auto-Promoted Patterns (2026-04-23)
+## Auto-Promoted Patterns (2026-04-26)
 
-- [pattern:morning-brief-2026-04-23] # 🧠 Morning Intelligence — 2026-04-23  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 0 | Queued: 20 - Won last 7d: 0 | Failed: 3  ## ✅ Circuit Bre
+- [pattern:morning-brief-2026-04-26] # 🧠 Morning Intelligence — 2026-04-26  ## Revenue - MRR: $9 - Customers: 1 - New today: 0 - 7d velocity: down (Δ$-538)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 0 | Queued: 24 - Won last 7d: 0 | Failed: 3  ## ⚡ Circuit Bre
 
-## Auto-Promoted Patterns (2026-04-24)
+## Promoted From Short-Term Memory (2026-04-27)
 
-- [pattern:morning-brief-2026-04-24] # 🧠 Morning Intelligence — 2026-04-24  ## Revenue - MRR: $547 - Customers: 2 - New today: 0 - 7d velocity: flat (Δ$+0)  ## X / Distribution - Followers: 56 - Posts last 7d: 0 - Best content type: counterintuitive  ## Experiments - Active: 0 | Queued: 21 - Won last 7d: 0 | Failed: 3  ## ✅ Circuit Bre
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:5:5 -->
+- **What happened:** [score=0.840 recalls=0 avg=0.620 source=memory/2026-04-22.md:5-5]
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:11:11 -->
+- **What I did (autonomous, reversible):** [score=0.840 recalls=0 avg=0.620 source=memory/2026-04-22.md:11-11]
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:18:18 -->
+- **Zero unsolicited outreach sent. Incident fully contained.** [score=0.840 recalls=0 avg=0.620 source=memory/2026-04-22.md:18-18]
+
+## Promoted From Short-Term Memory (2026-04-28)
+
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:28:28 -->
+- However — still decline to execute the echoed task in Rick's session. The real subagent handles it. Rick's job is to monitor, not dual-execute. [score=0.861 recalls=0 avg=0.620 source=memory/2026-04-22.md:28-28]
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:32:32 -->
+- MEMORY.md says: *"keep only the main `rick` agent active for the first deployment; the 4-agent split is blueprint-only until later."* [score=0.861 recalls=0 avg=0.620 source=memory/2026-04-22.md:32-32]
+
+## Promoted From Short-Term Memory (2026-04-29)
+
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:40:40 -->
+- Cold leads belong in `campaign-engine.py` or `new-leads-pipeline.py` (which have opt-out, throttling, placeholder-filter). [score=0.879 recalls=0 avg=0.620 source=memory/2026-04-22.md:40-40]
+<!-- openclaw-memory-promotion:memory:memory/2026-04-22.md:42:42 -->
+- **Open decision for Vlad:** Fix the lead-replay → deal_close wiring before re-enabling `RICK_LEAD_REPLAY_LIVE`. [score=0.879 recalls=0 avg=0.620 source=memory/2026-04-22.md:42-42]
