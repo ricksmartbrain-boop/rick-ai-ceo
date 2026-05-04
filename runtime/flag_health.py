@@ -133,6 +133,15 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # Vlad knows the digest section may be outdated.
     ("RICK_VLAD_ACTIONS_LIVE", "vlad-action-board.jsonl", 2.0,
         lambda e: e.get("event") == "run.done"),
+    # anthropic-billing-watchdog runs every 15 min
+    # (ai.rick.anthropic-billing-watchdog.plist StartInterval=900).
+    # 0.5h = 30 min = 2 missed cycles before alerting — enough hysteresis
+    # for a brief machine sleep without false positives.
+    # Any terminal status (ok, cleared, credits_low, error) confirms the
+    # watchdog ran. "cleared" is the self-healing success event.
+    # Digest surface: 🛡️ Anthropic watchdog: last check OK / disabled-until cleared X ago.
+    ("RICK_BILLING_WATCHDOG_LIVE", "billing-watchdog.jsonl", 0.5,
+        lambda e: e.get("status") in ("ok", "cleared", "credits_low", "error")),
 ]
 
 

@@ -19,6 +19,31 @@ CLI:
 
 De-duplication: items already surfaced as automated metrics in rick-activity-digest.py
 (flag-health, funnel counts, bounce rates) are NOT listed here — only Vlad-action items.
+
+────────────────────────────────────────────────────────────────────────
+OPENCLAW COMMITMENTS MIGRATION (2026-05-04 / OpenClaw 2026.5.3)
+────────────────────────────────────────────────────────────────────────
+The APPROVALS NEEDED section now tries `openclaw commitments list --status=pending
+--json` as a primary source before falling back to the legacy file-walk.
+
+Known gaps in openclaw commitments 2026.5.3:
+  GAP-1: No --kind flag → cannot do --kind=approval from CLI.
+          Workaround: fetch all pending commitments, filter on kind/text in Python.
+  GAP-2: No create/update subcommands → commitments are inferred from conversation
+          context only; workflow artifacts in mailbox/drafts/auto/ are NOT auto-ingested.
+  GAP-3: commitments.enabled is off by default → store will be empty until enabled
+          via `openclaw config set commitments.enabled true`.
+  GAP-4: openclaw commitments list itself does NOT invoke an LLM (read-only local
+          store). The background extraction pass DOES use a model, but the model
+          is not configurable from this CLI.
+  GAP-5: Commitments scope = conversation channel; mailbox/drafts/auto/ items are
+          not automatically surfaced as commitments.
+
+Fallback policy: if commitments returns 0 approval-like items (or errors),
+_gather_auto_drafts() falls back to _gather_auto_drafts_legacy() (the original
+file-walk). All other APPROVALS sub-functions are unchanged.
+
+Callers of this script are unaffected — CLI interface is identical.
 """
 from __future__ import annotations
 
@@ -180,8 +205,107 @@ class Task:
 # SECTION 1 — APPROVALS NEEDED
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── openclaw commitments integration ───────────────────────────────────────
+# Migration: APPROVALS NEEDED now queries openclaw commitments list first.
+# API (2026.5.3): list [--status=pending] [--agent <id>] [--json]
+#                  dismiss <id...>
+# Schema fields present in records (from store inspection + docs):
+#   id, agentId, sessionKey, status, kind, text/check_in, due_at, created_at,
+#   channel, scope
+# GAP-1: no --kind CLI flag → we filter kind/text in Python (see below).
+# GAP-4: list command is a local store read — no LLM invoked here.
+
+_APPROVAL_TEXT_KEYWORDS = ("approve", "approval", "review", "send", "draft", "reply", "decision")
+
+
+def _run_commitments_list(status: str = "pending") -> list[dict]:
+    """Shell out to `openclaw commitments list --status=<status> --json`.
+
+    Returns parsed commitment records, or [] on any error (graceful fallback).
+    No LLM is invoked by this call — it is a local JSON store read.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["openclaw", "commitments", "list", f"--status={status}", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout)
+        return data.get("commitments", [])
+    except Exception:
+        return []
+
+
+def _gather_approvals_via_commitments() -> list[Task]:
+    """PRIMARY path: query `openclaw commitments list --status=pending --json`.
+
+    Maps commitment records to APPROVALS NEEDED Tasks.
+    Filters for approval-like items because no --kind=approval flag exists (GAP-1).
+    Returns [] when: store is empty, commitments disabled, no matching items, or error.
+    Callers must fall back to _gather_auto_drafts_legacy() when this returns [].
+    """
+    records = _run_commitments_list(status="pending")
+    tasks: list[Task] = []
+    for rec in records:
+        text = str(rec.get("text") or rec.get("check_in") or "").lower()
+        kind = str(rec.get("kind") or "").lower()
+        # Accept if kind field contains approval semantics OR text matches keywords
+        # (GAP-1 workaround — no --kind=approval flag in this CLI version)
+        is_approval_like = (
+            "approval" in kind
+            or "draft" in kind
+            or any(kw in text for kw in _APPROVAL_TEXT_KEYWORDS)
+        )
+        if not is_approval_like:
+            continue
+        cm_id = rec.get("id", "?")
+        due = _parse_ts(rec.get("due_at") or rec.get("created_at"))
+        display_text = (rec.get("text") or rec.get("check_in") or cm_id)[:80]
+        tasks.append(Task(
+            section="APPROVALS NEEDED",
+            priority="P0",
+            label=f"Commitment: {display_text}",
+            detail=(
+                f"id={cm_id}  |  kind={rec.get('kind', 'inferred')}  "
+                f"|  Dismiss: openclaw commitments dismiss {cm_id}  "
+                f"|  source=openclaw-commitments"
+            ),
+            est_mins=5,
+            blocked="Open commitment loop; heartbeat will re-surface until dismissed",
+            overdue=_is_overdue(due),
+            created_ts=due,
+        ))
+    return tasks
+
+
 def _gather_auto_drafts() -> list[Task]:
-    """Auto-drafted replies in drafts/auto/ awaiting Vlad send-approval."""
+    """Auto-drafted replies in drafts/auto/ awaiting Vlad send-approval.
+
+    Migration (2026-05-04): tries `openclaw commitments list --status=pending` first.
+    Falls back to _gather_auto_drafts_legacy() (file-walk) when commitments returns
+    0 approval-like items — which is expected while commitments.enabled is off/empty.
+
+    GAP-2: Commitments are inferred from conversation; workflow file artifacts in
+    mailbox/drafts/auto/ are not auto-ingested. The legacy file-walk remains the
+    live implementation until OpenClaw infers these drafts from heartbeat context.
+    GAP-3: Store empty until `openclaw config set commitments.enabled true`.
+    """
+    # 1. Primary: openclaw commitments path
+    commitments_tasks = _gather_approvals_via_commitments()
+    if commitments_tasks:
+        return commitments_tasks
+    # 2. Fallback: legacy file-walk (active implementation)
+    return _gather_auto_drafts_legacy()
+
+
+def _gather_auto_drafts_legacy() -> list[Task]:
+    """LEGACY fallback: file-walk over mailbox/drafts/auto/ for pending send-approvals.
+
+    This is the active implementation while openclaw commitments store is empty.
+    Preserved verbatim — do not modify without updating _gather_auto_drafts() too.
+    """
     tasks: list[Task] = []
     if not DRAFTS_AUTO_DIR.is_dir():
         return tasks

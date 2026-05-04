@@ -22,7 +22,13 @@ from pathlib import Path
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OPS = DATA_ROOT / "operations"
 STATE_FILE = DATA_ROOT / "control" / "sender-warmup-state.json"
-SENDS_FILE = OPS / "email-sends.jsonl"
+# email-sends.jsonl may live under rick-vault/operations when RICK_DATA_ROOT
+# points to a different root (e.g. rick-install-test/data). Search both.
+_SENDS_CANDIDATES = [
+    OPS / "email-sends.jsonl",
+    Path.home() / "rick-vault" / "operations" / "email-sends.jsonl",
+]
+SENDS_FILE = next((p for p in _SENDS_CANDIDATES if p.exists()), _SENDS_CANDIDATES[0])
 SEQUENCE_SENDS_FILE = OPS / "email-sequence-send.jsonl"
 
 # ---------------------------------------------------------------------------

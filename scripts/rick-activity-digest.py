@@ -1256,6 +1256,43 @@ def render(s: dict) -> str:
                          for r in no_data[:5])
         lines.append(f"  ⚠️ no-data flags: {bits}")
 
+    # --- Anthropic billing watchdog dedicated section ---
+    _bw_log = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "operations" / "billing-watchdog.jsonl"
+    _bw_last: dict | None = None
+    if _bw_log.exists():
+        try:
+            _bw_lines = _bw_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            for _line in reversed(_bw_lines[-200:]):
+                if _line.strip():
+                    try:
+                        _bw_last = json.loads(_line)
+                        break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if _bw_last:
+        from datetime import timezone as _tz
+        _bw_ts_raw = _bw_last.get("ts", "")
+        _bw_age_str = "?"
+        try:
+            _bw_ts = datetime.fromisoformat(_bw_ts_raw.replace("Z", "+00:00"))
+            _bw_age_h = (datetime.now(_tz.utc) - _bw_ts).total_seconds() / 3600.0
+            _bw_age_str = f"{_bw_age_h * 60:.0f}m ago" if _bw_age_h < 1 else f"{_bw_age_h:.1f}h ago"
+        except Exception:
+            pass
+        _bw_status = _bw_last.get("status", "")
+        if _bw_status == "cleared":
+            _bw_du = _bw_last.get("cleared_disabled_until", "?")
+            _bw_label = f"disabled-until cleared ({_bw_age_str}) — was {_bw_du}"
+        elif _bw_status == "credits_low":
+            _bw_label = f"⚠️ credits low detected {_bw_age_str}"
+        elif _bw_status == "ok":
+            _bw_label = f"last check OK ({_bw_age_str})"
+        else:
+            _bw_label = f"status={_bw_status} ({_bw_age_str})"
+        lines.append(f"🛡️ *Anthropic watchdog*: {_bw_label}")
+
     fenix = s.get("fenix_observed_24h") or {}
     if fenix.get("would_have_blocked", 0) > 0:
         lines.append("")
