@@ -36,7 +36,7 @@ LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 ENV_FILE = Path.home() / "clawd" / "config" / "rick.env"
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 RUNTIME_DB = Path(os.getenv("RICK_RUNTIME_DB_FILE",
-    str(Path.home() / "rick-install-test" / "data" / "runtime" / "rick-runtime.db")))
+    str(Path.home() / "rick-vault" / "runtime" / "rick-runtime.db")))
 
 # Patterns that indicate external send capability
 SEND_PATTERNS = [

@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Hourly bounce-rate guardian.
+"""Hourly + 24h bounce-rate guardian.
 
-Reads the last 1h of:
+Reads the last 1h AND last 24h of:
   - ~/rick-vault/operations/email-sends.jsonl
   - ~/rick-vault/operations/email-bounces.jsonl
 
-Computes bounce_rate_1h = bounces / sends and writes a passive auto-throttle
-record when the rate breaches the emergency threshold.
+Computes bounce rates and writes passive auto-throttle records when a rate
+breaches an emergency threshold.
 
-If bounce_rate_1h > 5%:
-  - append a kill-switch row to ~/rick-vault/operations/pipeline-killswitch.jsonl
-  - pause the email channel in runtime.db (best-effort)
+1h window thresholds:
+  - bounce_rate_1h > 5%  → kill-switch + pause email channel (6h)
+  - bounce_rate_1h > 10% → notify operator
 
-If bounce_rate_1h > 10%:
-  - notify_operator_deduped() so Vlad sees it in the morning digest
+24h window thresholds (new — catches slow trickle bounces):
+  - bounce_rate_24h > 5% → kill-switch + pause email channel (6h)
+  - bounce_rate_24h > 10% → notify operator
 
-LaunchAgent: ai.rick.bounce-rate-guardian.plist
+Hard constraints:
+  - auto_resume is always False — manual flip required
+  - does NOT cancel workflows, only pauses the email channel send gate
+
+LaunchAgent: ai.rick.bounce-rate-guardian.plist  (StartInterval: 3600)
 """
 from __future__ import annotations
 
@@ -33,9 +38,16 @@ BOUNCES_FILE = OPS / "email-bounces.jsonl"
 GUARDIAN_LOG = OPS / "bounce-rate-guardian.jsonl"
 KILLSWITCH_LOG = OPS / "pipeline-killswitch.jsonl"
 
-WINDOW_HOURS = 1
-THROTTLE_THRESHOLD_PCT = 5.0
-ALERT_THRESHOLD_PCT = 10.0
+# 1h window
+WINDOW_1H = 1
+THROTTLE_PCT_1H = 5.0
+ALERT_PCT_1H = 10.0
+
+# 24h window (NEW — catches trickle bounces spread over a day)
+WINDOW_24H = 24
+THROTTLE_PCT_24H = 5.0   # >5% over 24h → 6h pause
+ALERT_PCT_24H = 10.0
+PAUSE_HOURS_24H = 6      # shorter pause when triggered by 24h window
 
 
 def now_iso() -> str:
@@ -108,96 +120,172 @@ def _append_jsonl(path: Path, row: dict) -> None:
         f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def _pause_email_channel(reason: str) -> str:
+def _pause_email_channel_db(reason: str, hours: int) -> str:
+    """Pause email channel in rick-runtime.db channel_state table."""
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+
+    db_paths = [
+        Path.home() / "rick-vault" / "runtime" / "rick-runtime.db",
+        Path.home() / ".openclaw" / "workspace" / "runtime" / "rick-runtime.db",
+    ]
+    pause_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for db_path in db_paths:
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                """UPDATE channel_state
+                   SET status='paused', paused_until=?, pause_reason=?, updated_at=?
+                   WHERE channel='email'""",
+                (pause_until, reason, now),
+            )
+            conn.commit()
+            conn.close()
+            return "email"
+        except Exception:
+            continue
+    return ""
+
+
+def _notify_operator(message: str, kind: str) -> None:
+    """Best-effort operator notification via runtime engine."""
     try:
+        sys.path.insert(0, str(Path.home() / ".openclaw" / "workspace"))
         from runtime.db import connect
-        from runtime.kill_switches import force_pause
+        from runtime.engine import notify_operator_deduped
 
         conn = connect()
         try:
-            force_pause(conn, "email", reason, hours=24)
+            notify_operator_deduped(
+                conn,
+                message,
+                kind=kind,
+                dedup_window_hours=6,
+                purpose="ops",
+            )
         finally:
             conn.close()
-        return "email"
     except Exception:
-        return ""
+        pass
+
+
+def _compute_window(window_hours: int) -> tuple[int, int, float]:
+    """Return (sends_count, bounces_count, bounce_rate_pct) for the given window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    sends = _window_rows(SENDS_FILE, cutoff)
+    bounces = [r for r in _window_rows(BOUNCES_FILE, cutoff) if r.get("event") == "bounced"]
+    sends_count = sum(1 for r in sends if r.get("status") == "sent")
+    bounces_count = len(bounces)
+    rate = (100.0 * bounces_count / sends_count) if sends_count else 0.0
+    return sends_count, bounces_count, rate
 
 
 def main() -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
-    sends = _window_rows(SENDS_FILE, cutoff)
-    bounces = [row for row in _window_rows(BOUNCES_FILE, cutoff) if row.get("event") == "bounced"]
-    complaints = [row for row in _window_rows(BOUNCES_FILE, cutoff) if row.get("event") == "complained"]
+    # --- 1h window ---
+    sends_1h, bounces_1h, rate_1h = _compute_window(WINDOW_1H)
+    cutoff_1h = datetime.now(timezone.utc) - timedelta(hours=WINDOW_1H)
+    sends_1h_rows = _window_rows(SENDS_FILE, cutoff_1h)
+    source_pipeline = _latest_source_pipeline([r for r in sends_1h_rows if r.get("status") == "sent"])
 
-    sends_count = sum(1 for row in sends if row.get("status") == "sent")
-    bounces_count = len(bounces)
-    complaints_count = len(complaints)
-    bounce_rate = (100.0 * bounces_count / sends_count) if sends_count else 0.0
-    source_pipeline = _latest_source_pipeline([row for row in sends if row.get("status") == "sent"])
-
-    throttle = bounce_rate > THROTTLE_THRESHOLD_PCT
-    alert = bounce_rate > ALERT_THRESHOLD_PCT
+    throttle_1h = rate_1h > THROTTLE_PCT_1H
+    alert_1h = rate_1h > ALERT_PCT_1H
     paused_channel = ""
 
-    if throttle:
+    if throttle_1h:
         record = {
             "ts": now_iso(),
             "action": "auto-throttle",
-            "reason": "hourly bounce_rate exceeded 5%",
+            "trigger_window": "1h",
+            "reason": f"1h bounce_rate {rate_1h:.1f}% exceeded {THROTTLE_PCT_1H}% threshold",
             "source_pipeline": source_pipeline,
             "channel": "email",
-            "window_hours": WINDOW_HOURS,
-            "sends_1h": sends_count,
-            "bounces_1h": bounces_count,
-            "complaints_1h": complaints_count,
-            "bounce_rate_1h": round(bounce_rate, 2),
+            "window_hours": WINDOW_1H,
+            "sends": sends_1h,
+            "bounces": bounces_1h,
+            "bounce_rate_pct": round(rate_1h, 2),
+            "pause_hours": 24,
+            "auto_resume": False,
         }
         _append_jsonl(KILLSWITCH_LOG, record)
-        paused_channel = _pause_email_channel(record["reason"])
+        paused_channel = _pause_email_channel_db(record["reason"], hours=24)
 
-    if alert:
-        try:
-            from runtime.db import connect
-            from runtime.engine import notify_operator_deduped
+    if alert_1h:
+        _notify_operator(
+            f"🚨 Bounce guardian (1h): {rate_1h:.1f}% bounce rate "
+            f"({bounces_1h}/{sends_1h}) on {source_pipeline}. "
+            f"Auto-throttle={'yes' if throttle_1h else 'no'}. Manual resume required.",
+            kind=f"bounce_rate_guardian_1h_{source_pipeline}",
+        )
 
-            conn = connect()
-            try:
-                notify_operator_deduped(
-                    conn,
-                    (
-                        f"🚨 Bounce guardian: {bounce_rate:.1f}% bounce rate in the last hour "
-                        f"({bounces_count}/{sends_count}) on {source_pipeline}. "
-                        f"Auto-throttle={'yes' if throttle else 'no'}."
-                    ),
-                    kind=f"bounce_rate_guardian_{source_pipeline}",
-                    dedup_window_hours=6,
-                    purpose="ops",
-                )
-            finally:
-                conn.close()
-        except Exception:
-            pass
+    # --- 24h window (NEW) ---
+    sends_24h, bounces_24h, rate_24h = _compute_window(WINDOW_24H)
+    throttle_24h = (not throttle_1h) and (rate_24h > THROTTLE_PCT_24H)
+    alert_24h = rate_24h > ALERT_PCT_24H
+
+    if throttle_24h:
+        from datetime import datetime as _dt
+        pause_until_ts = (_dt.now(timezone.utc) + timedelta(hours=PAUSE_HOURS_24H)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        record_24h = {
+            "ts": now_iso(),
+            "action": "auto-throttle",
+            "trigger_window": "24h",
+            "reason": f"24h bounce_rate {rate_24h:.1f}% exceeded {THROTTLE_PCT_24H}% threshold",
+            "source_pipeline": source_pipeline,
+            "channel": "email",
+            "window_hours": WINDOW_24H,
+            "sends": sends_24h,
+            "bounces": bounces_24h,
+            "bounce_rate_pct": round(rate_24h, 2),
+            "pause_hours": PAUSE_HOURS_24H,
+            "pause_until": pause_until_ts,
+            "auto_resume": False,
+        }
+        _append_jsonl(KILLSWITCH_LOG, record_24h)
+        if not paused_channel:
+            paused_channel = _pause_email_channel_db(record_24h["reason"], hours=PAUSE_HOURS_24H)
+
+    if alert_24h and not alert_1h:
+        _notify_operator(
+            f"🚨 Bounce guardian (24h): {rate_24h:.1f}% bounce rate "
+            f"({bounces_24h}/{sends_24h}) over last 24h on {source_pipeline}. "
+            f"Auto-throttle={'yes' if throttle_24h else 'no'}. Manual resume required.",
+            kind=f"bounce_rate_guardian_24h_{source_pipeline}",
+        )
 
     summary = {
         "ts": now_iso(),
         "event": "run.done",
-        "window_hours": WINDOW_HOURS,
-        "sends_1h": sends_count,
-        "bounces_1h": bounces_count,
-        "complaints_1h": complaints_count,
-        "bounce_rate_1h": round(bounce_rate, 2),
+        # 1h
+        "sends_1h": sends_1h,
+        "bounces_1h": bounces_1h,
+        "bounce_rate_1h": round(rate_1h, 2),
+        "would_throttle_1h": throttle_1h,
+        "would_alert_1h": alert_1h,
+        # 24h
+        "sends_24h": sends_24h,
+        "bounces_24h": bounces_24h,
+        "bounce_rate_24h": round(rate_24h, 2),
+        "would_throttle_24h": throttle_24h,
+        "would_alert_24h": alert_24h,
+        # shared
         "source_pipeline": source_pipeline,
-        "would_throttle": throttle,
-        "would_alert": alert,
         "paused_channel": paused_channel,
     }
     _append_jsonl(GUARDIAN_LOG, summary)
 
     print(
-        f"bounce_rate_1h={bounce_rate:.2f}% sends_1h={sends_count} "
-        f"bounces_1h={bounces_count} complaints_1h={complaints_count} "
-        f"source_pipeline={source_pipeline} would_throttle={'yes' if throttle else 'no'} "
-        f"would_alert={'yes' if alert else 'no'}"
+        f"1h:  rate={rate_1h:.2f}% sends={sends_1h} bounces={bounces_1h} "
+        f"throttle={'yes' if throttle_1h else 'no'}\n"
+        f"24h: rate={rate_24h:.2f}% sends={sends_24h} bounces={bounces_24h} "
+        f"throttle={'yes' if throttle_24h else 'no'}\n"
+        f"paused_channel={paused_channel or 'none'}"
     )
     return 0
 

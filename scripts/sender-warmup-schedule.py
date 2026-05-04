@@ -22,8 +22,8 @@ from pathlib import Path
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OPS = DATA_ROOT / "operations"
 STATE_FILE = DATA_ROOT / "control" / "sender-warmup-state.json"
-# email-sends.jsonl may live under rick-vault/operations when RICK_DATA_ROOT
-# points to a different root (e.g. rick-install-test/data). Search both.
+# email-sends.jsonl canonically lives under rick-vault/operations. Older
+# installs sometimes pinned RICK_DATA_ROOT elsewhere; search both for safety.
 _SENDS_CANDIDATES = [
     OPS / "email-sends.jsonl",
     Path.home() / "rick-vault" / "operations" / "email-sends.jsonl",
