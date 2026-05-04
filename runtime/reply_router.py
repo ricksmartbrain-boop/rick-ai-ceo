@@ -335,10 +335,22 @@ def _alert_vlad(label: str, conn, row: dict, dry_run: bool, *,
         if tg_script.is_file():
             prefix = "🚨 " if urgent else ""
             text = f"{prefix}*{label}* from `{email}`\n_{subject}_\n\n{body_preview[:240]}"
-            subprocess.run(
-                ["bash", str(tg_script), "customer", text],
+            # Primary: openclaw message send → customer (tid 32)
+            _r = subprocess.run(
+                [
+                    "openclaw", "message", "send",
+                    "--channel", "telegram",
+                    "--target", "-1003781085932",
+                    "--thread-id", "32",
+                    "--message", text,
+                ],
                 capture_output=True, text=True, timeout=10, check=False,
             )
+            if _r.returncode != 0 and tg_script.is_file():  # Fallback: tg-topic.sh
+                subprocess.run(
+                    ["bash", str(tg_script), "customer", text],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
     except Exception:
         pass
     out = {"action": "alerted-vlad", "label": label, "email": email}

@@ -413,21 +413,33 @@ def main():
     if len(no_email_skips) >= 2:
         try:
             import subprocess  # noqa: WPS433
-            tg_script = HOME / "clawd" / "scripts" / "tg-topic.sh"
-            if tg_script.is_file():
-                names = ", ".join(c.get("callsign", "?") for c in no_email_skips[:8])
-                msg = (
-                    f"📭 Post-install nudge: {len(no_email_skips)} free installs in 48-72h "
-                    f"window have NO email known.\n\n"
-                    f"Callsigns: {names}\n\n"
-                    f"Fix: add to ~/rick-vault/data/callsign-emails.json — "
-                    f"`{{\"Mochi\": \"founder@example.com\", ...}}` — "
-                    f"then next 06:00 PT cron will email them the day-2 nudge."
-                )
-                subprocess.run(
-                    ["bash", str(tg_script), "customer", msg],
-                    capture_output=True, text=True, timeout=15, check=False,
-                )
+            names = ", ".join(c.get("callsign", "?") for c in no_email_skips[:8])
+            msg = (
+                f"📭 Post-install nudge: {len(no_email_skips)} free installs in 48-72h "
+                f"window have NO email known.\n\n"
+                f"Callsigns: {names}\n\n"
+                f"Fix: add to ~/rick-vault/data/callsign-emails.json — "
+                f"`{{\"Mochi\": \"founder@example.com\", ...}}` — "
+                f"then next 06:00 PT cron will email them the day-2 nudge."
+            )
+            # Primary: openclaw message send → customer (chat -1003781085932, tid 32)
+            _r = subprocess.run(
+                [
+                    "openclaw", "message", "send",
+                    "--channel", "telegram",
+                    "--target", "-1003781085932",
+                    "--thread-id", "32",
+                    "--message", msg,
+                ],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if _r.returncode != 0:  # Fallback: tg-topic.sh
+                tg_script = HOME / "clawd" / "scripts" / "tg-topic.sh"
+                if tg_script.is_file():
+                    subprocess.run(
+                        ["bash", str(tg_script), "customer", msg],
+                        capture_output=True, text=True, timeout=15, check=False,
+                    )
         except Exception:
             pass
 

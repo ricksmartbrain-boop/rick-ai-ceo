@@ -122,12 +122,42 @@ def _format_message(mrr: float, mrr_source: str, anthropic_30d: float, total_30d
     return "\n".join(lines)
 
 
+# topic→(chat_id, thread_id) map — migrated from tg-topic.sh (Strategy-C #1)
+_TG_TOPIC_MAP = {
+    "ops-alerts": ("-1003781085932", 34), "ops": ("-1003781085932", 34),
+    "approvals":  ("-1003781085932", 26), "customer":  ("-1003781085932", 32),
+    "product-lab":("-1003781085932", 28), "distribution":("-1003781085932", 30),
+    "traffic":    ("-1003781085932", 715), "test":      ("-1003781085932", 36),
+    "ceo-hq":     ("-1003781085932", 24),
+}
+
+
 def _post_telegram(text: str, topic: str) -> dict:
+    # Primary: openclaw message send
+    entry = _TG_TOPIC_MAP.get(topic)
+    if entry:
+        chat_id, tid = entry
+        try:
+            proc = subprocess.run(
+                [
+                    "openclaw", "message", "send",
+                    "--channel", "telegram",
+                    "--target", chat_id,
+                    "--thread-id", str(tid),
+                    "--message", text,
+                ],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if proc.returncode == 0:
+                return {"posted": True, "via": "openclaw", "topic": topic}
+        except Exception:
+            pass
+    # Fallback: tg-topic.sh
     script = ROOT / "scripts" / "tg-topic.sh"
     if not script.is_file():
         return {"posted": False, "reason": f"missing {script}"}
     proc = subprocess.run(["bash", str(script), topic, text], capture_output=True, text=True, timeout=20, check=False)
-    return {"posted": proc.returncode == 0, "stdout": proc.stdout[:400], "stderr": proc.stderr[:400], "exit": proc.returncode}
+    return {"posted": proc.returncode == 0, "via": "tg-topic.sh", "stdout": proc.stdout[:400], "stderr": proc.stderr[:400], "exit": proc.returncode}
 
 
 def main() -> int:

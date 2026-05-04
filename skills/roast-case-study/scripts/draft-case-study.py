@@ -326,10 +326,29 @@ def _write_draft_file(domain: str, card: str, lead_id: str | None) -> Path:
 
 
 def _post_telegram(domain: str) -> tuple[bool, str]:
-    """Best-effort Telegram alert via tg-topic.sh customer."""
-    if not TG_TOPIC_SH.is_file():
-        return False, "tg-topic.sh missing"
+    """Best-effort Telegram alert via openclaw message send (tg-topic.sh fallback)."""
     msg = f"📝 Roast case-study draft: {_sanitize_domain(domain)} — review at /draft N"
+    # Primary: openclaw message send → customer (chat -1003781085932, tid 32)
+    try:
+        result = subprocess.run(
+            [
+                "openclaw", "message", "send",
+                "--channel", "telegram",
+                "--target", "-1003781085932",
+                "--thread-id", "32",
+                "--message", msg,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode == 0:
+            return True, "ok (openclaw)"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        pass  # fall through to tg-topic.sh
+    # Fallback: tg-topic.sh
+    if not TG_TOPIC_SH.is_file():
+        return False, "all-paths-failed"
     try:
         result = subprocess.run(
             ["bash", str(TG_TOPIC_SH), "customer", msg],

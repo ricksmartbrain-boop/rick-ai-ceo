@@ -212,15 +212,32 @@ def render(s: dict) -> str:
 def post_to_telegram(text: str, dry_run: bool) -> dict:
     if dry_run:
         return {"posted": False, "reason": "dry-run", "preview_chars": len(text)}
+    # Primary: openclaw message send → customer (chat -1003781085932, tid 32)
+    try:
+        proc = subprocess.run(
+            [
+                "openclaw", "message", "send",
+                "--channel", "telegram",
+                "--target", "-1003781085932",
+                "--thread-id", "32",
+                "--message", text,
+            ],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if proc.returncode == 0:
+            return {"posted": True, "via": "openclaw"}
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Fallback: tg-topic.sh
     if not TG_SCRIPT.is_file():
-        return {"posted": False, "reason": "tg-script-missing"}
+        return {"posted": False, "reason": "all-paths-failed"}
     try:
         proc = subprocess.run(
             ["bash", str(TG_SCRIPT), "customer", text],
             capture_output=True, text=True, timeout=20, check=False,
         )
         if proc.returncode == 0:
-            return {"posted": True}
+            return {"posted": True, "via": "tg-topic.sh"}
         return {"posted": False, "reason": "tg-failed", "stderr": proc.stderr[:200]}
     except subprocess.TimeoutExpired:
         return {"posted": False, "reason": "tg-timeout"}

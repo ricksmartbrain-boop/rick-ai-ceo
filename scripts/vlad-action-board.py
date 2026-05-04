@@ -70,6 +70,7 @@ SUPPRESSION_VIOLS  = OPS / "suppression-violations.jsonl"
 FALLBACK_LOG       = OPS / "llm-fallback-events.jsonl"
 MEMELORD_LOG_PATH  = OPS / "memelord-pipeline.jsonl"
 SENDER_WARMUP_FILE = DATA_ROOT / "control" / "sender-warmup-state.json"
+VLAD_DMS_DIR       = DATA_ROOT / "projects" / "vlad-dms"
 ANTHROPIC_CREDITS  = DATA_ROOT / "control" / "anthropic-credits.json"
 MOLTBOOK_CREDS     = Path.home() / ".config" / "moltbook" / "credentials.json"
 FENIX_DECISIONS    = OPS / "fenix-decisions.jsonl"
@@ -899,7 +900,80 @@ def _gather_quickstart_cta() -> list[Task]:
 # GATHER all tasks
 # ═══════════════════════════════════════════════════════════════════════════
 
-SECTION_ORDER = ["APPROVALS NEEDED", "INBOX", "MANUAL FIXES", "STRATEGIC DECISIONS"]
+SECTION_ORDER = ["APPROVALS NEEDED", "INBOX", "MANUAL FIXES", "OUTREACH", "STRATEGIC DECISIONS"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 — OUTREACH
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _gather_linkedin_dms() -> list[Task]:
+    """Surface pending Vlad-manual LinkedIn DMs from vlad-dms/ draft files."""
+    tasks: list[Task] = []
+    if not VLAD_DMS_DIR.exists():
+        return tasks
+
+    dm_files = sorted(VLAD_DMS_DIR.glob("*-linkedin-dm.txt"))
+    if not dm_files:
+        return tasks
+
+    # Parse each file for TO/PRIORITY/LINKEDIN header fields
+    p0_leads: list[str] = []
+    p1_leads: list[str] = []
+
+    for fpath in dm_files:
+        try:
+            text = fpath.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        lines = text.splitlines()
+        to_line = next((l for l in lines if l.startswith("TO:")), "")
+        prio_line = next((l for l in lines if l.startswith("PRIORITY:")), "")
+        linkedin_line = next((l for l in lines if l.startswith("LINKEDIN:")), "")
+        name = to_line.replace("TO:", "").split("|")[0].strip() if to_line else fpath.stem
+        company = to_line.split("|")[1].strip() if to_line and "|" in to_line else ""
+        priority = prio_line.replace("PRIORITY:", "").strip() if prio_line else "P1"
+        linkedin = linkedin_line.replace("LINKEDIN:", "").strip() if linkedin_line else "needs-linkedin-search"
+        label_suffix = f" ({linkedin})" if linkedin != "needs-linkedin-search" else " (LinkedIn URL needed)"
+        label = f"{name} — {company}{label_suffix}"
+
+        if priority == "P0":
+            p0_leads.append(label)
+        else:
+            p1_leads.append(label)
+
+    dm_dir_str = str(VLAD_DMS_DIR)
+
+    if p0_leads:
+        tasks.append(Task(
+            section="OUTREACH",
+            priority="P0",
+            label=f"LinkedIn DM P0 — {p0_leads[0]}",
+            detail=(
+                f"HOT lead — already replied to Rick email. Send this DM today.\n"
+                f"Draft: {dm_dir_str}/wf_050fb1d53cb7-linkedin-dm.txt\n"
+                f"Steps: (1) find Arjun on LinkedIn, (2) paste DM, (3) send."
+            ),
+            est_mins=5,
+            blocked="Vlad hasn't sent the DM yet — warm signal decays hourly",
+            overdue=True,
+        ))
+
+    if p1_leads:
+        tasks.append(Task(
+            section="OUTREACH",
+            priority="P1",
+            label=f"LinkedIn DMs P1 — {len(p1_leads)} founder DMs to send this week",
+            detail=(
+                f"All drafts in: {dm_dir_str}/\n"
+                + "\n".join(f"  • {l}" for l in p1_leads)
+                + f"\nEach DM: copy + paste from draft file, send from Vlad's LinkedIn. ~3-5 min each."
+            ),
+            est_mins=len(p1_leads) * 4,
+            blocked=None,
+        ))
+
+    return tasks
 
 
 def gather_all() -> list[Task]:
@@ -917,6 +991,8 @@ def gather_all() -> list[Task]:
     tasks += _gather_anthropic_billing()
     tasks += _gather_memelord_credits()
     tasks += _gather_suppression_violations()
+    # Outreach
+    tasks += _gather_linkedin_dms()
     # Strategic
     tasks += _gather_icp_warmup()
     tasks += _gather_experiment_decisions()

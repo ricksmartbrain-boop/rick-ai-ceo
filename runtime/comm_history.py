@@ -514,6 +514,40 @@ def _apply_filter(
 
 
 # ---------------------------------------------------------------------------
+# Semantic score helper (additive only — never changes exact-match path)
+# ---------------------------------------------------------------------------
+
+def _apply_semantic_score(
+    touches: list[Touch],
+    email: str,
+    semantic_query: str,
+) -> list[Touch]:
+    """Inject _semantic_score into the most-recent touch for this recipient.
+
+    Looks up the recipient's embedding similarity to semantic_query using the
+    precomputed comm_embeddings index. Fails silently — always returns touches
+    unchanged on any error.
+    """
+    if not touches or not semantic_query:
+        return touches
+    try:
+        try:
+            from runtime.comm_embeddings import find_similar  # type: ignore
+        except ImportError:
+            from comm_embeddings import find_similar  # type: ignore
+        matches = find_similar(semantic_query, top_k=100)
+        score_map = {m["email"]: m["similarity"] for m in matches}
+        recipient_score = score_map.get(email)
+        if recipient_score is not None:
+            last = dict(touches[-1])
+            last["_semantic_score"] = round(recipient_score, 4)
+            return list(touches[:-1]) + [last]
+    except Exception:  # noqa: BLE001
+        pass
+    return touches
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -542,7 +576,11 @@ def get_history(
     if email in _MEM_CACHE:
         cached_at, touches = _MEM_CACHE[email]
         if (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
-            return _apply_filter(touches, modality_filter, days_back)
+            if not semantic_query:
+                return _apply_filter(touches, modality_filter, days_back)
+            # semantic_query: fall through to shared enrichment path below
+            _touches_for_sem = _apply_filter(touches, modality_filter, days_back)
+            return _apply_semantic_score(_touches_for_sem, email, semantic_query)
 
     # 2. Disk cache
     disk = _get_disk_cache()
@@ -550,7 +588,10 @@ def get_history(
         cached_at, touches = disk[email]
         if (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
             _MEM_CACHE[email] = (cached_at, touches)
-            return _apply_filter(touches, modality_filter, days_back)
+            if not semantic_query:
+                return _apply_filter(touches, modality_filter, days_back)
+            _touches_for_sem = _apply_filter(touches, modality_filter, days_back)
+            return _apply_semantic_score(_touches_for_sem, email, semantic_query)
 
     # 3. Cache miss — aggregate from all sources (base window = 90d)
     touches = _aggregate_for(email, days_back=90)
@@ -561,36 +602,8 @@ def get_history(
     _cache_write(disk)
 
     result = _apply_filter(touches, modality_filter, days_back)
-
-    # --- ADDITIVE SEMANTIC LAYER -------------------------------------------
-    # Only runs when caller explicitly passes semantic_query.
-    # Never changes the exact-match path; fails silently on any error.
-    if semantic_query and result:
-        try:
-            from runtime.comm_embeddings import find_similar  # type: ignore
-        except ImportError:
-            try:
-                from comm_embeddings import find_similar  # type: ignore
-            except ImportError:
-                find_similar = None  # type: ignore
-
-        if find_similar is not None:
-            try:
-                matches = find_similar(semantic_query, top_k=50)
-                # Build lookup: email → similarity score
-                score_map = {m["email"]: m["similarity"] for m in matches}
-                recipient_score = score_map.get(email, None)
-                if recipient_score is not None:
-                    # Tag the most-recent touch with the semantic score so
-                    # callers (e.g. LLM prompt builders) can surface it.
-                    # Copy the touch dict to avoid mutating the cache.
-                    last = dict(result[-1])
-                    last["_semantic_score"] = round(recipient_score, 4)
-                    result = list(result[:-1]) + [last]
-            except Exception:  # noqa: BLE001
-                pass  # semantic errors never break exact-match callers
-    # -------------------------------------------------------------------------
-
+    if semantic_query:
+        result = _apply_semantic_score(result, email, semantic_query)
     return result
 
 

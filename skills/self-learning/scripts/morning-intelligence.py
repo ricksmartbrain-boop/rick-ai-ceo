@@ -303,11 +303,28 @@ def build_brief(stripe: dict, x: dict, experiments: dict, velocity: dict) -> str
 
 # ── Send to Telegram Ops Alerts ──────────────────────────────────────────────
 def send_telegram(text: str) -> None:
-    """Route morning brief to Ops Alerts (topic:34), NOT CEO HQ (topic:24)."""
+    """Route morning brief to ops-alerts (topic:34) via openclaw message send."""
+    # Primary: openclaw message send (chat -1003781085932, tid 34)
+    try:
+        r = subprocess.run(
+            [
+                "openclaw", "message", "send",
+                "--channel", "telegram",
+                "--target", "-1003781085932",
+                "--thread-id", "34",
+                "--message", text,
+            ],
+            capture_output=True, timeout=15,
+        )
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+    # Fallback: tg-topic.sh
     try:
         subprocess.run(
             ["bash", str(WORKSPACE / "scripts/tg-topic.sh"), "ops-alerts", text],
-            capture_output=True, timeout=10
+            capture_output=True, timeout=10,
         )
     except Exception:
         pass

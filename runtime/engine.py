@@ -1423,6 +1423,35 @@ _NOTIFY_LAST_SENT_AT = 0.0
 _NOTIFY_RATE_WINDOW_S = 5.0
 
 
+def _fire_slack_parallel(resolved: str, text: str, logger) -> None:  # noqa: ANN001
+    """Fire a best-effort parallel Slack alert for P0-urgency notifications.
+
+    Opt-in gate: RICK_SLACK_P0_ENABLED=1  (default off — wire first, Vlad enables).
+    Target channel: RICK_SLACK_P0_CHANNEL  (Slack channelId or user:ID).
+    Strategy-C #1 bonus, 2026-05-04.
+    """
+    slack_target = os.getenv("RICK_SLACK_P0_CHANNEL", "").strip()
+    if not slack_target:
+        logger.debug("_fire_slack_parallel: RICK_SLACK_P0_CHANNEL not set — skipping")
+        return
+    try:
+        subprocess.run(
+            [
+                resolved, "message", "send",
+                "--channel", "slack",
+                "--target", slack_target,
+                "--message", text,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        logger.info("notify_operator: P0 Slack parallel fired → %s", slack_target)
+    except Exception as exc:
+        logger.debug("notify_operator: Slack parallel failed: %s", exc)
+
+
 def notify_operator(
     connection: sqlite3.Connection,
     text: str,
@@ -1497,11 +1526,28 @@ def notify_operator(
         _fallback_notification(text, workflow_id=workflow_id, error=f"binary not found: {binary}")
         return
 
+    # Route: topic-specific delivery when chat_id/thread_id are provided →
+    # use 'openclaw message send' for precise Telegram forum routing.
+    # Default broadcast (no explicit target) → 'openclaw system event'.
+    # Strategy-C #1, 2026-05-04.
+    if chat_id or thread_id is not None:
+        _cmd_base = [
+            resolved, "message", "send",
+            "--channel", "telegram",
+            "--message", text,
+        ]
+        if chat_id:
+            _cmd_base += ["--target", str(chat_id)]
+        if thread_id is not None:
+            _cmd_base += ["--thread-id", str(thread_id)]
+    else:
+        _cmd_base = [resolved, "system", "event", "--text", text, "--mode", "now"]
+
     last_error = ""
     for attempt in range(1, 4):
         try:
             result = subprocess.run(
-                [resolved, "system", "event", "--text", text, "--mode", "now"],
+                _cmd_base,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1510,6 +1556,9 @@ def notify_operator(
             if result.returncode == 0:
                 if attempt > 1:
                     logger.info("notify_operator succeeded on attempt %d", attempt)
+                # Bonus: parallel Slack for P0-urgency (opt-in via RICK_SLACK_P0_ENABLED=1)
+                if is_urgent_for_rate and os.getenv("RICK_SLACK_P0_ENABLED", "").strip() in ("1", "true"):
+                    _fire_slack_parallel(resolved, text, logger)
                 return
             last_error = result.stderr.strip() or f"exit code {result.returncode}"
             logger.warning("notify_operator attempt %d failed: %s", attempt, last_error)
