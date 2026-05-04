@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,18 @@ def channel_config(channel: str) -> dict[str, Any]:
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse a stored ISO timestamp; accepts trailing 'Z' and naive forms."""
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _today_str() -> str:
@@ -110,7 +121,7 @@ def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
         paused_until = row["paused_until"]
         if status == "paused" and paused_until:
             try:
-                if datetime.fromisoformat(paused_until) <= _now():
+                if _parse_iso(paused_until) <= _now():
                     # Soft pause expired — flip back to active.
                     conn.execute(
                         "UPDATE channel_state SET status='active', paused_until=NULL, pause_reason='', updated_at=? WHERE channel=?",

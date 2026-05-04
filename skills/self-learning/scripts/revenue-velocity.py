@@ -184,11 +184,41 @@ def save_velocity_log(data: dict) -> None:
     REVENUE_DIR.mkdir(parents=True, exist_ok=True)
     VELOCITY_LOG.write_text(json.dumps(data, indent=2))
 
+# topic→(chat_id, thread_id) — migrated from tg-topic.sh (Strategy-C #1)
+_TG_TOPIC_MAP = {
+    "ops-alerts": ("-1003781085932", 34), "ops": ("-1003781085932", 34),
+    "approvals":  ("-1003781085932", 26), "customer":  ("-1003781085932", 32),
+    "product-lab":("-1003781085932", 28), "distribution":("-1003781085932", 30),
+    "traffic":    ("-1003781085932", 715), "test":      ("-1003781085932", 36),
+    "ceo-hq":     ("-1003781085932", 24),
+}
+
+
 def send_telegram(topic: str, text: str) -> None:
+    """Send to named Telegram topic via openclaw message send (tg-topic.sh fallback)."""
+    entry = _TG_TOPIC_MAP.get(topic)
+    if entry:
+        chat_id, tid = entry
+        try:
+            r = subprocess.run(
+                [
+                    "openclaw", "message", "send",
+                    "--channel", "telegram",
+                    "--target", chat_id,
+                    "--thread-id", str(tid),
+                    "--message", text,
+                ],
+                capture_output=True, timeout=15,
+            )
+            if r.returncode == 0:
+                return
+        except Exception:
+            pass
+    # Fallback: tg-topic.sh
     try:
         subprocess.run(
             ["bash", str(WORKSPACE / "scripts/tg-topic.sh"), topic, text],
-            capture_output=True, timeout=10
+            capture_output=True, timeout=10,
         )
     except Exception:
         pass
