@@ -142,6 +142,12 @@ FLAG_PROBES: list[tuple[str, str, float, Optional[Callable[[dict], bool]]]] = [
     # Digest surface: 🛡️ Anthropic watchdog: last check OK / disabled-until cleared X ago.
     ("RICK_BILLING_WATCHDOG_LIVE", "billing-watchdog.jsonl", 0.5,
         lambda e: e.get("status") in ("ok", "cleared", "credits_low", "error")),
+    # comm-embeddings index is rebuilt hourly (or on-demand via build_index()).
+    # Probes the trailing index_meta record written by comm_embeddings._save_index.
+    # 2.0h = one missed hourly refresh before alerting — hysteresis for machine sleep.
+    # Index freshness required for find_warmest_silent_leads() to return useful results.
+    ("RICK_EMBEDDING_INDEX_LIVE", "comm-embeddings-index.jsonl", 2.0,
+        lambda e: e.get("record_type") == "index_meta" and e.get("status") == "ok"),
 ]
 
 

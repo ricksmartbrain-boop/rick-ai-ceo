@@ -26,6 +26,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 CHANNEL_LIMITS_FILE = Path(
     os.getenv("RICK_CHANNEL_LIMITS_FILE", str(ROOT_DIR / "config" / "channel-limits.json"))
 )
+DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+# Zero-tolerance bounce guardian marker (written by ops scripts).
+_BOUNCE_GUARDIAN_FILE = DATA_ROOT / "control" / "email-bounce-guardian.json"
 
 
 class ChannelPaused(Exception):
@@ -210,9 +213,43 @@ def record_auth_failure(conn: sqlite3.Connection, channel: str, detail: str = ""
 
 
 def record_bounce(conn: sqlite3.Connection, channel: str) -> None:
-    """Email bounce — bump counter, pause channel if threshold exceeded."""
+    """Email bounce — bump counter, pause channel if threshold exceeded.
+
+    BOUNCE GUARDIAN MODE (Strategy-A ICP batch):
+    When email-bounce-guardian.json is active, ANY single bounce immediately
+    re-pauses the channel — much tighter than the normal 5%/24h threshold.
+    Guardian is time-boxed (active.until) so it expires automatically.
+    """
     row = _ensure_row(conn, channel)
     new_count = int(row["bounce_count_7d"] or 0) + 1
+
+    # --- Zero-tolerance guardian check (fires first, channel-specific) ---
+    if channel == "email" and _BOUNCE_GUARDIAN_FILE.exists():
+        try:
+            _g = json.loads(_BOUNCE_GUARDIAN_FILE.read_text(encoding="utf-8"))
+            _until_str = _g.get("until", "")
+            if _g.get("active") and _until_str and datetime.fromisoformat(_until_str) > _now():
+                conn.execute(
+                    """
+                    UPDATE channel_state
+                       SET status='paused', pause_reason=?,
+                           paused_until=?, bounce_count_7d=?, updated_at=?
+                     WHERE channel=?
+                    """,
+                    (
+                        f"BOUNCE GUARDIAN TRIGGERED: any-bounce zero-tolerance active until {_until_str}",
+                        (_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+                        new_count,
+                        _now().isoformat(timespec="seconds"),
+                        channel,
+                    ),
+                )
+                conn.commit()
+                return
+        except Exception:
+            pass  # Guardian read errors must never block the normal path
+
+    # --- Normal threshold logic ---
     cfg = channel_config(channel)
     threshold_pct = float(cfg.get("bounce_threshold_pct") or 0)
     sends_today = int(row["sends_today"] or 0)

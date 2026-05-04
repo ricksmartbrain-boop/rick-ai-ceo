@@ -3,11 +3,17 @@
 
 Public API
 ----------
-get_history(recipient, modality_filter=None, days_back=90) → list[Touch]
+get_history(recipient, modality_filter=None, days_back=90, semantic_query=None) → list[Touch]
+  When semantic_query is provided, the most semantically-relevant touch (by
+  cosine similarity to the query against the precomputed recipient embedding)
+  is promoted to the top of the list and tagged with _semantic_score. Falls
+  back silently to chronological order if the embeddings index is unavailable.
 render_for_prompt(history, max_chars=3000) → str
 aggregate_by_recipient(days_back=90) → dict[str, list[Touch]]
 get_digest_top5(days_back=7) → list[tuple[str, int]]
 format_digest_line(top5, days_back=7) → str
+find_warmest_silent_leads(days_silent_min=14, top_k=10) → list[dict]
+  Semantic wrapper: delegates to comm_embeddings.find_warmest_silent_leads.
 is_suppressed(email, days_back=90) → tuple[bool, str]
 
 Touch schema (TypedDict-compatible plain dict)
@@ -515,12 +521,17 @@ def get_history(
     recipient_id_or_email: str,
     modality_filter: list[str] | None = None,
     days_back: int = 90,
+    semantic_query: str | None = None,
 ) -> list[Touch]:
     """Return ordered (oldest-first) list of all touches for recipient.
 
     Results are cached in-process and on disk for CACHE_TTL_SECONDS (1h).
     modality_filter: if set, only return touches of those modalities
       e.g. ["email_out", "email_in", "bounce"]
+    semantic_query: optional. When provided, looks up the recipient's
+      precomputed embedding from comm_embeddings and injects _semantic_score
+      into the most-recent touch. Exact-match path is always preserved;
+      semantic layer is additive and fails silently.
     """
     email = _norm_email(recipient_id_or_email)
     if not email:
@@ -549,7 +560,38 @@ def get_history(
     disk[email] = (now, touches)
     _cache_write(disk)
 
-    return _apply_filter(touches, modality_filter, days_back)
+    result = _apply_filter(touches, modality_filter, days_back)
+
+    # --- ADDITIVE SEMANTIC LAYER -------------------------------------------
+    # Only runs when caller explicitly passes semantic_query.
+    # Never changes the exact-match path; fails silently on any error.
+    if semantic_query and result:
+        try:
+            from runtime.comm_embeddings import find_similar  # type: ignore
+        except ImportError:
+            try:
+                from comm_embeddings import find_similar  # type: ignore
+            except ImportError:
+                find_similar = None  # type: ignore
+
+        if find_similar is not None:
+            try:
+                matches = find_similar(semantic_query, top_k=50)
+                # Build lookup: email → similarity score
+                score_map = {m["email"]: m["similarity"] for m in matches}
+                recipient_score = score_map.get(email, None)
+                if recipient_score is not None:
+                    # Tag the most-recent touch with the semantic score so
+                    # callers (e.g. LLM prompt builders) can surface it.
+                    # Copy the touch dict to avoid mutating the cache.
+                    last = dict(result[-1])
+                    last["_semantic_score"] = round(recipient_score, 4)
+                    result = list(result[:-1]) + [last]
+            except Exception:  # noqa: BLE001
+                pass  # semantic errors never break exact-match callers
+    # -------------------------------------------------------------------------
+
+    return result
 
 
 def render_for_prompt(history: list[Touch], max_chars: int = 3000) -> str:
@@ -754,6 +796,27 @@ def is_suppressed(email: str, days_back: int = 90) -> tuple[bool, str]:
         if t.get("modality") == "email_in" and t.get("status") in NEGATIVE_STATUSES:
             return True, f"Replied {t.get('status')} on {(t.get('ts') or '')[:10]}"
     return False, ""
+
+
+def find_warmest_silent_leads(
+    days_silent_min: int = 14,
+    top_k: int = 10,
+) -> list[dict]:
+    """Semantic wrapper: return leads silent >= days_silent_min days ranked by
+    converter-similarity × recency. Delegates entirely to comm_embeddings.
+
+    Returns: [{email, score, similarity, days_silent, last_touch_ts,
+               touch_count, outcome_summary}]
+    Returns [] when the embeddings index is unavailable.
+    """
+    try:
+        from runtime.comm_embeddings import find_warmest_silent_leads as _fwsl  # type: ignore
+    except ImportError:
+        try:
+            from comm_embeddings import find_warmest_silent_leads as _fwsl  # type: ignore
+        except ImportError:
+            return []
+    return _fwsl(days_silent_min=days_silent_min, top_k=top_k)
 
 
 def invalidate_cache(email: str) -> None:

@@ -119,6 +119,11 @@ SEQUENCE: list[dict[str, Any]] = [
 
 TERMINAL_TOUCH_KINDS = {"email-breakup"}  # after this, sequence is done
 
+# Statuses that mean a touch FAILED to dispatch and must be retried.
+# Any status NOT in this set counts as "attempted" for gating purposes,
+# so Day-5+ touches advance even when Day-0 is still 'queued' (in-flight).
+TERMINAL_FAILURES: frozenset[str] = frozenset({"error", "deduped"})
+
 # Max touches dispatched per tick — warmup Day 1 is 5, so the sequencer can
 # clear a full daily email allotment in one heartbeat if needed.
 MAX_DISPATCHES_PER_TICK = 5
@@ -176,9 +181,14 @@ def _touch_done(seq: dict, kind: str) -> bool:
 
 
 def _has_sent_touch(seq: dict, kind: str) -> bool:
-    """Return True if touch_log contains a sent record for *kind*."""
+    """Return True if touch_log shows *kind* was attempted (status not in TERMINAL_FAILURES).
+
+    'queued', 'sent', 'skipped', 'deferred' all count as attempted — sequencer can
+    advance to Day-5+ even when Day-0 is still in-flight (outbound_job queued).
+    Only 'error' and 'deduped' are terminal failures requiring a fresh dispatch.
+    """
     for entry in seq.get("touch_log", []):
-        if entry.get("kind") == kind and entry.get("status") == "sent":
+        if entry.get("kind") == kind and entry.get("status") not in TERMINAL_FAILURES:
             return True
     return False
 
