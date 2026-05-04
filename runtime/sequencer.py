@@ -186,11 +186,43 @@ def _has_sent_touch(seq: dict, kind: str) -> bool:
     'queued', 'sent', 'skipped', 'deferred' all count as attempted — sequencer can
     advance to Day-5+ even when Day-0 is still in-flight (outbound_job queued).
     Only 'error' and 'deduped' are terminal failures requiring a fresh dispatch.
+
+    NOTE: 2026-05-04 — this helper stays permissive for compatibility with other
+    callers, but the sequence-prerequisite gate now uses _has_confirmed_sent_touch()
+    so Day-N follow-ups can't fire while Day-(N-1) is still queued in the channel.
     """
     for entry in seq.get("touch_log", []):
         if entry.get("kind") == kind and entry.get("status") not in TERMINAL_FAILURES:
             return True
     return False
+
+
+def _has_confirmed_sent_touch(conn: sqlite3.Connection, wf_id: str, kind: str) -> bool:
+    """Strict gate: True only if the prerequisite touch's outbound_job is
+    actually in a terminal-success state ('done' / 'sent' / 'delivered' / 'replied').
+
+    Status 'queued' does NOT count — that means the dispatcher hasn't fired it,
+    typically because the channel is paused or the warmup cap is hit. Firing
+    Day-N while Day-(N-1) is still queued produces lying-content follow-ups
+    ("Re: …last note" when no last note ever sent). Defect surfaced 2026-05-04
+    via Vlad TUI handoff.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT status FROM outbound_jobs
+             WHERE lead_id=? AND template_id=?
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (wf_id, kind),
+        ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    status = row["status"] if hasattr(row, "keys") else row[0]
+    return status in ("done", "sent", "delivered", "replied")
 
 
 @lru_cache(maxsize=1)
@@ -775,7 +807,25 @@ def _dispatch_touch(
         seq["sequence_started_at"] = _now_iso()
 
     _save_context(conn, wf_id, ctx)
-    _log({"event": "touch_dispatched", "wf_id": wf_id, **result_meta})
+    # 2026-05-04: be honest about what just happened. fan_out() only INSERTs
+    # an outbound_job row in 'queued' status — channel gating + actual send
+    # happen later in outbound_dispatcher.drain(). Logging "touch_dispatched"
+    # here as if the message went out caused us to advance Day-N follow-ups
+    # while Day-0 sat queued for 7 days behind a paused email channel.
+    status = (result_meta.get("status") or "").lower()
+    if status == "queued":
+        event = "touch_queued"
+    elif status in ("sent", "delivered", "done"):
+        event = "touch_dispatched"
+    elif status in ("deferred", "skipped"):
+        event = "touch_skipped"
+    elif status in ("deduped",):
+        event = "touch_deduped"
+    elif status in ("error",):
+        event = "touch_error"
+    else:
+        event = "touch_recorded"
+    _log({"event": event, "wf_id": wf_id, **result_meta})
     return True
 
 
@@ -880,12 +930,12 @@ def _process_workflow(conn: sqlite3.Connection, workflow: sqlite3.Row) -> int:
             break
         if _touch_done(seq, touch["kind"]):
             continue
-        if touch["kind"] != "email-cold-1" and not _has_sent_touch(seq, "email-cold-1"):
+        if touch["kind"] != "email-cold-1" and not _has_confirmed_sent_touch(conn, wf_id, "email-cold-1"):
             _log({
                 "event": "touch_deferred",
                 "wf_id": wf_id,
                 "kind": touch["kind"],
-                "reason": "awaiting_sent_email_cold_1",
+                "reason": "awaiting_confirmed_sent_email_cold_1",
             })
             return 0
         if touch["channel"] == "email" and warmup_remaining <= 0:
