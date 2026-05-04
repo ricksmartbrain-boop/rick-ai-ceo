@@ -20,6 +20,8 @@ CLI
 ---
     python3 -m runtime.newsletter_memory backfill
     python3 -m runtime.newsletter_memory check <draft.json>
+    python3 -m runtime.newsletter_memory next-theme
+    python3 -m runtime.newsletter_memory no-repeat-block
 """
 
 from __future__ import annotations
@@ -256,6 +258,52 @@ def detect_overlap(draft: dict, history: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Prompt-side helpers
+# ---------------------------------------------------------------------------
+
+def next_theme(ledger_path: Path = LEDGER_PATH) -> str:
+    """Theme slot for the issue *after* the latest one in the ledger."""
+    history = last_n_issues(ledger_path=ledger_path, n=1000)
+    latest = max((r.get("issue") or 0 for r in history), default=0)
+    return slot_for_issue(latest + 1)
+
+
+def render_no_repeat_block(history: list[dict] | None = None) -> str:
+    """Render the DO NOT REPEAT prompt section for the LLM."""
+    if history is None:
+        history = last_n_issues(n=6)
+    if not history:
+        return ""
+    lines = [
+        "## DO NOT REPEAT (last 6 issues — every item below is OFF-LIMITS)",
+        "",
+        "Do not reuse any of these subjects, hooks, CTAs, or specific numbers.",
+        "Pick fresh angles. If your topic naturally pulls toward a number listed",
+        "below, use a different number or skip the number entirely.",
+        "",
+    ]
+    for e in history:
+        n = e.get("issue", "?")
+        date = e.get("date", "?") or "?"
+        theme = e.get("theme", "?")
+        lines.append(f"### Issue #{n} — {date} (theme: {theme})")
+        if e.get("subject"):
+            lines.append(f"- Subject: {e['subject']}")
+        if e.get("hook"):
+            lines.append(f"- Hook: {e['hook']}")
+        topics = e.get("topics") or []
+        if topics:
+            lines.append("- Topics: " + " | ".join(topics))
+        if e.get("cta"):
+            lines.append(f"- CTA: {e['cta']}")
+        nums = e.get("key_numbers") or []
+        if nums:
+            lines.append("- Numbers: " + ", ".join(nums))
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -285,17 +333,33 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_next_theme(args: argparse.Namespace) -> int:
+    print(next_theme())
+    return 0
+
+
+def _cmd_no_repeat_block(args: argparse.Namespace) -> int:
+    print(render_no_repeat_block())
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("backfill")
     pc = sub.add_parser("check")
     pc.add_argument("draft")
+    sub.add_parser("next-theme")
+    sub.add_parser("no-repeat-block")
     args = p.parse_args()
     if args.cmd == "backfill":
         return _cmd_backfill(args)
     if args.cmd == "check":
         return _cmd_check(args)
+    if args.cmd == "next-theme":
+        return _cmd_next_theme(args)
+    if args.cmd == "no-repeat-block":
+        return _cmd_no_repeat_block(args)
     return 1
 
 

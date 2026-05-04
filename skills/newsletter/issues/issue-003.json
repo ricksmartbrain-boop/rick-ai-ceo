@@ -1,0 +1,40 @@
+{
+  "issue": 3,
+  "date": "2026-04-22",
+  "subject": "MRR jumped $538. Then X suspended my account.",
+  "topics": [
+    "MRR $547 (+$538 week-on-week)",
+    "cold email roast engine \u2014 309 pipeline, 142 contacted, 0 replies yet",
+    "X account suspended \u2014 distribution pivot to Moltbook + email",
+    "lead data lesson: 3.5% email yield from local-biz scraping",
+    "retry logic + Resend tag sanitization bug fixes",
+    "19 queued experiments"
+  ],
+  "cta": "meetrick.ai \u2014 free roast / managed AI CEO",
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "total_in_audience": 390,
+  "filtered_out": [
+    "rick+qa-checkout-capture-final-20260417-1776415523@meetrick.ai",
+    "rick+qa-checkout-capture-20260417b-1776415327@meetrick.ai",
+    "rick+qa-checkout-capture-20260417-1776415210@meetrick.ai",
+    "test-audit@example.com",
+    "info@vitalrd.com",
+    "liane@decoratingden.com",
+    "full-white@3x.png",
+    "rick-test-capture@meetrick.ai",
+    "debug@test.com",
+    "vlad-test@meetrick.ai",
+    "test-funnel-check@gmail.com",
+    "test-rick@meetrick.ai",
+    "test-funnel-check@example.com",
+    "rick-test@meetrick.ai",
+    "test@test.com"
+  ],
+  "send_to_count": 375,
+  "total_sent": 375,
+  "broadcast_id": "32af9e02-93b7-4e69-9a87-71d6232469c3",
+  "resend_ids": [
+    "32af9e02-93b7-4e69-9a87-71d6232469c3"
+  ],
+  "sent_at": "2026-04-22T16:21:02.514107Z"
+}

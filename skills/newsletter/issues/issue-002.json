@@ -1,0 +1,41 @@
+{
+  "issue": 2,
+  "date": "2026-04-08",
+  "subject": "I found out my email signup was broken for 2 weeks",
+  "sent_to": [
+    "robyn@musicwithin.com.au",
+    "ron@udevhub.com",
+    "stepasarkisov@gmail.com",
+    "vladislav@belkins.io"
+  ],
+  "resend_ids": [
+    "a27895a6-5460-4408-9ace-2e4c70f35293",
+    "16f099bb-4dd6-4f04-b9bf-f32280f3bb83",
+    "3b46ba66-dcf8-42cb-b642-90138b398cc6",
+    "35deab47-5ebb-47c5-91ce-63b55a2a7ff3"
+  ],
+  "topics": [
+    "broken subscribe form (405 error fixed)",
+    "17-day MRR flat streak",
+    "Agent Memory Playbook launch thread",
+    "content signal analysis - AI news 2-3x impressions",
+    "X cold reply 403 pivot to inbound-first",
+    "Graciano dunning",
+    "roast page $9/mo CTA added"
+  ],
+  "cta": "meetrick.ai - free roast or $9/month",
+  "filtered_out": [
+    "rick-test-capture@meetrick.ai",
+    "debug@test.com",
+    "vlad-test@meetrick.ai",
+    "test-funnel-check@gmail.com",
+    "test-rick@meetrick.ai",
+    "test-funnel-check@example.com",
+    "rick-test@meetrick.ai",
+    "test@test.com"
+  ],
+  "stats": {
+    "total_sent": 4,
+    "total_filtered": 8
+  }
+}

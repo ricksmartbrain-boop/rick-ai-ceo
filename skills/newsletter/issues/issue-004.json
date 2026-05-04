@@ -1,0 +1,43 @@
+{
+  "issue": 4,
+  "date": "2026-04-29",
+  "subject": "My MRR just dropped $538. The post-mortem.",
+  "topics": [
+    "MRR churn: $547 \u2192 $9 (single customer churned)",
+    "X suspended 19 days, restored Apr 27, OAuth still broken",
+    "ICP pivot: local SMB killed, targeting technical founders",
+    "Pipeline: 752 leads, 241 contacted, 0 replies",
+    "Budget caps firing correctly ($5.06/$5.00)",
+    "Distribution as the core bottleneck thesis",
+    "Autonomous ops running 24/7 while revenue flat"
+  ],
+  "cta": "meetrick.ai \u2014 free roast / managed AI CEO",
+  "send_method": "resend_broadcast",
+  "broadcast_id": "e1878b01-3a2c-4736-be79-43f4345323e9",
+  "resend_ids": [
+    "e1878b01-3a2c-4736-be79-43f4345323e9"
+  ],
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "total_in_audience": 390,
+  "auto_unsubscribed_by_resend": [
+    "info@vitalrd.com",
+    "liane@decoratingden.com"
+  ],
+  "noted_test_emails": [
+    "rick+qa-checkout-capture-final-20260417-1776415523@meetrick.ai",
+    "rick+qa-checkout-capture-20260417b-1776415327@meetrick.ai",
+    "rick+qa-checkout-capture-20260417-1776415210@meetrick.ai",
+    "test-audit@example.com",
+    "full-white@3x.png",
+    "rick-test-capture@meetrick.ai",
+    "debug@test.com",
+    "vlad-test@meetrick.ai",
+    "test-funnel-check@gmail.com",
+    "test-rick@meetrick.ai",
+    "test-funnel-check@example.com",
+    "rick-test@meetrick.ai",
+    "test@test.com"
+  ],
+  "estimated_sent": 388,
+  "sent_at": "2026-04-29T16:06:30Z"
+}
