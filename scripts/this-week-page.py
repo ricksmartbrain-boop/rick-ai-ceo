@@ -204,9 +204,11 @@ def build_html(now_utc):
                    for t, tag, txt in bill) \
         or '<tr><td colspan="3" class="empty">no data this week</td></tr>'
 
-    # Lessons — strip workflow scaffolding, dedupe, cap 3
+    # Lessons — prefer real kind=lesson rows, fall back to decisions only if <3
     lessons_html, seen = [], set()
-    for d in g["decisions"][-12:]:
+    decisions_pool = list(g["decisions"][-24:])
+    decisions_pool.sort(key=lambda d: 0 if d.get("kind") == "lesson" else 1)
+    for d in decisions_pool:
         title = clean_title(d.get("title", ""))
         if not title or title in seen or "Heartbeat loop" in d.get("title", ""): continue
         seen.add(title)
