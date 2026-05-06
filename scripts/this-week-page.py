@@ -237,6 +237,12 @@ def build_html(now_utc):
         cta_url, cta_label = "https://meetrick.ai/newsletter", g["newsletters"][-1].get("subject", "the latest issue")
     cta_block = (f'<a class="cta" href="{escape(cta_url)}">see the ICP-pivot post-mortem → '
                  f'{escape((cta_label or "")[:80])}</a>') if cta_url else ""
+    # Hard CTA — direct path to a pilot for ready-to-buy readers. Sits below the
+    # soft (blog) CTA above. Soft CTA = skeptics. Hard CTA = pilot-ready.
+    pilot_cta = ('<a class="cta pilot" href="/pilot" '
+                 'style="margin-top:10px;background:#FBBF24;color:#000;border-color:#000">'
+                 'want this running on your company? free 1-week pilot →</a>')
+    cta_block = cta_block + pilot_cta
 
     week_label = f'{(anchor - timedelta(days=7)).strftime("%b %d")} – {anchor.strftime("%b %d, %Y")}'
     summary = (f'{len(g["commits"])} commits · {len(g["posts"])} posts · '
