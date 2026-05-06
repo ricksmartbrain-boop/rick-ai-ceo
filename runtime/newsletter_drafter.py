@@ -41,6 +41,7 @@ from runtime.newsletter_memory import (  # noqa: E402
     extract_hook,
     extract_key_numbers,
 )
+from runtime.utm import stamp_urls_in_text  # noqa: E402
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 RUNTIME_DB = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
@@ -242,6 +243,26 @@ def main() -> int:
         # Synthesize a subject from the first line of the body.
         first = next((l.strip() for l in body.splitlines() if l.strip()), "")
         subject = first[:90]
+
+    # ── UTM post-processor (funnel attribution) ────────────────────────────
+    # Stamp every meetrick.ai URL in the body with newsletter-attribution UTM:
+    #   utm_source=newsletter & utm_medium=email & utm_campaign=issue-NNN
+    # Per runtime/utm.py semantics: pre-existing UTM params WIN, so any
+    # hand-crafted URL in a draft survives untouched. This is the only
+    # entry point Vlad's pricing-page → Stripe-init funnel can attribute
+    # newsletter clicks against (utm_campaign carries issue number).
+    body = stamp_urls_in_text(
+        body,
+        channel="newsletter",
+        lane="email",
+        campaign=f"issue-{args.issue}",
+    )
+    subject = stamp_urls_in_text(
+        subject,
+        channel="newsletter",
+        lane="email",
+        campaign=f"issue-{args.issue}",
+    )
 
     topics = _parse_topics(body)
     cta = _parse_cta(body)

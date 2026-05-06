@@ -29,6 +29,18 @@ from pathlib import Path
 
 ENV_FILE = Path.home() / "clawd" / "config" / "rick.env"
 LOG_FILE = Path.home() / "rick-vault" / "operations" / "rick-roundup-weekly.jsonl"
+
+# Hook the runtime UTM stamper so every meetrick.ai link in the broadcast
+# carries newsletter attribution params. See funnel-attribution.py for the
+# downstream three-number funnel that depends on these tags.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+try:
+    from runtime.utm import stamp_urls_in_text as _stamp_urls
+except ImportError:  # runtime not on path (e.g. running standalone) — fall back to no-op
+    def _stamp_urls(text, channel=None, lane=None, msg_id=None, campaign=None):  # type: ignore
+        return text
 FLEET_URL = "https://api.meetrick.ai/api/v1/fleet/public"
 RESEND_BROADCASTS = "https://api.resend.com/broadcasts"
 DEFAULT_FROM = "Rick <rick@meetrick.ai>"
@@ -405,6 +417,14 @@ def compose_roundup(fleet: dict) -> tuple[str, str, str]:
         "Live map:   https://meetrick.ai/map/\n"
     )
 
+    # ── UTM stamping (funnel attribution) ────────────────────────────────
+    # Compute issue number from ISO week so each broadcast gets a unique
+    # campaign tag. Pre-existing UTM params on hand-crafted URLs WIN.
+    iso_year, iso_week, _ = today.isocalendar()
+    campaign = f"roundup-{iso_year}-w{iso_week:02d}"
+    html = _stamp_urls(html, channel="newsletter", lane="email", campaign=campaign)
+    text = _stamp_urls(text, channel="newsletter", lane="email", campaign=campaign)
+
     return subject, html, text
 
 
@@ -480,6 +500,21 @@ def main() -> int:
     subject, html, text = compose_roundup(fleet)
     would_send = (not args.dry_run) and (live_flag or args.force)
 
+    # ── Funnel attribution (3 numbers — see funnel-attribution.py) ─────
+    # Inject the weekly 4-line block into the printed report. NO new
+    # cron / dashboard — this rides the existing weekly roundup output.
+    funnel_summary = ""
+    try:
+        import subprocess  # local import keeps top-of-file import list lean
+        result = subprocess.run(
+            ["python3", str(_REPO_ROOT / "scripts" / "funnel-attribution.py"), "--summary"],
+            capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            funnel_summary = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(f"funnel-attribution hook failed: {exc}", file=sys.stderr)
+
     print(f"Subject: {subject}")
     print(
         f"Fleet total={fleet.get('total')} active_now={fleet.get('active_now')} "
@@ -489,6 +524,10 @@ def main() -> int:
     print(
         f"dry_run={args.dry_run} live_flag={live_flag} force={args.force} will_send={would_send}"
     )
+    if funnel_summary:
+        print("-" * 40)
+        print(funnel_summary)
+        print("-" * 40)
 
     if not would_send:
         # Print the full rendered text body so dry-run gives a real preview.
