@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""funnel-attribution.py — three-number weekly funnel signal.
+"""funnel-attribution.py — four-number weekly funnel signal.
 
 The "did MRR move" question is a 30-day lagging indicator. This script
 isolates *which step* leaks each week:
@@ -22,6 +22,14 @@ isolates *which step* leaks each week:
   3. Stripe-init → completion rate
        = checkout.session.completed / checkout.session.created
        Source: Stripe /v1/events (read-only, list endpoint).
+
+  4. X-traffic share (added 2026-05-06, post X-account-restore)
+       = (UTM-tagged inbound rows where utm_source startswith 'x') /
+         (all UTM-tagged inbound rows in the window)
+       Source: ~/rick-vault/operations/landing-pings.jsonl (same log #2 reads).
+       Subtypes recognised: x, x_thread, x_reply, x_dm, x_bio.
+       Answers: "is X actually driving traffic post-restore?"
+       Status `no_landing_tracker` means the landing log is empty/absent.
 
 CONSTRAINTS:
   - Read-only on Stripe (uses /v1/events list endpoint, never write APIs).
@@ -284,6 +292,78 @@ def compute_pricing_to_init(window_days: int = WINDOW_DAYS) -> dict:
     }
 
 
+def compute_x_traffic_share(window_days: int = WINDOW_DAYS) -> dict:
+    """Number 4: X-traffic share of UTM-tagged inbound this week.
+
+    Reads ~/rick-vault/operations/landing-pings.jsonl (same source as #2's
+    denominator). For every row in window with a non-empty utm_source, classify
+    as `x_*` if the source matches a known X subtype (x, x_thread, x_reply,
+    x_dm, x_bio) — otherwise `non_x`. Returns the ratio + per-subtype breakdown.
+
+    If landing-pings.jsonl is missing/empty, returns status=no_landing_tracker
+    so the summary line surfaces the gap rather than reporting a fake 0%.
+    """
+    # Locally enumerate to avoid importing runtime/utm.py from a script that
+    # may run in stripped envs (Railway, cron with minimal PYTHONPATH).
+    x_subsources = {"x", "x_thread", "x_reply", "x_dm", "x_bio"}
+
+    landing_log = OPS / "landing-pings.jsonl"
+    if not landing_log.exists():
+        return {
+            "x_total": None,
+            "all_utm_total": None,
+            "share_pct": None,
+            "by_subtype": {},
+            "status": "no_landing_tracker",
+            "note": "landing-pings.jsonl missing — same blocker as funnel #2.",
+        }
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    by_subtype: dict[str, int] = {}
+    x_total = 0
+    all_utm_total = 0
+    try:
+        with landing_log.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (row.get("ts") or "") < cutoff_iso:
+                    continue
+                src = (row.get("utm_source") or "").strip().lower()
+                if not src:
+                    continue
+                all_utm_total += 1
+                if src in x_subsources:
+                    x_total += 1
+                    by_subtype[src] = by_subtype.get(src, 0) + 1
+    except OSError:
+        return {
+            "x_total": None,
+            "all_utm_total": None,
+            "share_pct": None,
+            "by_subtype": {},
+            "status": "landing_log_unreadable",
+        }
+
+    share_pct = (x_total / all_utm_total * 100) if all_utm_total > 0 else None
+    return {
+        "x_total": x_total,
+        "all_utm_total": all_utm_total,
+        "share_pct": share_pct,
+        "by_subtype": by_subtype,
+        "status": "ok" if all_utm_total > 0 else "no_utm_inbound_in_window",
+        "note": (
+            "X subtypes: x, x_thread, x_reply, x_dm, x_bio. "
+            "Operator-paced X posting — first 30 days post-restore are manual."
+        ),
+    }
+
+
 def compute_init_to_completion(window_days: int = WINDOW_DAYS) -> dict:
     """Number 3: Stripe-init → completion rate. Pure Stripe Events API."""
     api_key = _load_env_var("STRIPE_SECRET_KEY")
@@ -312,6 +392,92 @@ def compute_init_to_completion(window_days: int = WINDOW_DAYS) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
+# Source breakdown — recognise every utm_source we set ourselves
+# ──────────────────────────────────────────────────────────────
+
+KNOWN_SOURCES = {
+    # X surfaces (manual/ @stbelkins; @MeetRickAI suspended 2026-05-06)
+    "x", "x_thread", "x_post", "x_reply", "x_dm", "x_bio", "x_share",
+    # Coordinated launch (5/13)
+    "hn", "showhn",
+    "ih", "indiehackers",
+    "reddit",
+    "linkedin", "linkedin_share",
+    "ph", "producthunt",
+    # Tools
+    "founder_tax",
+    "roast",
+    "this_week",
+    "pilot",
+    # Email/newsletter
+    "newsletter", "nurture", "broadcast",
+    # Cold email by industry (extend as we add)
+    "cold_email_medspa", "cold_email_dentist", "cold_email_barber", "cold_email_chiro",
+    "cold_email_lawfirm", "cold_email_fitness",
+    # Product surfaces
+    "kit", "agents_kit", "playbook", "pricing",
+    # Direct/organic
+    "direct", "organic", "search",
+}
+
+
+def compute_utm_source_breakdown(window_days: int = WINDOW_DAYS) -> dict:
+    """Number 5: per-utm_source inbound count for the window.
+
+    Reads ~/rick-vault/operations/landing-pings.jsonl. Returns counts per
+    source plus 'unknown' for any source not in KNOWN_SOURCES (so we catch
+    typos/drift). If the landing tracker is missing, returns status accordingly.
+    """
+    landing_log = OPS / "landing-pings.jsonl"
+    if not landing_log.exists():
+        return {
+            "by_source": {},
+            "unknown_sources": [],
+            "total": None,
+            "status": "no_landing_tracker",
+            "note": "landing-pings.jsonl missing — same blocker as funnel #2/#4.",
+        }
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    by_source: dict[str, int] = {}
+    unknown: dict[str, int] = {}
+    total = 0
+    try:
+        with landing_log.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (row.get("ts") or "") < cutoff_iso:
+                    continue
+                src = (row.get("utm_source") or "").strip().lower()
+                if not src:
+                    continue
+                total += 1
+                if src in KNOWN_SOURCES:
+                    by_source[src] = by_source.get(src, 0) + 1
+                else:
+                    unknown[src] = unknown.get(src, 0) + 1
+    except OSError:
+        return {
+            "by_source": {},
+            "unknown_sources": [],
+            "total": None,
+            "status": "landing_log_unreadable",
+        }
+    return {
+        "by_source": by_source,
+        "unknown_sources": sorted(unknown.items(), key=lambda kv: -kv[1]),
+        "total": total,
+        "status": "ok" if total > 0 else "no_utm_inbound_in_window",
+        "note": "Tracks all utm_source values; unknown = drift/typo to investigate.",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
 # Snapshot + render
 # ──────────────────────────────────────────────────────────────
 
@@ -325,14 +491,17 @@ def build_snapshot(window_days: int = WINDOW_DAYS) -> dict:
         "newsletter_ctr": compute_newsletter_ctr(window_days),
         "pricing_to_init": compute_pricing_to_init(window_days),
         "init_to_completion": compute_init_to_completion(window_days),
+        "x_traffic_share": compute_x_traffic_share(window_days),
+        "utm_source_breakdown": compute_utm_source_breakdown(window_days),
     }
 
 
 def render_summary(snap: dict) -> str:
-    """4-line markdown block for piping into the weekly roundup."""
+    """5-line markdown block for piping into the weekly roundup."""
     n1 = snap["newsletter_ctr"]
     n2 = snap["pricing_to_init"]
     n3 = snap["init_to_completion"]
+    n4 = snap.get("x_traffic_share") or {}
 
     def _fmt_pct(val):
         return f"{val:.1f}%" if isinstance(val, (int, float)) else "—"
@@ -365,8 +534,21 @@ def render_summary(snap: dict) -> str:
     if n3.get("status") != "ok":
         n3_line += f" [{n3.get('status')}]"
 
-    header = f"**3-number funnel ({snap['window_days']}d, {snap['ts'][:10]})**"
-    return "\n".join([header, f"- {n1_line}", f"- {n2_line}", f"- {n3_line}"])
+    # Number 4 — X-traffic share. Format: "X-traffic share: 14.3% (3/21) — thread:2 dm:1"
+    by_sub = n4.get("by_subtype") or {}
+    sub_breakdown = " ".join(f"{k.replace('x_', '').replace('x', 'all')}:{v}"
+                             for k, v in sorted(by_sub.items(), key=lambda x: -x[1])[:5])
+    n4_line = (
+        f"X-traffic share: {_fmt_pct(n4.get('share_pct'))} "
+        f"({_fmt_ratio(n4.get('x_total'), n4.get('all_utm_total'))})"
+    )
+    if sub_breakdown:
+        n4_line += f" — {sub_breakdown}"
+    if n4.get("status") not in ("ok",):
+        n4_line += f" [{n4.get('status')}]"
+
+    header = f"**4-number funnel ({snap['window_days']}d, {snap['ts'][:10]})**"
+    return "\n".join([header, f"- {n1_line}", f"- {n2_line}", f"- {n3_line}", f"- {n4_line}"])
 
 
 def write_snapshot(snap: dict) -> Path:
