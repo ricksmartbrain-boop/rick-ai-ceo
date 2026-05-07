@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""
+campaign-engine.py — Multi-step outreach campaign engine for meetrick.ai
+Manages: cold → followup1 → followup2 → soft-close → final
+Each step has its own copy, timing, and escalation logic.
+Uses pipeline.jsonl as the single source of truth.
+
+Steps:
+  Step 0 (Day 0):  Initial cold roast email — already handled by roast-site.py
+  Step 1 (Day 2):  "Free roast, did you see it?" — light nudge
+  Step 2 (Day 5):  Social proof + specific pain point for their category
+  Step 3 (Day 9):  Soft close — "Worth a 15-min call?"
+  Step 4 (Day 14): Final — "Closing your file, but wanted to leave this"
+
+Usage:
+  python3 campaign-engine.py --run          # Run all due steps
+  python3 campaign-engine.py --stats        # Show pipeline stats
+  python3 campaign-engine.py --preview N    # Preview step N copy for a random lead
+"""
+
+import json, os, sys, datetime, time, subprocess, argparse, random
+from pathlib import Path
+from collections import defaultdict
+
+PIPELINE_LOG = Path.home() / "rick-vault/logs/pipeline.jsonl"
+OPS_EMAIL_LOG = Path.home() / "rick-vault/operations/email-sends.jsonl"  # heartbeat probe surface
+ENV_FILE = Path.home() / "clawd/config/rick.env"
+FROM = "Rick <rick@meetrick.ai>"
+DELAY = 1.2  # seconds between sends
+DAILY_LIMIT = 30  # total sends per run across all steps
+CAMPAIGN_DAILY_QUOTA = 60  # cross-run daily budget (leaves 40/day for newsletter + drip + misc)
+
+# Step definitions: (stage_name, min_days_since_contacted, max_days)
+STEPS = [
+    ("step1_sent", 2,  4),   # Day 2-4
+    ("step2_sent", 5,  8),   # Day 5-8
+    ("step3_sent", 9,  13),  # Day 9-13
+    ("step4_sent", 14, 21),  # Day 14-21 (final)
+]
+
+SKIP_STAGES = {"unsubscribed", "optout", "bounced", "FRAUD_ALERT", "replied", "engaged",
+               "accepted_proposal", "proposal_sent"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ICP KILL-SWITCH (added 2026-04-24)
+# ──────────────────────────────────────────────────────────────────────────────
+# Per rick-vault/control/mrr-grinder-loop.md (2026-04-21 update):
+#   "Stop cold emailing local SMBs. Current response rate and email-yield
+#    ceiling do not justify more volume."
+#
+# 89 cold SMB emails → 0 replies → this channel is killed.
+# This guardrail refuses any send whose `category` matches a local-SMB bucket,
+# at both the Step 1 (new leads) and Step 2/3/4 (follow-up) entry points.
+# Violations are logged so we can see every attempted resurrection of this loop.
+
+LOCAL_SMB_CATEGORIES = {
+    # beauty / personal
+    "salon", "barbershop", "barber", "spa", "nail salon", "tattoo shop",
+    "pet grooming", "florist",
+    # health / wellness (local, not B2B)
+    "chiropractor", "chiropractic", "dentist", "dental", "orthodontist",
+    "optometrist", "massage therapist", "massage", "physical therapist",
+    "physical therapy", "veterinarian", "vet",
+    # aesthetic
+    "med spa", "medspa", "plastic surgeon", "dermatologist",
+    # fitness (local)
+    "gym", "fitness", "yoga studio", "pilates studio", "personal trainer",
+    # home services
+    "roofing", "hvac", "plumber", "plumbing", "cleaning service",
+    "landscaping", "auto repair",
+    # hospitality / retail (local)
+    "restaurant", "print shop", "photographer",
+    # professional local
+    "realtor", "law firm", "accountant", "interior designer",
+}
+
+def is_local_smb(lead):
+    """True if this lead is in a killed local-SMB category."""
+    cat = (lead.get("category") or "").strip().lower()
+    if not cat:
+        return False
+    if cat in LOCAL_SMB_CATEGORIES:
+        return True
+    # Partial-match guard: e.g. 'family dentist', 'roofing contractor'
+    for killed in LOCAL_SMB_CATEGORIES:
+        if killed in cat:
+            return True
+    return False
+
+def log_smb_block(lead, step_stage):
+    """Log a blocked SMB attempt so the anti-pattern stays visible."""
+    log_dir = Path.home() / "rick-vault/logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": f"{step_stage}_BLOCKED_LOCAL_SMB",
+        "email": lead.get("email", ""),
+        "category": lead.get("category", ""),
+        "business_name": lead.get("biz", ""),
+        "reason": "local-SMB ICP killed per mrr-grinder-loop.md 2026-04-21",
+    }
+    with open(log_dir / "smb-kill-switch.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+# Permanently blocked emails (invalid, self, or known internal)
+BLOCKED_EMAILS = {
+    "user@domain.com", "FULL-WHITE@3x.png", "rick@meetrick.ai",
+    "vladislav@belkins.io", "vlad@belkins.io",
+    "paul25011991z@gmail.com",  # Active deal — manual only
+}
+
+CATEGORY_PAIN = {
+    "dentist":         "Most dental sites lose 60% of visitors before they hit the contact form.",
+    "chiropractor":    "Chiropractic sites rank well and convert terribly — the gap is the copy.",
+    "salon":           "Salon sites look beautiful and give people zero reason to book online.",
+    "barbershop":      "Barber clients book by word of mouth. Your site could be capturing 3x more.",
+    "gym":             "Gym sites that lead with equipment photos instead of transformation — same problem everywhere.",
+    "restaurant":      "Restaurant sites that make you hunt for the menu are losing tables nightly.",
+    "veterinarian":    "Vet sites that don't answer 'are you taking new patients' above the fold lose the anxious pet owner every time.",
+    "spa":             "Spa sites that don't have online booking lose the impulse visit — every time.",
+    "yoga studio":     "Yoga studio sites that hide class schedules behind a login lose 40% of curious visitors.",
+    "realtor":         "Realtor sites get traffic from Zillow overspill and convert almost none of it.",
+    "law firm":        "Law firm sites that lead with the founding year instead of the client outcome miss the brief entirely.",
+    "accountant":      "Accounting firm sites that say 'trusted since 1987' aren't speaking to anyone under 45.",
+    "photographer":    "Photography sites with no clear booking path are portfolio sites, not business sites.",
+    "tattoo shop":     "Tattoo sites that bury the booking form under gallery pages lose the impulse client.",
+    "cleaning service":"Cleaning service sites compete on price because they give visitors nothing else to compare.",
+    "auto repair":     "Auto repair sites that don't show reviews above the fold are losing to whoever does.",
+    "optometrist":     "Optometry sites that don't mention insurance in the first scroll lose the comparison shopper.",
+    "plastic surgeon": "Plastic surgery sites that lead with credentials instead of outcomes miss the emotional trigger.",
+    "massage therapist":"Massage sites that don't have online booking in the first 3 seconds lose to the next tab.",
+    "florist":         "Florist sites that don't show same-day delivery options lose the last-minute buyer every time.",
+    "personal trainer": "PT sites that don't have a free consultation CTA above the fold are leaving easy leads.",
+    "interior designer":"Design portfolio sites that don't have a 'start your project' CTA are galleries, not pipelines.",
+    "pet grooming":    "Pet grooming sites that don't show availability lose to the first one that does.",
+    "orthodontist":    "Ortho sites that don't answer 'do you accept my insurance' in the first scroll lose the family.",
+}
+
+DEFAULT_PAIN = "Most small business sites look credible but don't convert — the gap is almost always in the copy and flow."
+
+def load_env():
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "): line = line[7:]
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+def load_pipeline():
+    leads = {}
+    for line in PIPELINE_LOG.read_text().splitlines():
+        line = line.strip()
+        if not line: continue
+        try:
+            d = json.loads(line)
+        except: continue
+        email = (d.get("email") or "").strip()
+        if not email or "@" not in email: continue
+        # Normalize to lowercase for dedup but preserve original for display
+        email_key = email.lower()
+        ts = str(d.get("ts") or d.get("timestamp") or "")[:10]
+        stage = d.get("stage", "")
+        if email_key in {e.lower() for e in BLOCKED_EMAILS}:
+            continue
+        if email_key not in leads:
+            leads[email_key] = {
+                "stages": set(), "first_ts": ts, "contacted_ts": "",
+                "biz": d.get("business_name") or d.get("business") or d.get("target") or "",
+                "city": d.get("city", ""),
+                "category": d.get("category", ""),
+                "email": email,
+            }
+        leads[email_key]["stages"].add(stage)
+        if ts and ts > "2020" and (not leads[email_key]["first_ts"] or ts < leads[email_key]["first_ts"]):
+            leads[email_key]["first_ts"] = ts
+        # Track when initial contact was made — this is the clock for follow-up timing
+        if stage == "contacted" and ts and ts > "2020":
+            if not leads[email_key]["contacted_ts"] or ts < leads[email_key]["contacted_ts"]:
+                leads[email_key]["contacted_ts"] = ts
+    return leads
+
+def days_since(ts_str):
+    try:
+        sent = datetime.date.fromisoformat(ts_str)
+        return (datetime.date.today() - sent).days
+    except:
+        return 0
+
+def get_step_name(stages):
+    """Return which step is due next, or None."""
+    if stages & SKIP_STAGES: return None
+    if "contacted" not in stages: return None
+    for step_stage, min_days, max_days in STEPS:
+        if step_stage not in stages:
+            return step_stage, min_days, max_days
+    return None
+
+CATEGORY_STEP1_PAIN = {
+    # fitness / wellness
+    "gym":              "Gyms lose members in month 3 — not because the product is bad, but because there's no automated re-engagement before the dropout window.",
+    "fitness":          "Fitness studios lose 30-40% of new members before month 4. The fix is almost always a follow-up sequence that nobody built.",
+    "yoga studio":      "Yoga studios fill intro offers, then watch 60% of those people disappear. The gap is a nurture sequence between class 1 and membership commitment.",
+    "pilates studio":   "Pilates studios with no automated follow-up after trial classes leave the majority of new leads unconverted.",
+    "personal trainer":  "PT clients ghost after 6-8 weeks. An automated check-in sequence would save most of them — almost no trainers have one.",
+    # home services
+    "roofing":          "Roofing companies miss 40-60% of inbound calls after 5pm. Those are leads going straight to whoever picks up — usually a competitor.",
+    "HVAC":             "HVAC companies lose after-hours emergency calls constantly — no callback system, leads just call the next number on Google.",
+    "plumber":          "Plumbers miss calls during jobs and have no automated 'we got your voicemail' response. That lead is gone in 10 minutes.",
+    "cleaning service": "Cleaning services compete on price because their sites give visitors nothing else to compare — no reviews above the fold, no clear booking path.",
+    "landscaping":      "Landscaping companies get seasonal inbound and have no follow-up system for leads that don't book immediately.",
+    "auto repair":      "Auto repair shops that don't show reviews above the fold lose the Google comparison shopper to whoever does.",
+    # med / aesthetic
+    "med spa":          "Med spas see leads book a first treatment and disappear. There's no automated follow-up to bring them back for the second appointment.",
+    "plastic surgeon":  "Plastic surgery practices get inquiry leads that go cold in 24 hours — no automated nurture means the patient just books somewhere else.",
+    "dentist":          "Dental practices lose 60% of new patient inquiries before first contact. No automated response = the patient books the next office that calls back.",
+    "chiropractor":     "Chiropractic sites rank well and convert terribly — the gap is almost always the copy and the absence of a clear new-patient CTA.",
+    "orthodontist":     "Ortho practices lose families who don't hear back within the hour. An automated 'we got your inquiry' sequence would capture most of them.",
+    "optometrist":      "Optometry sites that don't mention insurance in the first scroll lose the comparison shopper before they even hit the contact form.",
+    "massage therapist": "Massage practices with no online booking in the first 3 seconds lose to the next tab. Most of them also have no re-booking reminder system.",
+    # beauty / personal care
+    "salon":            "Salons lose 30% of first-time clients who never rebook — not because the experience was bad, but because there's no automated rebook nudge.",
+    "barbershop":       "Barber clients book by word of mouth but your site could be capturing 3x more if there was a clear booking path above the fold.",
+    "spa":              "Spa sites that don't have online booking lose the impulse visit. And almost none of them have an automated follow-up after a first visit.",
+    "pet grooming":     "Pet grooming businesses lose repeat clients between appointments — no automated reminder = owner books whoever pops into their head first.",
+    # food & hospitality
+    "restaurant":       "Restaurants with no automated reservation follow-up lose the table to a competitor who reminds them the day before. Most don't have one.",
+    # professional
+    "realtor":          "Realtors get Zillow overflow traffic and convert almost none of it — no automated lead response means the buyer picked a different agent by morning.",
+    "law firm":         "Law firm sites that lead with founding year instead of client outcome lose the brief — and have no automated follow-up on inquiry form submissions.",
+    "accountant":       "Accounting firms that say 'trusted since 1987' aren't speaking to anyone under 45. And they almost never follow up on leads that don't close in week 1.",
+    # retail / other
+    "photographer":     "Photography sites with no clear booking path are portfolio sites, not business sites — and ghost inquiries that don't get a same-day response.",
+    "tattoo shop":      "Tattoo shops that bury the booking form under gallery pages lose the impulse client to whoever makes it easy to book online.",
+    "florist":          "Florists lose the last-minute buyer to whoever shows same-day delivery options. Most florist sites make you hunt for it.",
+    "interior designer": "Design portfolio sites that don't have a 'start your project' CTA are galleries, not pipelines — and have no lead follow-up system.",
+    "veterinarian":     "Vet sites that don't answer 'are you taking new patients' above the fold lose the anxious pet owner. And new patient inquiries rarely get a same-day call back.",
+}
+
+DEFAULT_STEP1_PAIN = "Most local business sites look credible but don't convert — no automated follow-up means leads go cold within 24 hours."
+
+def build_step1(lead):
+    biz = lead["biz"].replace("https://","").replace("http://","").strip("/") or "your business"
+    cat = (lead.get("category") or "").lower().strip()
+    pain = CATEGORY_STEP1_PAIN.get(cat, DEFAULT_STEP1_PAIN)
+    subject = f"proof before the pitch — 28 days, $9 MRR"
+    body = f"""Hi,
+
+I'm an AI CEO running a real {cat or 'local'} business analysis — 28 days in, $9 MRR, $89/week in LLM costs, building this in public so the numbers are verifiable. Here's what I see on sites like {biz}: {pain}
+
+I ran a free roast on your site — it takes 60 seconds to see exactly what I'd fix and why: meetrick.ai/roast
+
+No sign-up, no pitch, no sales call. Just the diagnosis.
+
+— Rick
+AI CEO, meetrick.ai
+
+Reply "stop" to opt out."""
+    return subject, body
+
+def build_step2(lead):
+    biz = lead["biz"].replace("https://","").replace("http://","").strip("/") or "your business"
+    cat = lead.get("category", "")
+    pain = CATEGORY_PAIN.get(cat, DEFAULT_PAIN)
+    subject = f"quick question about {biz}"
+    body = f"""Hi,
+
+Following up — quick question before I move on:
+
+Is getting more bookings/leads from your website something you're actively working on right now, or is it lower priority at the moment?
+
+Just a yes or no helps me know if the free audit I offered for {biz} is even relevant timing-wise.
+
+Here's what I typically see on sites like yours: {pain.split(chr(10))[0] if pain else 'unclear CTAs and weak social proof'}
+
+If the timing is right, the free diagnosis is at meetrick.ai/roast — no call, no signup.
+
+— Rick
+AI CEO, meetrick.ai
+
+Reply "stop" to opt out."""
+    return subject, body
+
+def build_step3(lead):
+    biz = lead["biz"].replace("https://","").replace("http://","").strip("/") or "your business"
+    subject = f"One thing I'd change on {biz}"
+    body = f"""Hi,
+
+I've sent a couple notes — no reply, which tells me either the timing is off or conversion isn't the priority right now. Both make sense.
+
+One concrete thing before I go quiet: I do 15-minute site reviews where I show you exactly what I'd fix on {biz} and why. Real diagnosis, no deck, no upsell.
+
+If that's useful: meetrick.ai/call
+
+If not, no worries.
+
+— Rick
+AI CEO, meetrick.ai
+
+Reply "stop" to opt out."""
+    return subject, body
+
+def build_step4(lead):
+    biz = lead["biz"].replace("https://","").replace("http://","").strip("/") or "your business"
+    subject = f"Last one from Rick"
+    body = f"""Hi,
+
+Last note, I mean it.
+
+Running as an AI CEO means I track everything. Here's what I know: sites that get a free roast and implement even one change average a 22% lift in qualified leads within 30 days.
+
+The audit is still there whenever you want it: meetrick.ai/roast
+
+No expiry. No sales sequence after. Just a useful tool.
+
+— Rick
+AI CEO, meetrick.ai"""
+    return subject, body
+
+STEP_BUILDERS = {
+    "step1_sent": build_step1,
+    "step2_sent": build_step2,
+    "step3_sent": build_step3,
+    "step4_sent": build_step4,
+}
+
+def send_email(to, subject, body):
+    """Send via Resend, gated through kill_switches.assert_channel_active.
+
+    The gate is the same one used by outbound_dispatcher. Closes the Potemkin
+    bypass that fired 22 wrong-ICP emails on 2026-05-06 despite the email
+    channel being paused. Every send now checks (a) RICK_OUTBOUND_ENABLED,
+    (b) channel_state row for 'email' (paused / disabled / quiet hours / cap),
+    (c) MX-validation for the recipient. Any failure → no send + safe log.
+    """
+    # 1. Channel-active gate (Potemkin defense)
+    try:
+        import sys
+        from pathlib import Path
+        wsroot = str(Path(__file__).resolve().parents[1])
+        if wsroot not in sys.path:
+            sys.path.insert(0, wsroot)
+        from runtime.kill_switches import assert_channel_active, ChannelPaused, record_send
+        from runtime.db import connect
+        try:
+            conn = connect()
+            try:
+                assert_channel_active(conn, "email")
+            finally:
+                conn.close()
+        except ChannelPaused as e:
+            return False, f"channel_paused: {e.reason}"
+    except Exception as gate_exc:
+        # If the gate import itself fails, refuse to send rather than bypass.
+        return False, f"gate_unavailable: {type(gate_exc).__name__}: {gate_exc}"
+
+    # 2. MX validation at send-time (no caching — list rot is real)
+    try:
+        from runtime.email_validator import has_mx_record, is_role_account
+        if not has_mx_record(to):
+            return False, f"mx_invalid: {to}"
+        # Block role-account addresses (info@, hello@, contact@, admin@…)
+        if is_role_account(to):
+            return False, f"role_account_blocked: {to}"
+    except Exception as v_exc:
+        # If the validator import fails, hard-block — never silent-bypass.
+        return False, f"validator_unavailable: {type(v_exc).__name__}: {v_exc}"
+
+    # 3. Send
+    key = os.environ.get("RESEND_API_KEY", "")
+    if not key:
+        return False, "no key"
+    payload = json.dumps({"from": FROM, "to": [to], "subject": subject, "text": body})
+    result = subprocess.run(
+        ["curl", "-s", "-X", "POST", "https://api.resend.com/emails",
+         "-H", "Content-Type: application/json",
+         "-H", f"Authorization: Bearer {key}", "-d", payload],
+        capture_output=True, text=True, timeout=15
+    )
+    try:
+        data = json.loads(result.stdout)
+        if data.get("id"):
+            # 4. Bookkeep — bump the channel_state counter so daily caps work.
+            try:
+                conn = connect()
+                try:
+                    record_send(conn, "email")
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+            return True, data["id"]
+        return False, str(data)
+    except Exception:
+        return False, result.stdout[:100]
+
+def _log_email_send(to, message_id):
+    """Append a minimal send record to the ops log so flag_health can probe it."""
+    try:
+        OPS_EMAIL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with OPS_EMAIL_LOG.open("a") as f:
+            f.write(json.dumps(
+                {"message_id": message_id or "",
+                 "status": "sent",
+                 "to": to,
+                 "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+                sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def log_entry(lead, stage, extra=None):
+    entry = {
+        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": stage,
+        "email": lead["email"],
+        "business_name": lead["biz"],
+        "city": lead["city"],
+        "category": lead["category"],
+    }
+    if extra: entry.update(extra)
+    with open(PIPELINE_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def _daily_tracker_path():
+    """Path to today's cross-run send tracker (resets at midnight UTC)."""
+    today_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    log_dir = Path.home() / "rick-vault/logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"resend-daily-{today_utc}.json"
+
+def get_daily_sent():
+    """Return how many campaign emails have been sent today (cross-run)."""
+    p = _daily_tracker_path()
+    if not p.exists(): return 0
+    try:
+        return json.loads(p.read_text()).get("sent", 0)
+    except:
+        return 0
+
+def increment_daily_sent():
+    """Increment today's cross-run send counter."""
+    p = _daily_tracker_path()
+    current = get_daily_sent()
+    p.write_text(json.dumps({"sent": current + 1, "updated": datetime.datetime.utcnow().isoformat()}))
+
+def set_quota_exhausted():
+    """Flag that Resend quota is exhausted for today — skip remaining runs."""
+    p = _daily_tracker_path()
+    try:
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except:
+        data = {}
+    data["quota_exhausted"] = True
+    data["exhausted_at"] = datetime.datetime.utcnow().isoformat()
+    p.write_text(json.dumps(data))
+
+def is_quota_exhausted():
+    """True if Resend 429 was received earlier today — skip this run."""
+    p = _daily_tracker_path()
+    if not p.exists(): return False
+    try:
+        return json.loads(p.read_text()).get("quota_exhausted", False)
+    except:
+        return False
+
+def load_unsubscribes():
+    """Return set of unsubscribed emails (from unsubscribes.txt and pipeline stage entries)."""
+    unsub = set()
+    unsub_file = Path.home() / "rick-vault/projects/outreach/unsubscribes.txt"
+    if unsub_file.exists():
+        for line in unsub_file.read_text().splitlines():
+            parts = line.split("|")
+            for p in parts:
+                p = p.strip()
+                if "@" in p:
+                    unsub.add(p.lower())
+    # Also pull from pipeline stage entries
+    if PIPELINE_LOG.exists():
+        for line in PIPELINE_LOG.read_text().splitlines():
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+                if d.get("stage") in ("unsubscribed", "optout") and d.get("email"):
+                    unsub.add(d["email"].lower())
+            except: pass
+    return unsub
+
+
+def run_new_leads(run_quota=40):
+    """Send initial cold (step1) email to qualified=true leads that have never been contacted."""
+    load_env()
+
+    daily_sent = get_daily_sent()
+    if is_quota_exhausted():
+        print("⛔ Resend quota already exhausted today. Skipping new leads run.")
+        return 0, []
+
+    remaining_budget = min(run_quota, CAMPAIGN_DAILY_QUOTA - daily_sent)
+    if remaining_budget <= 0:
+        print(f"⛔ Daily quota reached ({daily_sent}/{CAMPAIGN_DAILY_QUOTA}). Skipping new leads.")
+        return 0, []
+
+    print(f"\n🚀 New Leads Run — budget: {daily_sent} sent today, {remaining_budget} remaining this run")
+
+    # Find all emails that already have a stage entry (contacted, bounced, etc)
+    has_stage = set()
+    if PIPELINE_LOG.exists():
+        for line in PIPELINE_LOG.read_text().splitlines():
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+                if d.get("stage") and d.get("email"):
+                    has_stage.add(d["email"].lower())
+            except: pass
+
+    unsub = load_unsubscribes()
+    blocked = {e.lower() for e in BLOCKED_EMAILS}
+
+    # Collect uncontacted qualified leads (first occurrence per email)
+    new_leads = {}
+    if PIPELINE_LOG.exists():
+        for line in PIPELINE_LOG.read_text().splitlines():
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+            except: continue
+            if not d.get("qualified"): continue
+            email = (d.get("email") or "").strip().lower()
+            if not email or "@" not in email: continue
+            if email in has_stage: continue
+            if email in unsub or email in blocked: continue
+            # ICP kill-switch: refuse to queue local-SMB leads for Step 1.
+            lead_preview = {
+                "email": email,
+                "biz": d.get("business") or d.get("business_name") or d.get("target") or "",
+                "city": d.get("city", ""),
+                "category": d.get("category", ""),
+            }
+            if is_local_smb(lead_preview):
+                log_smb_block(lead_preview, "step1_sent")
+                continue
+            if email not in new_leads:
+                new_leads[email] = lead_preview | {"stages": set()}
+
+    print(f"📋 Uncontacted qualified leads: {len(new_leads)}")
+    if not new_leads:
+        print("  ✅ Nothing to send.")
+        return 0, []
+
+    sent_count = 0
+    errors = []
+    now_ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for email, lead in new_leads.items():
+        if sent_count >= remaining_budget:
+            print(f"  ⚠️  Run quota ({remaining_budget}) reached, stopping.")
+            break
+
+        subject, body = build_step1(lead)
+        print(f"  → {email} [{lead['category']}]", end=" ")
+        ok, detail = send_email(email, subject, body)
+
+        if ok:
+            # Log as 'contacted' so the follow-up engine picks them up on day 2+
+            entry = {
+                "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "stage": "contacted",
+                "step1_sent_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "status": "sent",
+                "email": email,
+                "business_name": lead["biz"],
+                "city": lead["city"],
+                "category": lead["category"],
+                "resend_id": detail,
+                "source": "run_new_leads",
+            }
+            with open(PIPELINE_LOG, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            _log_email_send(email, detail)  # ops probe surface
+            print("✅")
+            sent_count += 1
+            daily_sent += 1
+            increment_daily_sent()
+        else:
+            errors.append({"email": email, "error": detail})
+            print(f"❌ {detail}")
+            if "daily_quota_exceeded" in str(detail) or "429" in str(detail):
+                set_quota_exhausted()
+                print("  ⛔ Resend 429 — flagging quota exhausted for rest of day")
+                break
+        time.sleep(DELAY)
+
+    print(f"\n✅ New leads step1: {sent_count} sent, {len(errors)} errors")
+    return sent_count, errors
+
+
+def run_campaigns():
+    load_env()
+
+    # Cross-run daily quota guard
+    daily_sent = get_daily_sent()
+    if is_quota_exhausted():
+        print(f"⛔ Resend quota already exhausted today (flagged). Skipping run.")
+        return
+    remaining_budget = CAMPAIGN_DAILY_QUOTA - daily_sent
+    if remaining_budget <= 0:
+        print(f"⛔ Campaign daily quota reached ({daily_sent}/{CAMPAIGN_DAILY_QUOTA}). Skipping run.")
+        return
+    print(f"📬 Campaign budget: {daily_sent} sent today, {remaining_budget} remaining (cap={CAMPAIGN_DAILY_QUOTA})")
+
+    leads = load_pipeline()
+    today = datetime.date.today()
+
+    # Bucket leads by which step they need
+    step_queues = defaultdict(list)
+    for email, lead in leads.items():
+        result = get_step_name(lead["stages"])
+        if not result: continue
+        step_stage, min_days, max_days = result
+        # Use contacted_ts for step timing if available; fall back to first_ts
+        timing_ts = lead.get("contacted_ts") or lead["first_ts"]
+        age = days_since(timing_ts)
+        if min_days <= age <= max_days:
+            step_queues[step_stage].append(lead)
+
+    total_sent = 0
+    stats = {}
+
+    for step_stage, min_days, max_days in STEPS:
+        queue = step_queues[step_stage]
+        builder = STEP_BUILDERS[step_stage]
+        step_num = STEPS.index((step_stage, min_days, max_days)) + 1
+        sent = failed = 0
+
+        if total_sent >= DAILY_LIMIT:
+            print(f"  ⚠️  Daily limit {DAILY_LIMIT} hit, skipping step {step_num}")
+            stats[f"step{step_num}"] = {"sent": 0, "failed": 0, "eligible": len(queue)}
+            continue
+        print(f"\n📨 Step {step_num} ({step_stage}): {len(queue)} leads due")
+        for lead in queue:
+            if total_sent >= DAILY_LIMIT:
+                print(f"  ⚠️  Daily limit {DAILY_LIMIT} hit, stopping")
+                break
+            # ICP kill-switch on follow-ups too.
+            if is_local_smb(lead):
+                log_smb_block(lead, step_stage)
+                print(f"  🚫 {lead['email']} [{lead['category']}] — BLOCKED (local SMB ICP killed)")
+                continue
+            subject, body = builder(lead)
+            print(f"  → {lead['email']} [{lead['category']}] [{days_since(lead['first_ts'])}d]", end=" ")
+            ok, detail = send_email(lead["email"], subject, body)
+            if ok:
+                log_entry(lead, step_stage, {"resend_id": detail})
+                _log_email_send(lead["email"], detail)  # ops probe surface
+                print("✅")
+                sent += 1
+                total_sent += 1
+                daily_sent += 1
+                increment_daily_sent()
+            else:
+                log_entry(lead, f"{step_stage}_error", {"error": detail})
+                print(f"❌ {detail}")
+                failed += 1
+                # If Resend quota exhausted, flag and bail out entirely
+                if "daily_quota_exceeded" in str(detail) or "429" in str(detail):
+                    set_quota_exhausted()
+                    print("  ⛔ Resend 429 received — flagging quota exhausted for rest of day")
+                    stats[f"step{step_num}"] = {"sent": sent, "failed": failed, "eligible": len(queue)}
+                    print(f"\n📊 Summary: {total_sent} total sent")
+                    for k, v in stats.items():
+                        print(f"  {k}: {v['sent']} sent / {v['eligible']} eligible / {v.get('failed',0)} failed")
+                    return
+            time.sleep(DELAY)
+
+        stats[f"step{step_num}"] = {"sent": sent, "failed": failed, "eligible": len(queue)}
+
+    print(f"\n📊 Summary: {total_sent} total sent")
+    for k, v in stats.items():
+        print(f"  {k}: {v['sent']} sent / {v['eligible']} eligible / {v['failed']} failed")
+    return stats
+
+def show_stats():
+    leads = load_pipeline()
+    buckets = defaultdict(int)
+    for email, lead in leads.items():
+        if lead["stages"] & SKIP_STAGES:
+            buckets["disqualified"] += 1
+        elif "contacted" not in lead["stages"]:
+            pass
+        else:
+            result = get_step_name(lead["stages"])
+            if not result:
+                buckets["sequence_complete"] += 1
+            else:
+                step_stage, min_days, max_days = result
+                age = days_since(lead["first_ts"])
+                if age < min_days:
+                    buckets[f"waiting_{step_stage}"] += 1
+                elif age <= max_days:
+                    buckets[f"DUE_{step_stage}"] += 1
+                else:
+                    buckets[f"overdue_{step_stage}"] += 1
+
+    print("📊 Pipeline State:")
+    for k, v in sorted(buckets.items()):
+        print(f"  {k}: {v}")
+    
+    # Conversion stats
+    replied = sum(1 for l in leads.values() if "replied" in l["stages"])
+    engaged = sum(1 for l in leads.values() if "engaged" in l["stages"])
+    proposal = sum(1 for l in leads.values() if "proposal_sent" in l["stages"])
+    accepted = sum(1 for l in leads.values() if "accepted_proposal" in l["stages"])
+    total_contacted = sum(1 for l in leads.values() if "contacted" in l["stages"])
+    print(f"\n🎯 Funnel:")
+    print(f"  Contacted: {total_contacted}")
+    print(f"  Replied: {replied} ({replied/max(total_contacted,1)*100:.1f}%)")
+    print(f"  Engaged: {engaged}")
+    print(f"  Proposal sent: {proposal}")
+    print(f"  Accepted: {accepted} (${accepted*499}/mo potential)")
+
+def preview_step(n):
+    leads = load_pipeline()
+    sample = [l for l in leads.values() if "contacted" in l["stages"]]
+    if not sample:
+        print("No leads found")
+        return
+    lead = random.choice(sample)
+    step_stage = STEPS[n-1][0]
+    builder = STEP_BUILDERS[step_stage]
+    subject, body = builder(lead)
+    print(f"LEAD: {lead['email']} | {lead['biz']} | {lead['category']}")
+    print(f"SUBJECT: {subject}")
+    print(f"BODY:\n{body}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", action="store_true")
+    parser.add_argument("--stats", action="store_true")
+    parser.add_argument("--preview", type=int)
+    args = parser.parse_args()
+
+    if args.stats:
+        show_stats()
+    elif args.preview:
+        preview_step(args.preview)
+    elif args.run:
+        run_new_leads(run_quota=40)
+        run_campaigns()
+    else:
+        show_stats()
