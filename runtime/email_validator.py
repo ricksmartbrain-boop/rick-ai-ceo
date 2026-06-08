@@ -189,6 +189,102 @@ def is_role_account(email: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Fabricated / guessed local-part guard
+# ---------------------------------------------------------------------------
+
+# Local parts that are almost always fabricated guesses produced by
+# scrape-and-blast jobs (e.g. "email@medspaoftampa.com"). These pass MX
+# checks because the domain is real, but the mailbox does not exist and the
+# message hard-bounces, poisoning domain reputation.
+_FABRICATED_LOCALS: frozenset[str] = frozenset({
+    "email", "youremail", "name", "yourname", "firstname", "lastname",
+    "example", "test", "none", "null", "na", "n/a", "unknown",
+})
+
+# US city tokens commonly used as fabricated local parts by the lead scraper
+# (e.g. "tampa@medspaoftampa.com"). Kept small and append-only.
+_CITY_LOCALS: frozenset[str] = frozenset({
+    "tampa", "orlando", "sacramento", "detroit", "memphis", "louisville",
+    "baltimore", "pittsburgh", "albuquerque", "cincinnati", "columbus",
+    "cleveland", "omaha", "richmond", "denver", "saltlakecity", "slc",
+})
+
+
+def is_fabricated_local(email: str) -> bool:
+    """Return True if the local part looks fabricated/guessed (not a real mailbox)."""
+    try:
+        local, _ = _parse_parts(email)
+    except ValueError:
+        return False
+    clean_local = re.split(r'[+.]', local)[0].lower()
+    return clean_local in _FABRICATED_LOCALS or clean_local in _CITY_LOCALS
+
+
+# ---------------------------------------------------------------------------
+# SMTP RCPT probe — verifies the mailbox actually accepts mail
+# ---------------------------------------------------------------------------
+
+def smtp_mailbox_exists(email: str, timeout: float = 8.0,
+                        helo_host: str = "meetrick.ai",
+                        mail_from: str = "rick@meetrick.ai") -> Tuple[bool, str]:
+    """Probe the recipient's mail server with RCPT TO to confirm the mailbox.
+
+    Returns (accepts, reason). Conservative: on ANY ambiguity (greylisting,
+    timeout, connection refused, 4xx) returns (True, ...) so we never block a
+    legitimate address on a flaky probe. Only a hard 5xx RCPT rejection (550
+    "no such user" family) returns (False, ...).
+    """
+    import smtplib
+    try:
+        _, domain = _parse_parts(email)
+    except ValueError:
+        return False, "invalid_format"
+
+    # Resolve best MX host
+    mx_host = domain
+    try:
+        import dns.resolver  # type: ignore
+        answers = dns.resolver.resolve(domain, "MX", lifetime=timeout)
+        mx_host = str(sorted(answers, key=lambda r: r.preference)[0].exchange).rstrip(".")
+    except Exception:
+        mx_host = domain  # fall back to domain A record
+
+    # Hard guard: if port 25 is blocked outbound (common on many hosts), a
+    # connect can hang well past the smtplib timeout. Pre-check with a short
+    # raw socket connect and bail fast (fail-open) if unreachable.
+    try:
+        import socket as _sock
+        probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        probe.settimeout(min(timeout, 5.0))
+        try:
+            probe.connect((mx_host, 25))
+        finally:
+            probe.close()
+    except Exception as exc:
+        return True, f"port25_unreachable:{type(exc).__name__}"
+
+    try:
+        server = smtplib.SMTP(timeout=timeout)
+        server.connect(mx_host, 25)
+        server.helo(helo_host)
+        server.mail(mail_from)
+        code, _msg = server.rcpt(email)
+        try:
+            server.quit()
+        except Exception:
+            pass
+        if code in (250, 251):
+            return True, "rcpt_accepted"
+        if 500 <= code < 600:
+            return False, f"rcpt_rejected:{code}"
+        # 4xx / greylist / unknown → don't block
+        return True, f"ambiguous:{code}"
+    except Exception as exc:
+        # Connection refused, timeout, blocked port 25, etc. → don't block
+        return True, f"probe_unavailable:{type(exc).__name__}"
+
+
+# ---------------------------------------------------------------------------
 # Combined outbound gate
 # ---------------------------------------------------------------------------
 
@@ -215,10 +311,29 @@ def validate_for_outbound(email: str) -> Tuple[bool, str]:
     if is_role_account(email):
         return False, f"role_account:{local}"
 
+    if is_fabricated_local(email):
+        return False, f"fabricated_local:{local}"
+
     if not has_mx_record(email):
         return False, f"no_mx_record:{domain}"
 
     return True, "ok"
+
+
+def deep_validate_for_outbound(email: str) -> Tuple[bool, str]:
+    """validate_for_outbound + live SMTP RCPT mailbox probe.
+
+    Use this on COLD outbound (scraped/guessed addresses) where mailbox
+    existence is uncertain. The SMTP probe adds latency, so reserve it for
+    cold blasts, not transactional/subscriber sends.
+    """
+    ok, reason = validate_for_outbound(email)
+    if not ok:
+        return ok, reason
+    accepts, sreason = smtp_mailbox_exists(email)
+    if not accepts:
+        return False, sreason
+    return True, f"ok:{sreason}"
 
 
 # ---------------------------------------------------------------------------
