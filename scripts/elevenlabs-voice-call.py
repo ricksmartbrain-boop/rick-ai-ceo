@@ -250,9 +250,22 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Print payload for first eligible lead and exit")
     parser.add_argument("--limit", type=int, default=DEFAULT_DAILY_LIMIT, help="Max calls to place this run")
     parser.add_argument("--force-hours", action="store_true", help="Skip business-hours check")
+    parser.add_argument("--live", action="store_true", help="Required (with RICK_VOICE_LIVE=1) to place real calls")
     args = parser.parse_args()
 
     load_env()
+
+    # Voice master gate (2026-07-13): live calls require BOTH the env flag
+    # AND an explicit --live. Anything else is forced dry-run, loudly — this
+    # script used to be live by default with zero env gates.
+    if not args.dry_run and not args.smoke:
+        if os.getenv("RICK_VOICE_LIVE", "0").strip() != "1" or not args.live:
+            print(
+                "🔒 FORCED DRY-RUN: live calls need RICK_VOICE_LIVE=1 in rick.env "
+                "AND the --live flag (TCPA layer incomplete).",
+                flush=True,
+            )
+            args.dry_run = True
 
     api_key = require_env("ELEVENLABS_API_KEY")
     agent_id = require_env("ELEVENLABS_AGENT_ID")

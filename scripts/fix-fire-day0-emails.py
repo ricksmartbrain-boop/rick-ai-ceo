@@ -8,8 +8,8 @@ ctx['trigger_payload']['email'] → "no email" skip on 2026-04-27.
 Fix sequence per workflow:
   1. Promote trigger_payload fields to top-level ctx
   2. Remove stale skipped email-cold-1 entry from touch_log
-  3. Generate opus-4-7 opener via generate_text('review')
-  4. Verify model is opus-4-7 or gpt-5.4 (hard-fail on mini)
+  3. Generate opus-4-8 opener via generate_text('review')
+  4. Verify model is opus-4-8 or gpt-5.4 (hard-fail on mini)
   5. Save vault JSON
   6. Write mailbox outbox file (email formatter pattern)
   7. Create outbound_job in DB
@@ -57,7 +57,7 @@ TARGETS = [
 ]
 
 # Smart-model invariant: only these are acceptable for cold openers
-APPROVED_MODELS = {"claude-opus-4-7", "gpt-5.4"}
+APPROVED_MODELS = {"claude-opus-4-8", "gpt-5.4"}
 
 FROM_EMAIL = os.getenv("MEETRICK_FROM_EMAIL", "Rick <rick@meetrick.ai>")
 
@@ -124,7 +124,7 @@ def generate_opener(lead: dict) -> tuple[str, str, str]:
     result = generate_text("review", prompt, fallback_text)
     model_used = result.model.strip()
 
-    # Normalize: strip provider prefix if present (e.g. "anthropic/claude-opus-4-7" → "claude-opus-4-7")
+    # Normalize: strip provider prefix if present (e.g. "anthropic/claude-opus-4-8" → "claude-opus-4-8")
     model_short = model_used.split("/")[-1] if "/" in model_used else model_used
 
     # Hard invariant: NEVER mini for these openers

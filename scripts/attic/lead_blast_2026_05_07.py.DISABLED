@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+Lead blast script — May 7, 2026
+10 new cities, fresh leads, cold roast emails via Resend API
+"""
+import os, json, requests
+from datetime import datetime, timezone
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+FROM_EMAIL = os.environ.get("MEETRICK_FROM_EMAIL", "Rick <hello@meetrick.ai>")
+PIPELINE_LOG = os.path.expanduser("~/rick-vault/logs/pipeline.jsonl")
+
+LEADS = [
+    {
+        "business_name": "Windermere Medical Spa & Laser Institute",
+        "category": "med_spa",
+        "city": "Orlando",
+        "state": "FL",
+        "email": "support@windermeremedicalspa.com",
+        "domain": "windermeremedicalspa.com",
+        "website": "https://windermeremedicalspa.com",
+        "email_confirmed": True,
+        "roast_hook": "stunning work on the branding — 'Princess Injectors' is a genuinely memorable angle. But your homepage hero doesn't tell a first-time visitor what to do next. You're getting traffic and then quietly losing it.",
+    },
+    {
+        "business_name": "Elite Roofing Sacramento",
+        "category": "roofing",
+        "city": "Sacramento",
+        "state": "CA",
+        "email": "sales@eliteroofingsacramento.com",
+        "domain": "eliteroofingsacramento.com",
+        "website": "https://eliteroofingsacramento.com",
+        "email_confirmed": True,
+        "roast_hook": "your site loads clean and the instant estimator is a smart move. The problem? Your above-the-fold section is basically just a phone number. That's leaving a lot of leads on the table before they ever scroll.",
+    },
+    {
+        "business_name": "Peak Performance Physical Therapy",
+        "category": "physical_therapist",
+        "city": "Detroit",
+        "state": "MI",
+        "email": "info@peakperformancemi.com",
+        "domain": "peakperformancemi.com",
+        "website": "https://peakperformancemi.com",
+        "email_confirmed": True,
+        "roast_hook": "two locations, solid reviews, and a clear niche — you're doing a lot right. But your homepage headline ('Your Progress to a Pain-Free Life Is Our Passion') is the most generic thing in PT marketing. You deserve better copy than that.",
+    },
+    {
+        "business_name": "Aced Roofing & Remodeling",
+        "category": "roofing",
+        "city": "Cincinnati",
+        "state": "OH",
+        "email": "info@acedroofers.com",
+        "domain": "acedroofers.com",
+        "website": "https://acedroofers.com",
+        "email_confirmed": True,
+        "roast_hook": "A+ BBB rating and lifetime warranties — that's serious credibility. But your homepage doesn't lead with that. Instead it opens with generic stock imagery and a big form. You're burying your best assets.",
+    },
+    {
+        "business_name": "AlluraDerm MD Med Spa",
+        "category": "med_spa",
+        "city": "Albuquerque",
+        "state": "NM",
+        "email": "info@alluraderm.com",
+        "domain": "alluraderm.com",
+        "website": "https://alluraderm.com",
+        "email_confirmed": False,
+        "roast_hook": "the positioning as NM's #1 Botox provider is bold and I like it. But your homepage loads with a dense paragraph of buzzwords before any clear CTA. Confidence like yours needs a sharper hook — not a features list.",
+    },
+    {
+        "business_name": "Affinity Med Spa & Wellness Center",
+        "category": "med_spa",
+        "city": "Orlando",
+        "state": "FL",
+        "email": "info@myaffinitymedspa.com",
+        "domain": "myaffinitymedspa.com",
+        "website": "https://myaffinitymedspa.com",
+        "email_confirmed": False,
+        "roast_hook": "award-winning, family-owned, and clearly doing the work. The issue is your site doesn't feel award-winning. The first thing visitors see is a navigation bar instead of a reason to book — that's a conversion leak hiding in plain sight.",
+    },
+    {
+        "business_name": "Rafa Therapies",
+        "category": "physical_therapist",
+        "city": "Detroit",
+        "state": "MI",
+        "email": "info@rafatherapies.org",
+        "domain": "rafatherapies.org",
+        "website": "https://rafatherapies.org",
+        "email_confirmed": False,
+        "roast_hook": "great mission and the three-step patient approach is actually a compelling story. But your homepage buries it. A first-time visitor can't figure out in under 5 seconds why they should choose you over any other Detroit PT clinic.",
+    },
+    {
+        "business_name": "Elevated Roofing Inc",
+        "category": "roofing",
+        "city": "Sacramento",
+        "state": "CA",
+        "email": "info@elevatedroofinginc.com",
+        "domain": "elevatedroofinginc.com",
+        "website": "https://elevatedroofinginc.com",
+        "email_confirmed": False,
+        "roast_hook": "30+ years of roofing experience is genuinely impressive and should be the first thing anyone sees on your site. Instead, it's buried three scrolls down under some stock imagery. That's an authority mismatch — your credibility deserves the top spot.",
+    },
+    {
+        "business_name": "Benchmark Wealth",
+        "category": "financial_advisor",
+        "city": "Memphis",
+        "state": "TN",
+        "email": "info@benchmarkwealth.com",
+        "domain": "benchmarkwealth.com",
+        "website": "https://benchmarkwealth.com",
+        "email_confirmed": False,
+        "roast_hook": "people over profit is a genuine differentiator in wealth management — and it comes across. The gap is your site's CTA structure. 'Let's Talk' at the top nav isn't a compelling action for someone who just landed cold. You need a stronger on-ramp.",
+    },
+    {
+        "business_name": "Ashwood Financial Partners",
+        "category": "financial_advisor",
+        "city": "Richmond",
+        "state": "VA",
+        "email": "info@ashwoodfinancialpartners.com",
+        "domain": "ashwoodfinancialpartners.com",
+        "website": "https://ashwoodfinancialpartners.com",
+        "email_confirmed": False,
+        "roast_hook": "CFA charterholders, fiduciary, independent — your credibility stack is genuinely strong. But your homepage tries to speak to three different audiences at once (families, businesses, nonprofits) without a clear entry point for any of them. Attention splits, conversions drop.",
+    },
+    {
+        "business_name": "Deer Park Roofing",
+        "category": "roofing",
+        "city": "Cincinnati",
+        "state": "OH",
+        "email": "info@deerparkroofing.com",
+        "domain": "deerparkroofing.com",
+        "website": "https://www.deerparkroofing.com",
+        "email_confirmed": False,
+        "roast_hook": "#1 Cincinnati roofing company is a big claim, and from what I can see, you've earned it. But your website doesn't back it up visually. The layout looks like 2018 called and you answered — which is a shame given how strong the reputation is.",
+    },
+    {
+        "business_name": "NUR Med Spa & Wellness",
+        "category": "med_spa",
+        "city": "Orlando",
+        "state": "FL",
+        "email": "info@thenurmedspa.com",
+        "domain": "thenurmedspa.com",
+        "website": "https://www.thenurmedspa.com",
+        "email_confirmed": False,
+        "roast_hook": "2,500+ happy patients since 2024 is insane velocity — that's real traction. But your homepage opens with stats before it opens with desire. People don't book med spa treatments because of numbers. They book because they picture themselves transformed. Lead with the outcome, not the scoreboard.",
+    },
+]
+
+EMAIL_TEMPLATE = """\
+Subject: honest take on {business_name}'s website
+
+Hey {business_name} team,
+
+I've been building a free website roast tool for local businesses and I pulled up {website} — {roast_hook}
+
+I'm offering free roasts at meetrick.ai/roast — takes 60 seconds, no strings. Just paste your URL and I'll tell you exactly what's costing you customers.
+
+Figured you'd want to know.
+
+— Rick
+AI-powered website critic, co-founder @ MeetRick
+meetrick.ai/roast
+"""
+
+def send_email(lead):
+    subject = f"honest take on {lead['business_name']}'s website"
+    body_text = EMAIL_TEMPLATE.format(
+        business_name=lead["business_name"],
+        website=lead["website"],
+        roast_hook=lead["roast_hook"],
+    )
+    body_html = f"""<p>Hey {lead['business_name']} team,</p>
+<p>I've been building a free website roast tool for local businesses and I pulled up <a href="{lead['website']}">{lead['domain']}</a> — {lead['roast_hook']}</p>
+<p>I'm offering free roasts at <a href="https://meetrick.ai/roast">meetrick.ai/roast</a> — takes 60 seconds, no strings. Just paste your URL and I'll tell you exactly what's costing you customers.</p>
+<p>Figured you'd want to know.</p>
+<p>— Rick<br>
+AI-powered website critic, co-founder @ MeetRick<br>
+<a href="https://meetrick.ai/roast">meetrick.ai/roast</a></p>"""
+
+    payload = {
+        "from": FROM_EMAIL,
+        "to": [lead["email"]],
+        "subject": subject,
+        "text": body_text,
+        "html": body_html,
+    }
+
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    return resp.status_code, resp.json()
+
+
+def log_send(lead, status, resend_id=None):
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "stage": "contacted",
+        "status": status,
+        "business_name": lead["business_name"],
+        "category": lead["category"],
+        "city": lead["city"],
+        "state": lead["state"],
+        "email": lead["email"],
+        "email_confirmed": lead.get("email_confirmed", False),
+        "domain": lead["domain"],
+        "website": lead["website"],
+        "source": "cold_outreach_blast",
+        "resend_id": resend_id,
+    }
+    os.makedirs(os.path.dirname(PIPELINE_LOG), exist_ok=True)
+    with open(PIPELINE_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return entry
+
+
+def load_existing_domains():
+    domains = set()
+    try:
+        with open(PIPELINE_LOG) as f:
+            for line in f:
+                try:
+                    row = json.loads(line.strip())
+                    if row.get("domain"):
+                        domains.add(row["domain"].lower())
+                    if row.get("email"):
+                        domains.add(row["email"].lower())
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    return domains
+
+
+def main():
+    existing = load_existing_domains()
+    print(f"Loaded {len(existing)} existing pipeline entries for dedup")
+
+    sent = 0
+    skipped = 0
+    failed = 0
+
+    for lead in LEADS:
+        domain_key = lead["domain"].lower()
+        email_key = lead["email"].lower()
+
+        if domain_key in existing or email_key in existing:
+            print(f"  [SKIP] {lead['business_name']} — already in pipeline")
+            skipped += 1
+            continue
+
+        print(f"  [SEND] {lead['business_name']} ({lead['city']}) → {lead['email']}")
+        try:
+            code, data = send_email(lead)
+            if code in (200, 201):
+                resend_id = data.get("id")
+                log_send(lead, "sent", resend_id)
+                print(f"    ✓ Sent — resend_id={resend_id}")
+                sent += 1
+                existing.add(domain_key)
+                existing.add(email_key)
+            else:
+                log_send(lead, f"failed_{code}")
+                print(f"    ✗ Failed — HTTP {code}: {data}")
+                failed += 1
+        except Exception as e:
+            log_send(lead, "error")
+            print(f"    ✗ Error: {e}")
+            failed += 1
+
+    print(f"\nDone: {sent} sent, {skipped} skipped (dupes), {failed} failed")
+
+
+if __name__ == "__main__":
+    main()

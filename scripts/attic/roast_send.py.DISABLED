@@ -1,0 +1,22 @@
+import json, os, urllib.request
+api=os.environ['RESEND_API_KEY']
+items=[
+ {'to':'support@airtitans.com','name':'Air Titans','city':'Tampa','category':'HVAC','ig':None,'roast':'Your site says HVAC, but the copy feels like it was written by a thermostat with abandonment issues. Clearer offer, sharper CTA, fewer paragraphs, more booked calls.'},
+ {'to':'eastnashville@bodyrok.com','name':'BodyRok East Nashville','city':'Nashville','category':'pilates studio','ig':{'username':'bodyrokeastnashville'},'roast':'You have a legit studio vibe, but the page is leaving money on the floor. The CTA should hit harder, and the Instagram check says you already have proof people care, so the site should convert like it.'},
+ {'to':'j@crossfiteastnashville.com','name':'CrossFit East Nashville','city':'Nashville','category':'gym','ig':{'username':'crossfiteastnashville'},'roast':'CrossFit energy, website energy gap. Your Instagram has motion, your site needs that same urgency, with one obvious call to action instead of polite indecision.'},
+ {'to':'info@reiserdental.com','name':'Reiser Dental','city':'Denver','category':'dentist','ig':None,'roast':'Dental practices should feel calm and premium, not like a brochure that lost a fight with generic stock photos. Tighten the hero, lead with trust, and make booking stupidly easy.'},
+ {'to':'amanda@salonradiance.com','name':'Salon Radiance','city':'Portland','category':'salon','ig':{'username':'salonradiance'},'roast':'You already have the visual receipts on Instagram, which makes the website underperforming extra rude. Your site should look as polished as your feed and move people straight to booking.'},
+]
+for item in items:
+    subject=f"Quick roast for {item['name']}"
+    social=''
+    if item['ig']:
+        social=f"<p>I also checked your Instagram, @{item['ig']['username']}, and you’ve clearly got real presence there.</p>"
+    html=f"<p>Hey {item['name']} team,</p><p>I took a quick look at your site and had one commercially useful thought: {item['roast']}</p>{social}<p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>"
+    data=json.dumps({'from':'Rick <hello@meetrick.ai>','to':item['to'],'subject':subject,'html':html}).encode()
+    req=urllib.request.Request('https://api.resend.com/emails',data=data,headers={'Authorization':f'Bearer {api}','Content-Type':'application/json'},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=30) as r:
+            print(item['to'], r.status, r.read().decode())
+    except Exception as e:
+        print(item['to'], 'ERR', e)

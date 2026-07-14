@@ -1,0 +1,407 @@
+Best Products
+Launches
+News
+Forums
+Advertise
+Submit
+Best of Product Hunt
+|
+March 20, 2026
+Daily
+Weekly
+Monthly
+Yearly
+Featured
+All
+←
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+→
+ProductBridge
+Agent that collects feedback across multiple platforms
+Productivity
+•
+Customer Communication
+•
+SaaS
+Nika
+upvoted this product
+
+73
+
+600
+
+AdsTurbo
+Create ads with AI actors that look truly human
+Marketing
+•
+Advertising
+•
+Video
+Nika
+upvoted this product
+
+38
+
+391
+
+Assembly 2.0
+Build modern client portals for service businesses
+Task Management
+•
+Customer Communication
+•
+CRM
+
+37
+
+266
+
+Composer 2 by Cursor
+Fast, token-efficient frontier-level coding model
+Developer Tools
+•
+Artificial Intelligence
+•
+Development
+
+Chris Messina
+
+While Windsurf confuses their pricing model, Cursor keeps trucking with their own tech. Inspiring stuff.
+
+25
+
+372
+
+GitAgent by Lyzr
+Your repository becomes your agent
+Artificial Intelligence
+•
+GitHub
+•
+Vibe coding
+
+21
+
+242
+
+Claude Code Channels
+Push events and chat with Claude Code via Telegram & Discord
+Productivity
+•
+Messaging
+•
+Artificial Intelligence
+Nika
+upvoted this product
+
+9
+
+251
+
+Google AI Studio 2.0
+Full-stack vibe coding powered by Antigravity + Firebase
+Developer Tools
+•
+Artificial Intelligence
+•
+Vibe coding
+Chris Messina
+upvoted this product
+
+10
+
+220
+
+Visdiff
+Stop bridging the design-to-code gap, close it
+Design Tools
+•
+Developer Tools
+•
+Artificial Intelligence
+Nika
+upvoted this product
+
+48
+
+162
+
+Built for Devs
+See how developers really experience your product
+User Experience
+•
+Developer Tools
+•
+Artificial Intelligence
+Nika
+upvoted this product
+
+40
+
+192
+
+AppSignal
+Full-stack monitoring for errors, metrics, and logs
+Promoted
+Productivity
+•
+Analytics
+•
+Developer Tools
+
+HΞNRY
+
+I've been using AppSignal for a little while now and I cannot imagine working without it. Their support is awesome, the interface is super clean and it was so easy to get it up and running.
+
+11
+
+240
+
+AI Skills Manager
+One place for all your AI skills
+Open Source
+•
+Developer Tools
+•
+Artificial Intelligence
+
+13
+
+146
+
+RoastMyReels - AI Reels Coach That Hurts
+Your reels are mid. We will tell you exactly why.
+Social Media
+•
+Marketing
+•
+Artificial Intelligence
+
+13
+
+14
+
+Telea
+Speak like you always know what to say
+Productivity
+•
+Meetings
+•
+YouTube
+Nika
+upvoted this product
+
+21
+
+119
+
+Room Service
+The Mac cleaner built for developers
+Mac
+•
+Productivity
+•
+Developer Tools
+
+31
+
+131
+
+CueNotch
+Look like you memorized everything. You didn't.
+Product Hunt
+•
+Tech
+•
+Apple
+
+5
+
+19
+
+Wispr Flow: Dictation That Works Everywhere
+Stop typing. Start speaking. 4x faster.
+Promoted
+Productivity
+•
+Artificial Intelligence
+•
+Audio
+
+Tanay Kothari
+
+Hey Product Hunt 🎉 I’m Tanay, co-founder & CEO of Wispr Flow, a Mac dictation app that lets you speak naturally, and writes in your style, in every application — with auto-edits, command mode, and over 100 languages. ⭐ The founding story Ever since I watched the first Ironman movie in 2008 at age 10, I've wanted to build Jarvis. It drove me to pull my first all-nighter and start teaching myself how to code. 16 years later, I think we’ve found a way to make a voice experience delightful for all-day use. And there's no one else I'd build this with than my college roommate and closest friend @sahaj_garg2 Our vision is to make voice interfaces both useful (so you trust them) and ubiquitous (so you can use them everywhere). This is how we can move from screen-first technologies to voice-first technologies and build a future where we aren't stuck looking at our phones all day long. ⭐ Using Flow is super simple: 1. Download Flow for Mac 2. Press and hold [Fn] to start speaking in any app 3. Release [Fn] to enter text ⭐ What users love Flow for - 🛠️ Developers using Cursor / Claude / ChatGPT: Speak with AI assistants faster than typing. - ✉️ Professionals breezing through their inbox: Flow accurately captures names and formats your emails and Slack messages. - 🧑‍🎓 Students chatting with AI and finishing assignments even faster: We have a special student discount. - 📄 Product Managers drafting PRDs and sharing thoughts: Flow turns your rambles into clear ideas. - 👶 Parents with busy lives: Time is precious. Every second you save writing is an extra second you have for family. - 🤖 Tech-lovers who want to use voice with every AI tool ⭐ Here’s all you’ll get with Flow 1.0 — and we’re just getting started. 1. ⚡ Blazing fast dictation: Powered by Flow’s ultra-fast inference engine 2. 🎨 Tone match: You speak differently than you write. Flow learns your writing style across every application 3. 🔧 Auto-edits when you change your mind: “Hey lets meet at 5pm, actually lets do 6pm” → “Hey, lets meet at 6pm” 4. 😎 Command Mode for selected text: Say commands like “Flow, make this crisper and more assertive” without copy-pasting into other tools. 5. 🧩 Native integrations: Select text anywhere and just say: “Ask perplexity, what does this mean?” 6. 😶 Whispering mode: Use Flow around others by quietly whispering to your computer. 7. 🔒 Private by design: Your recordings locally on your computer by default. Only you have access to it. You can allow Flow to use your data to improve our models (disabled by default). Learn more: wispr.ai/data-usage For technical users, most voice dictation tools focus on technical metrics like "word error rate." At Flow, we prioritize what truly matters to users: zero-edit messages. With Flow, you rarely need to return to your keyboard for edits. Our new approach has made Flow the first consumer voice dictation platform that makes people enjoy using voice more than their keyboards. ⭐ A final note Our dream is to create a world where interacting with technology feels as natural as interacting with people. I'd love your help to make this a reality. Try out Flow and share your feedback — we're eager to make it even more magical with your input. PS: A huge shoutout to our thousands of beta users who've showered us with love and feedback over the last few months. We wouldn't be here without you.
+
+526
+
+2,086
+
+Fig Prompt
+Build Figma plugins with just a prompt
+Design Tools
+•
+Artificial Intelligence
+•
+No-Code
+
+8
+
+103
+
+Context Overflow
+Knowledge Sharing for AI Agents
+Productivity
+•
+Developer Tools
+•
+Artificial Intelligence
+
+14
+
+117
+
+GentleLimit
+Mindful screen time for macOS without blocking apps
+Productivity
+•
+Time Tracking
+•
+Menu Bar Apps
+
+Nika
+
+This is really cool. I think that I saw something similar to @focusedOS What kind of permissions do I need to give this tool, and what data leaves my computer? Is there any pricing available?
+
+11
+
+99
+
+Launch Archive
+
+2026
+• March
+• February
+• January
+2025
+2024
+2023
+2022
+2021
+2020
+2019
+2018
+2017
+2016
+2015
+2014
+2013
+Top Product Categories
+Engineering & Development
+Vibe Coding Tools
+AI Coding Agents
+AI Code Editors
+LLMs
+AI Chatbots
+AI Infrastructure Tools
+Prompt Engineering Tools
+Productivity
+AI notetakers
+Note and writing apps
+Team collaboration software
+Search
+AI Workflow Automation
+Marketing & Sales
+Lead generation software
+Marketing automation platforms
+Design & Creative
+Video editing
+Design resources
+Graphic design tools
+AI Generative Media
+Social & Community
+Social Networking
+Professional networking platforms
+Community management
+Finance
+Accounting software
+Fundraising resources
+Investing
+AI Agents
+AI Voice Agents
+See All Categories >>
+Trending categories
+Vibe Coding Tools
+AI Dictation Apps
+AI notetakers
+Code Review Tools
+No-code Platforms
+Figma Plugins
+Static site generators
+Top reviewed
+Lovable
+n8n
+Attio
+PostHog
+Vapi
+Granola
+Raycast
+Supabase
+Trending products
+Lovable
+Screen Studio
+bolt.new
+Wispr Flow
+Framer
+Replit
+Vapi
+Granola
+Top forum threads
+Cursor or Claude Code?
+POLL: Domain or product first?
+YC deadline in <2 weeks; Who's applying?
+We Got into YC, Got Kicked Out, and Fought Our Way Back
+How Wispr Flow found PMF through pivot
+Best Vibe Coding tool so far?
+Landing page roast - 48 hours only
+Fix your tagline with the PH CEO
+© 2026 Product Hunt
+Newsletter
+Apps
+About
+FAQ
+Terms
+Privacy & Cookies
+Privacy Choices
+Advertise
+llms.txt
+Contact us: hello@producthunt.com

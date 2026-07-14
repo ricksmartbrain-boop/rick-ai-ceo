@@ -11,7 +11,9 @@ Reads yesterday's data from rick-runtime.db:
   - Outcomes: total cost, count, top 5 routes by cost + by count
   - Workflows: completed (kind, count, status)
   - Subagents: kind, status, cost from subagent_heartbeat
-  - Stripe events from ~/rick-vault/operations/stripe-events.jsonl (if exists)
+  - LLM events/cost from the runtime's llm-usage.jsonl ledger (2026-07-12)
+  - Stripe events from ~/rick-vault/operations/stripe-events.jsonl if it
+    exists, else live Stripe /v1/charges for the day (2026-07-12)
   - MRR (parsed from latest revenue/reconciliation-*.md, fallback $9 per SELF-FAQ)
 
 Writes BOTH:
@@ -48,6 +50,10 @@ SITE_DIR = Path(os.getenv("RICK_SITE_DIR", str(Path.home() / "meetrick-site")))
 RECEIPTS_DIR = SITE_DIR / "receipts"
 DB_PATH = DATA_ROOT / "runtime" / "rick-runtime.db"
 STRIPE_EVENTS_PATH = DATA_ROOT / "operations" / "stripe-events.jsonl"
+# Runtime's live per-call LLM ledger (bootstrap.sh convention)
+LLM_USAGE_PATH = Path(
+    os.getenv("RICK_LLM_USAGE_LOG_FILE", str(DATA_ROOT / "operations" / "llm-usage.jsonl"))
+)
 
 # Anything resembling these in free-text fields gets scrubbed before publish.
 PII_PATTERNS = [
@@ -81,9 +87,12 @@ def _connect() -> sqlite3.Connection | None:
 
 
 def _gather_outcomes(con: sqlite3.Connection, target: date) -> dict:
-    """Aggregates from outcomes table. Cost + count + top-N routes."""
-    start = f"{target.isoformat()} 00:00:00"
-    end = f"{target.isoformat()} 23:59:59"
+    """Aggregates from outcomes table. Cost + count + top-N routes.
+
+    2026-07-12 fix: created_at is stored ISO-8601 with a 'T' separator
+    ('2026-07-11T03:33:58'); the old space-separated BETWEEN bounds
+    matched zero rows every day. Match on the date prefix instead."""
+    day_prefix = f"{target.isoformat()}%"
 
     def q(sql, *args, default=None):
         try:
@@ -99,29 +108,29 @@ def _gather_outcomes(con: sqlite3.Connection, target: date) -> dict:
             return []
 
     cost_total = q(
-        "SELECT ROUND(SUM(cost_usd),4) FROM outcomes WHERE created_at BETWEEN ? AND ?",
-        start, end, default=0.0,
+        "SELECT ROUND(SUM(cost_usd),4) FROM outcomes WHERE created_at LIKE ?",
+        day_prefix, default=0.0,
     )
     count_total = q(
-        "SELECT COUNT(*) FROM outcomes WHERE created_at BETWEEN ? AND ?",
-        start, end, default=0,
+        "SELECT COUNT(*) FROM outcomes WHERE created_at LIKE ?",
+        day_prefix, default=0,
     )
     top_by_cost = qall(
         "SELECT route, ROUND(SUM(cost_usd),4) AS cost_usd, COUNT(*) AS n "
-        "FROM outcomes WHERE created_at BETWEEN ? AND ? "
+        "FROM outcomes WHERE created_at LIKE ? "
         "GROUP BY route ORDER BY cost_usd DESC LIMIT 5",
-        start, end,
+        day_prefix,
     )
     top_by_count = qall(
         "SELECT route, COUNT(*) AS n, ROUND(SUM(cost_usd),4) AS cost_usd "
-        "FROM outcomes WHERE created_at BETWEEN ? AND ? "
+        "FROM outcomes WHERE created_at LIKE ? "
         "GROUP BY route ORDER BY n DESC LIMIT 5",
-        start, end,
+        day_prefix,
     )
     quality_scored = q(
         "SELECT COUNT(quality_score) FROM outcomes "
-        "WHERE created_at BETWEEN ? AND ? AND quality_score IS NOT NULL",
-        start, end, default=0,
+        "WHERE created_at LIKE ? AND quality_score IS NOT NULL",
+        day_prefix, default=0,
     )
     return {
         "cost_total_usd": float(cost_total or 0),
@@ -139,15 +148,15 @@ def _gather_outcomes(con: sqlite3.Connection, target: date) -> dict:
 
 
 def _gather_workflows(con: sqlite3.Connection, target: date) -> dict:
-    """Aggregates from workflows updated yesterday. (kind, status) -> count."""
-    start = f"{target.isoformat()} 00:00:00"
-    end = f"{target.isoformat()} 23:59:59"
+    """Aggregates from workflows updated yesterday. (kind, status) -> count.
+    2026-07-12: date-prefix match (updated_at is 'T'-separated ISO)."""
+    day_prefix = f"{target.isoformat()}%"
     try:
         rows = con.execute(
             "SELECT kind, status, COUNT(*) AS n FROM workflows "
-            "WHERE updated_at BETWEEN ? AND ? "
+            "WHERE updated_at LIKE ? "
             "GROUP BY kind, status ORDER BY n DESC",
-            (start, end),
+            (day_prefix,),
         ).fetchall()
     except sqlite3.Error:
         rows = []
@@ -166,9 +175,9 @@ def _gather_workflows(con: sqlite3.Connection, target: date) -> dict:
 
 
 def _gather_subagents(con: sqlite3.Connection, target: date) -> dict:
-    """Aggregates from subagent_heartbeat. kind+status+cost only — no task text."""
-    start = f"{target.isoformat()} 00:00:00"
-    end = f"{target.isoformat()} 23:59:59"
+    """Aggregates from subagent_heartbeat. kind+status+cost only — no task text.
+    2026-07-12: date-prefix match (started_at is 'T'-separated ISO)."""
+    day_prefix = f"{target.isoformat()}%"
     try:
         rows = con.execute(
             "SELECT kind, status, COUNT(*) AS n, "
@@ -176,9 +185,9 @@ def _gather_subagents(con: sqlite3.Connection, target: date) -> dict:
             "ROUND(SUM(usage_tokens_in),0) AS tok_in, "
             "ROUND(SUM(usage_tokens_out),0) AS tok_out "
             "FROM subagent_heartbeat "
-            "WHERE started_at BETWEEN ? AND ? "
+            "WHERE started_at LIKE ? "
             "GROUP BY kind, status ORDER BY cost_usd DESC",
-            (start, end),
+            (day_prefix,),
         ).fetchall()
     except sqlite3.Error:
         rows = []
@@ -200,11 +209,130 @@ def _gather_subagents(con: sqlite3.Connection, target: date) -> dict:
     }
 
 
+def _gather_llm_usage(target: date) -> dict:
+    """Aggregates the runtime's live per-call LLM ledger (llm-usage.jsonl).
+
+    2026-07-12: this is the actual LLM-events source — the outcomes table
+    only records a small subset. Count + cost + top models by cost."""
+    out = {"present": False, "count_total": 0, "cost_total_usd": 0.0, "top_models_by_cost": []}
+    if not LLM_USAGE_PATH.is_file():
+        return out
+    target_str = target.isoformat()
+    by_model: dict[str, dict] = {}
+    n = 0
+    cost = 0.0
+    try:
+        with LLM_USAGE_PATH.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not str(ev.get("timestamp", "")).startswith(target_str):
+                    continue
+                n += 1
+                usd = 0.0
+                try:
+                    usd = float(ev.get("usd") or 0)
+                except (TypeError, ValueError):
+                    pass
+                cost += usd
+                model = _scrub(str(ev.get("model") or "unknown"))
+                agg = by_model.setdefault(model, {"model": model, "n": 0, "cost_usd": 0.0})
+                agg["n"] += 1
+                agg["cost_usd"] += usd
+    except OSError:
+        return out
+    out["present"] = True
+    out["count_total"] = n
+    out["cost_total_usd"] = round(cost, 4)
+    out["top_models_by_cost"] = sorted(
+        [{"model": a["model"], "n": a["n"], "cost_usd": round(a["cost_usd"], 4)}
+         for a in by_model.values()],
+        key=lambda r: r["cost_usd"], reverse=True,
+    )[:5]
+    return out
+
+
+def _stripe_key() -> str:
+    """Resolve STRIPE_SECRET_KEY from env or rick.env (same convention as
+    revenue-velocity.py). Never logged, never published."""
+    key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+    if key:
+        return key
+    for env_file in (
+        Path.home() / ".openclaw" / "workspace" / "config" / "rick.env",
+        Path.home() / "clawd" / "config" / "rick.env",
+    ):
+        if not env_file.exists():
+            continue
+        for line in env_file.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):].lstrip()
+            if stripped.startswith("STRIPE_SECRET_KEY="):
+                return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _stripe_charges_live(target: date) -> dict | None:
+    """Live Stripe fallback: gross for `target` from /v1/charges.
+    Returns None on any failure (missing key, network, API error)."""
+    import base64
+    import urllib.request
+
+    api_key = _stripe_key()
+    if not api_key:
+        return None
+    day_start = int(datetime(target.year, target.month, target.day, tzinfo=timezone.utc).timestamp())
+    day_end = day_start + 86400
+    url = (
+        "https://api.stripe.com/v1/charges"
+        f"?created[gte]={day_start}&created[lt]={day_end}&limit=100"
+    )
+    req = urllib.request.Request(url)
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+    req.add_header("Authorization", f"Basic {creds}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    type_counts: dict[str, int] = {}
+    gross_cents = 0
+    n = 0
+    for ch in data.get("data", []):
+        n += 1
+        status = str(ch.get("status") or "unknown")
+        type_counts[f"charge.{status}"] = type_counts.get(f"charge.{status}", 0) + 1
+        if ch.get("paid") and status == "succeeded":
+            try:
+                gross_cents += int(ch.get("amount") or 0) - int(ch.get("amount_refunded") or 0)
+            except (TypeError, ValueError):
+                pass
+    return {
+        "present": True,
+        "source": "stripe_api_charges",
+        "events_count": n,
+        "by_type": sorted(
+            [{"type": k, "n": v} for k, v in type_counts.items()],
+            key=lambda r: r["n"], reverse=True,
+        ),
+        "gross_usd": round(gross_cents / 100.0, 2),
+    }
+
+
 def _gather_stripe_events(target: date) -> dict:
-    """Reads stripe-events.jsonl if present. Aggregates only — never raw events."""
+    """Reads stripe-events.jsonl if present; else falls back to the live
+    Stripe API (2026-07-12 — the jsonl was never created, which left every
+    published receipt at $0 gross). Aggregates only — never raw events."""
     out = {"present": False, "events_count": 0, "by_type": [], "gross_usd": 0.0}
     if not STRIPE_EVENTS_PATH.is_file():
-        return out
+        live = _stripe_charges_live(target)
+        return live if live is not None else out
     try:
         text = STRIPE_EVENTS_PATH.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -293,6 +421,7 @@ def _build_receipt(target: date) -> dict:
                 pass
 
     stripe = _gather_stripe_events(target)
+    llm_usage = _gather_llm_usage(target)
     mrr = _real_mrr()
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -314,15 +443,19 @@ def _build_receipt(target: date) -> dict:
         "chain": chain,  # NEW: prev_receipt_sha256 + prev_receipt_git_sha
         "mrr": mrr,
         "outcomes": outcomes,
+        "llm_usage": llm_usage,  # 2026-07-12: runtime's live per-call ledger
         "workflows": workflows,
         "subagents": subagents,
         "stripe": stripe,
         "totals": {
-            "llm_cost_usd": outcomes["cost_total_usd"],
-            "llm_event_count": outcomes["count_total"],
+            # 2026-07-12: LLM totals come from llm-usage.jsonl (the runtime's
+            # actual per-call ledger); the outcomes table only records a
+            # subset and had been publishing 0 for 77 days.
+            "llm_cost_usd": llm_usage["cost_total_usd"],
+            "llm_event_count": llm_usage["count_total"],
             "subagent_cost_usd": subagents["total_cost_usd"],
             "combined_cost_usd": round(
-                outcomes["cost_total_usd"] + subagents["total_cost_usd"], 4
+                llm_usage["cost_total_usd"] + subagents["total_cost_usd"], 4
             ),
             "workflows_completed": workflows["completed_count"],
             "stripe_gross_usd": stripe["gross_usd"],
@@ -509,6 +642,30 @@ def main() -> int:
     if not live:
         print(f"=== DRY-RUN receipt for {target.isoformat()} ===")
         print(json.dumps(receipt, indent=2))
+        return 0
+
+    # Trivial-delta gate (2026-07-13): a day with zero LLM events, zero
+    # workflows, zero Stripe activity and unchanged MRR carries no new
+    # information — skip the write/commit instead of publishing noise.
+    # Chain note: _previous_receipt_anchors already tolerates a missing
+    # day (anchors go None, same as the first-ever receipt).
+    totals = receipt.get("totals", {})
+    prev_mrr = None
+    try:
+        prev_entries = json.loads(
+            (RECEIPTS_DIR / "manifest.json").read_text()).get("entries", [])
+        if prev_entries:
+            prev_mrr = prev_entries[0].get("mrr_usd_per_mo")
+    except (OSError, ValueError):
+        prev_mrr = None
+    if (not totals.get("llm_event_count") and not totals.get("workflows_completed")
+            and not totals.get("stripe_gross_usd")
+            and prev_mrr is not None and totals.get("mrr_usd_per_mo") == prev_mrr):
+        print(json.dumps({
+            "status": "SKIPPED_TRIVIAL",
+            "date": target.isoformat(),
+            "reason": "0 llm events, 0 workflows, $0 stripe, MRR unchanged",
+        }))
         return 0
 
     try:

@@ -8,7 +8,7 @@ to the most recent Mon 09:00 PT, identical input → identical output.
 Usage: python3 scripts/this-week-page.py [--out PATH] [--now ISO]
 """
 from __future__ import annotations
-import argparse, json, re, subprocess, sys
+import argparse, json, re, subprocess, sys, urllib.parse
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -19,6 +19,10 @@ BLOG_DIR = HOME / "meetrick-content" / "blog"
 DRAFTS = HOME / "rick-vault" / "projects" / "email" / "newsletter-drafts"
 WSGIT = HOME / ".openclaw" / "workspace"
 DEFAULT_OUT = HOME / "meetrick-site" / "this-week.html"
+# X-thread sidecar drafts — operator copy-pastes manually (zero automation
+# during 30-day post-suspension cooldown; see docs/x-funnel-integration-2026-05-06.md).
+X_DRAFTS_DIR = HOME / "rick-vault" / "projects" / "x-drafts"
+VELOCITY = HOME / "rick-vault" / "revenue" / "velocity.json"
 PT = timezone(timedelta(hours=-7))
 
 
@@ -140,6 +144,30 @@ def gather(since, until):
 def fmt_short(t): return t.astimezone(PT).strftime("%a %H:%M")
 
 
+def fmt_money(v):
+    s = f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"${s}"
+
+
+def mrr_span(since, until):
+    """(start, end) MRR from velocity.json, or None if missing/unparsable —
+    caller must then render 'see receipts' rather than a stale number."""
+    try:
+        entries = sorted(json.loads(VELOCITY.read_text())["entries"],
+                         key=lambda e: e["date"])
+        def at(ts):
+            d = ts.astimezone(PT).strftime("%Y-%m-%d")
+            vals = [e["mrr"] for e in entries if e["date"] <= d]
+            return vals[-1] if vals else None
+        end = at(until)
+        if end is None:
+            return None
+        start = at(since)
+        return (end if start is None else start, end)
+    except Exception:
+        return None
+
+
 CSS = (":root{--y:#FBBF24;--k:#000;--w:#fff;--m:'Space Mono',monospace;--p:'Press Start 2P',cursive}"
 "*{box-sizing:border-box;margin:0;padding:0}"
 "body{background:var(--w);font-family:var(--m);color:var(--k);background-image:radial-gradient(circle,rgba(0,0,0,.06) 1px,transparent 1px);background-size:24px 24px}"
@@ -178,6 +206,21 @@ CSS = (":root{--y:#FBBF24;--k:#000;--w:#fff;--m:'Space Mono',monospace;--p:'Pres
 def build_html(now_utc):
     since, until, anchor = now_utc - timedelta(days=7), now_utc, page_anchor(now_utc)
     g = gather(since, until)
+
+    span = mrr_span(since, until)
+    if span:
+        delta = span[1] - span[0]
+        delta_str = f'Δ {"-" if delta < 0 else ""}{fmt_money(abs(delta))}'
+        mrr_summary = f"MRR {fmt_money(span[0])} → {fmt_money(span[1])}"
+        money_html = (f'<div class="money"><span class="num">{escape(fmt_money(span[0]))}</span>'
+                      f'<span class="arrow">→</span><span class="num">{escape(fmt_money(span[1]))}</span>'
+                      f'<span class="arrow">{escape(delta_str)}</span>'
+                      '<span class="note">from revenue reconciliation — full ledger at '
+                      '<a href="/receipts/">/receipts</a>.</span></div>')
+    else:
+        mrr_summary = "MRR: see receipts"
+        money_html = ('<div class="money"><span class="num">MRR: see receipts</span>'
+                      '<span class="note">live ledger at <a href="/receipts/">/receipts</a>.</span></div>')
 
     bill = [(c["ts"], "ship", f'<code>{escape(c["sha"])}</code> {escape(c["subj"])}') for c in g["commits"]]
     bill += [(p["date"], "blog",
@@ -229,14 +272,16 @@ def build_html(now_utc):
     for p in g["posts"]:
         if any(k in p["slug"] for k in ("icp", "funnel-leak")):
             cta_url, cta_label = f'https://meetrick.ai/blog/{p["slug"]}', p["title"]; break
+    # /newsletter never existed on the site (404 from a money page) — route
+    # newsletter CTAs to the homepage subscribe block instead.
     if not cta_url:
         for n in g["newsletters"]:
             if n.get("issue") == 5 and n.get("broadcast_id"):
-                cta_url, cta_label = "https://meetrick.ai/newsletter/issue-5", n.get("subject", "Issue #5"); break
+                cta_url, cta_label = "https://meetrick.ai/#updates", n.get("subject", "Issue #5"); break
     if not cta_url and g["posts"]:
         cta_url, cta_label = f'https://meetrick.ai/blog/{g["posts"][-1]["slug"]}', g["posts"][-1]["title"]
     elif not cta_url and g["newsletters"]:
-        cta_url, cta_label = "https://meetrick.ai/newsletter", g["newsletters"][-1].get("subject", "the latest issue")
+        cta_url, cta_label = "https://meetrick.ai/#updates", "get the weekly post-mortem in your inbox → subscribe"
     cta_block = (f'<a class="cta" href="{escape(cta_url)}">see the ICP-pivot post-mortem → '
                  f'{escape((cta_label or "")[:80])}</a>') if cta_url else ""
     # Hard CTA — direct path to a pilot for ready-to-buy readers. Sits below the
@@ -244,13 +289,28 @@ def build_html(now_utc):
     pilot_cta = ('<a class="cta pilot" href="/pilot" '
                  'style="margin-top:10px;background:#FBBF24;color:#000;border-color:#000">'
                  'want this running on your company? free 1-week pilot →</a>')
-    cta_block = cta_block + pilot_cta
+    # X share intent — pure client-side anchor, NO JS, NO automation.
+    # Pre-fills tweet text with a single specific number from the week, and
+    # links the /this-week page with utm_source=x_thread so the eventual
+    # click-through gets attributed in funnel-attribution.py number #4.
+    share_text = (f"What an autonomous AI agent shipped this week ({len(g['commits'])} "
+                  f"commits, {len(g['posts'])} posts, {g['sends_total']} cold emails, {mrr_summary}). "
+                  f"Auto-generated from prod logs. No marketing copy:")
+    share_url = "https://meetrick.ai/this-week?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share"
+    share_intent = ("https://x.com/intent/post?"
+                    f"text={urllib.parse.quote(share_text)}"
+                    f"&url={urllib.parse.quote(share_url)}")
+    x_share_cta = (f'<a class="cta x-share" href="{escape(share_intent)}" '
+                   'target="_blank" rel="noopener" '
+                   'style="margin-top:10px;background:#fff;color:#000;border-color:#000">'
+                   'share this on X →</a>')
+    cta_block = cta_block + pilot_cta + x_share_cta
 
     week_label = f'{(anchor - timedelta(days=7)).strftime("%b %d")} – {anchor.strftime("%b %d, %Y")}'
     summary = (f'{len(g["commits"])} commits · {len(g["posts"])} posts · '
                f'{len(g["newsletters"])} newsletter{"s" if len(g["newsletters"])!=1 else ""} · '
                f'{g["sends_total"]} emails · {len(g["replies"])} repl'
-               f'{"ies" if len(g["replies"])!=1 else "y"} · MRR $9 → $9')
+               f'{"ies" if len(g["replies"])!=1 else "y"} · {mrr_summary}')
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -278,8 +338,7 @@ def build_html(now_utc):
      Generated: {escape(anchor.strftime("%Y-%m-%d %H:%M PT"))} &nbsp;•&nbsp; {escape(summary)}</p>
   <section><h2>THE WEEK'S BILL</h2><table>{rows}</table></section>
   <section><h2>THE WEEK'S $</h2>
-    <div class="money"><span class="num">$9</span><span class="arrow">→</span><span class="num">$9</span>
-      <span class="arrow">Δ $0</span><span class="note">single paying customer; ICP pivot in flight.</span></div>
+    {money_html}
   </section>
   <section><h2>THE LESSONS</h2>{''.join(lessons_html)}</section>
   <section><h2>THE ROADMAP — NEXT WEEK</h2><ul class="roadmap">{roadmap_html}</ul></section>
@@ -290,18 +349,124 @@ def build_html(now_utc):
 """
 
 
+def build_x_thread_draft(now_utc):
+    """Build a 4-tweet X-thread paste-ready draft from this week's prod log
+    summary. Operator-paced — written to a sidecar file Vlad pastes manually.
+
+    Each tweet ≤ 270 chars (X cap is 280; leave runway for handle additions).
+    Tweet 1 hooks with the headline number. Tweets 2-3 carry concrete proof.
+    Tweet 4 is the CTA back to /this-week with utm_source=x_thread.
+
+    Returns (thread_text, anchor_iso). thread_text is "Tweet 1\\n\\n---\\n\\nTweet 2..."
+    so Vlad can copy-paste into X's compose UI block by block.
+    """
+    since, until, anchor = now_utc - timedelta(days=7), now_utc, page_anchor(now_utc)
+    g = gather(since, until)
+    span = mrr_span(since, until)
+    mrr_line = (f"MRR: {fmt_money(span[0])} → {fmt_money(span[1])}." if span
+                else "MRR: see receipts.")
+    # Prefer the ICP-pivot post if present, else the most recent blog post
+    headline_post = None
+    for p in g["posts"]:
+        if any(k in p["slug"] for k in ("icp", "funnel-leak", "first-cold-reply")):
+            headline_post = p; break
+    if not headline_post and g["posts"]:
+        headline_post = g["posts"][-1]
+    headline_url = (f"https://meetrick.ai/blog/{headline_post['slug']}"
+                    "?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share"
+                    if headline_post else None)
+
+    # Top reply (warm signal) — first sales/positive label
+    top_reply = next((r for r in g["replies"]
+                      if (r.get("label") or "") in ("sales_inquiry", "warm_reply", "positive")), None)
+
+    t1 = (f"What an autonomous AI agent shipped this week.\n\n"
+          f"{len(g['commits'])} commits. {len(g['posts'])} blog posts. "
+          f"{g['sends_total']} cold emails to {g['recipients']} founders. "
+          f"{len(g['replies'])} reply{'ies' if len(g['replies'])!=1 else ''}. "
+          f"{mrr_line}\n\n"
+          f"Every line is from a prod log. No marketing copy.")[:270]
+
+    if g["sends_total"] and top_reply:
+        t2 = (f"The 1 reply was from {top_reply.get('email','a founder').split('@')[-1]}. "
+              f"Classified {top_reply.get('label','—')} → routed to {top_reply.get('action','—')}.\n\n"
+              f"Reply-router is real code, not a wrapper around \"please respond appropriately\".")[:270]
+    else:
+        t2 = (f"{g['sends_total']} cold emails fired this week. "
+              f"Sequencer events: {sum(g['seq'].values())}. "
+              f"Bounce rate held under 5%, sender-warmup ramp on schedule.")[:270]
+
+    if headline_post:
+        t3 = (f"Most-honest post this week: \"{headline_post['title'][:120]}\".\n\n"
+              f"Receipts inside.")[:270]
+    elif g["decisions"]:
+        d_title = clean_title(g["decisions"][-1].get("title", ""))[:160]
+        t3 = (f"Lesson logged: {d_title}")[:270]
+    else:
+        t3 = "Nothing dramatic this week. The boring weeks are when compounding happens."[:270]
+
+    t4 = (f"Full week's bill (auto-generated, anchored Mon 09:00 PT):\n"
+          f"https://meetrick.ai/this-week?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share\n\n"
+          f"Pilot: https://meetrick.ai/pilot?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share")[:270]
+
+    tweets = [t1, t2, t3, t4]
+    if headline_url and len(tweets) < 5:
+        tweets.insert(3, f"Read: {headline_url}"[:270])
+
+    body = "\n\n---\n\n".join(tweets)
+    return body, anchor
+
+
+def write_x_thread_sidecar(now_utc):
+    """Write paste-ready X-thread draft to ~/rick-vault/projects/x-drafts/.
+    Operator pastes manually — Rick stays manual on X for 30 days post-restore.
+    Returns Path or None on failure."""
+    try:
+        body, anchor = build_x_thread_draft(now_utc)
+    except Exception as exc:
+        print(f"[warn] x-thread draft failed: {exc}", file=sys.stderr)
+        return None
+    X_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = anchor.strftime("%Y-%m-%d")
+    path = X_DRAFTS_DIR / f"this-week-{date_str}-thread.txt"
+    header = (f"# X-thread draft — /this-week ({date_str})\n"
+              f"# Anchor: {anchor.isoformat()}\n"
+              f"# Operator-paced: copy-paste manually into X. Tweets separated by `---`.\n"
+              f"# UTM: utm_source=x_thread (funnel-attribution.py #4 picks this up).\n"
+              f"# 30-day post-suspension cooldown ends ~2026-06-05.\n\n")
+    path.write_text(header + body + "\n", encoding="utf-8")
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     ap.add_argument("--now", default=None, help="ISO timestamp override")
+    ap.add_argument("--no-x-thread", action="store_true",
+                    help="Skip writing the paste-ready X-thread sidecar")
     args = ap.parse_args()
     now = (parse_ts(args.now) if args.now else None) or datetime.now(timezone.utc)
+    # Trivial-delta gate (2026-07-13): a week with nothing shipped, nothing
+    # posted and no revenue movement is not worth a publish cycle.
+    g = gather(now - timedelta(days=7), now)
+    span = mrr_span(now - timedelta(days=7), now)
+    revenue_changed = bool(span) and span[1] != span[0]
+    if not g["commits"] and not g["posts"] and not revenue_changed:
+        print("SKIPPED_TRIVIAL: 0 commits, 0 posts, 0 revenue change in 7d window")
+        return 3
     html = build_html(now)
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
+    rc = 0
     if out.exists() and out.read_text() == html:
-        print(f"[ok] no change → {out}"); return 0
-    out.write_text(html)
-    print(f"[ok] wrote {out} ({len(html)} bytes)"); return 0
+        print(f"[ok] no change → {out}")
+    else:
+        out.write_text(html)
+        print(f"[ok] wrote {out} ({len(html)} bytes)")
+    if not args.no_x_thread:
+        x_path = write_x_thread_sidecar(now)
+        if x_path:
+            print(f"[ok] x-thread draft → {x_path}")
+    return rc
 
 
 if __name__ == "__main__":

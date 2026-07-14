@@ -67,10 +67,14 @@ def upsert_pattern(
         "SELECT id FROM effective_patterns WHERE id = ?", (f"ep_{h}",)
     ).fetchone()
     if row:
-        # Already exists — just refresh evidence so miner can mark freshness.
+        # Already exists — refresh evidence only. 2026-07-12 fix: do NOT
+        # stamp last_used_at here. Re-mining is not a use; only
+        # runtime.patterns.record_pattern_outcome may touch last_used_at
+        # (it drives pick_patterns' LRU rotation tiebreaker, and daily
+        # re-stamps masked the fact that no pattern was ever credited).
         conn.execute(
-            "UPDATE effective_patterns SET evidence_json=?, last_used_at=? WHERE id=?",
-            (json.dumps(evidence), now_iso(), row["id"]),
+            "UPDATE effective_patterns SET evidence_json=? WHERE id=?",
+            (json.dumps(evidence), row["id"]),
         )
         return None
     pid = f"ep_{h}"

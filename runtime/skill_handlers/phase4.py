@@ -144,6 +144,11 @@ def handle_call_schedule(connection: sqlite3.Connection, workflow: sqlite3.Row, 
 
 def handle_call_execute(connection: sqlite3.Connection, workflow: sqlite3.Row, job: sqlite3.Row) -> StepOutcome:
     """Execute the voice call via ElevenLabs Conversational AI."""
+    # Voice master gate (2026-07-13): the TCPA layer (DNC sync, disclosure,
+    # consent logging) is incomplete — no handler may dial unless the owner
+    # explicitly flips RICK_VOICE_LIVE=1.
+    if os.getenv("RICK_VOICE_LIVE", "0").strip() != "1":
+        raise DependencyBlocked("voice-call", "RICK_VOICE_LIVE!=1 — voice channel disabled")
     elevenlabs_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not elevenlabs_key:
         raise DependencyBlocked("voice-call", "ELEVENLABS_API_KEY not configured. Set it in rick.env to enable voice calls.")

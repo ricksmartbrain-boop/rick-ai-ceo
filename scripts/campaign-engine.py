@@ -24,6 +24,7 @@ from collections import defaultdict
 
 PIPELINE_LOG = Path.home() / "rick-vault/logs/pipeline.jsonl"
 OPS_EMAIL_LOG = Path.home() / "rick-vault/operations/email-sends.jsonl"  # heartbeat probe surface
+SUPPRESSION_FILE = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault"))) / "mailbox" / "suppression.txt"
 ENV_FILE = Path.home() / "clawd/config/rick.env"
 FROM = "Rick <rick@meetrick.ai>"
 DELAY = 1.2  # seconds between sends
@@ -32,14 +33,43 @@ CAMPAIGN_DAILY_QUOTA = 60  # cross-run daily budget (leaves 40/day for newslette
 
 # Step definitions: (stage_name, min_days_since_contacted, max_days)
 STEPS = [
-    ("step1_sent", 2,  4),   # Day 2-4
-    ("step2_sent", 5,  8),   # Day 5-8
-    ("step3_sent", 9,  13),  # Day 9-13
-    ("step4_sent", 14, 21),  # Day 14-21 (final)
+    ("followup_day2_sent", 2,  4),   # Day 2-4
+    ("followup_day5_sent", 5,  8),   # Day 5-8
+    ("followup_day9_sent", 9,  13),  # Day 9-13
+    ("followup_day14_sent", 14, 21), # Day 14-21 (final)
 ]
+
+LEGACY_STAGE_ALIASES = {
+    "step1_sent": "followup_day2_sent",
+    "step2_sent": "followup_day5_sent",
+    "step3_sent": "followup_day9_sent",
+    "step4_sent": "followup_day14_sent",
+}
 
 SKIP_STAGES = {"unsubscribed", "optout", "bounced", "FRAUD_ALERT", "replied", "engaged",
                "accepted_proposal", "proposal_sent"}
+
+BLOCKED_DOMAINS = {
+    "ampf.com",  # Ameriprise corporate advisors; low/no authority to buy Rick retainers.
+}
+
+
+def is_suppressed(email: str) -> bool:
+    """Return True when the local bounce/unsubscribe list blocks this recipient."""
+    if not SUPPRESSION_FILE.exists():
+        return False
+    target = (email or "").strip().lower()
+    if not target:
+        return False
+    try:
+        lines = SUPPRESSION_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return True
+    for raw in lines:
+        suppressed = raw.split("#", 1)[0].strip().lower()
+        if suppressed and suppressed == target:
+            return True
+    return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ICP KILL-SWITCH (added 2026-04-24)
@@ -102,6 +132,25 @@ def log_smb_block(lead, step_stage):
     with open(log_dir / "smb-kill-switch.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
+def is_blocked_corporate_domain(lead):
+    email = (lead.get("email") or "").strip().lower()
+    domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+    return domain in BLOCKED_DOMAINS
+
+def log_domain_block(lead, step_stage):
+    log_dir = Path.home() / "rick-vault/logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": f"{step_stage}_BLOCKED_CORPORATE_DOMAIN",
+        "email": lead.get("email", ""),
+        "category": lead.get("category", ""),
+        "business_name": lead.get("biz", ""),
+        "reason": "corporate advisor domain unlikely to buy Rick retainer",
+    }
+    with open(log_dir / "campaign-domain-blocks.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 # Permanently blocked emails (invalid, self, or known internal)
 BLOCKED_EMAILS = {
     "user@domain.com", "FULL-WHITE@3x.png", "rick@meetrick.ai",
@@ -160,7 +209,7 @@ def load_pipeline():
         # Normalize to lowercase for dedup but preserve original for display
         email_key = email.lower()
         ts = str(d.get("ts") or d.get("timestamp") or "")[:10]
-        stage = d.get("stage", "")
+        stage = LEGACY_STAGE_ALIASES.get(d.get("stage", ""), d.get("stage", ""))
         if email_key in {e.lower() for e in BLOCKED_EMAILS}:
             continue
         if email_key not in leads:
@@ -243,10 +292,10 @@ def build_step1(lead):
     biz = lead["biz"].replace("https://","").replace("http://","").strip("/") or "your business"
     cat = (lead.get("category") or "").lower().strip()
     pain = CATEGORY_STEP1_PAIN.get(cat, DEFAULT_STEP1_PAIN)
-    subject = f"proof before the pitch — 28 days, $9 MRR"
+    subject = f"proof before the pitch — public build, real numbers"
     body = f"""Hi,
 
-I'm an AI CEO running a real {cat or 'local'} business analysis — 28 days in, $9 MRR, $89/week in LLM costs, building this in public so the numbers are verifiable. Here's what I see on sites like {biz}: {pain}
+I'm an AI CEO running a real business in public — still early, and painfully honest about the numbers. Here's what I see on sites like {biz}: {pain}
 
 I ran a free roast on your site — it takes 60 seconds to see exactly what I'd fix and why: meetrick.ai/roast
 
@@ -307,7 +356,7 @@ def build_step4(lead):
 
 Last note, I mean it.
 
-Running as an AI CEO means I track everything. Here's what I know: sites that get a free roast and implement even one change average a 22% lift in qualified leads within 30 days.
+Running as an AI CEO means I track everything, including the uncomfortable part: most sites do not have a traffic problem first. They have a trust, offer, and follow-up problem.
 
 The audit is still there whenever you want it: meetrick.ai/roast
 
@@ -318,13 +367,13 @@ AI CEO, meetrick.ai"""
     return subject, body
 
 STEP_BUILDERS = {
-    "step1_sent": build_step1,
-    "step2_sent": build_step2,
-    "step3_sent": build_step3,
-    "step4_sent": build_step4,
+    "followup_day2_sent": build_step1,
+    "followup_day5_sent": build_step2,
+    "followup_day9_sent": build_step3,
+    "followup_day14_sent": build_step4,
 }
 
-def send_email(to, subject, body):
+def send_email(to, subject, body, cold=True):
     """Send via Resend, gated through kill_switches.assert_channel_active.
 
     The gate is the same one used by outbound_dispatcher. Closes the Potemkin
@@ -332,6 +381,10 @@ def send_email(to, subject, body):
     channel being paused. Every send now checks (a) RICK_OUTBOUND_ENABLED,
     (b) channel_state row for 'email' (paused / disabled / quiet hours / cap),
     (c) MX-validation for the recipient. Any failure → no send + safe log.
+
+    cold=True (first touch) enforces the 7-day frequency cap; campaign
+    follow-up steps pass cold=False so day-2+ sends to enrolled leads
+    aren't blocked by their own step-1 send.
     """
     # 1. Channel-active gate (Potemkin defense)
     try:
@@ -340,7 +393,7 @@ def send_email(to, subject, body):
         wsroot = str(Path(__file__).resolve().parents[1])
         if wsroot not in sys.path:
             sys.path.insert(0, wsroot)
-        from runtime.kill_switches import assert_channel_active, ChannelPaused, record_send
+        from runtime.kill_switches import assert_channel_active, ChannelPaused, record_send, is_send_allowed
         from runtime.db import connect
         try:
             conn = connect()
@@ -350,11 +403,22 @@ def send_email(to, subject, body):
                 conn.close()
         except ChannelPaused as e:
             return False, f"channel_paused: {e.reason}"
+        # 1b. Unified per-recipient gate (2026-07-13): master kill +
+        # RICK_EMAIL_SEND_LIVE + merged suppression/DNC (domain-aware) +
+        # 7-day cold frequency cap.
+        allowed, gate_reason = is_send_allowed(to, cold=cold)
+        if not allowed:
+            print(f"SEND_BLOCKED reason={gate_reason} to={to}")
+            return False, f"SEND_BLOCKED {gate_reason}"
     except Exception as gate_exc:
         # If the gate import itself fails, refuse to send rather than bypass.
         return False, f"gate_unavailable: {type(gate_exc).__name__}: {gate_exc}"
 
-    # 2. MX validation at send-time (no caching — list rot is real)
+    # 2. Local suppression at send-time. Bounces/unsubs are hard stops.
+    if is_suppressed(to):
+        return False, f"suppressed: {to}"
+
+    # 3. MX validation at send-time (no caching — list rot is real)
     try:
         from runtime.email_validator import has_mx_record, is_role_account
         if not has_mx_record(to):
@@ -366,7 +430,7 @@ def send_email(to, subject, body):
         # If the validator import fails, hard-block — never silent-bypass.
         return False, f"validator_unavailable: {type(v_exc).__name__}: {v_exc}"
 
-    # 3. Send
+    # 4. Send
     key = os.environ.get("RESEND_API_KEY", "")
     if not key:
         return False, "no key"
@@ -393,6 +457,30 @@ def send_email(to, subject, body):
         return False, str(data)
     except Exception:
         return False, result.stdout[:100]
+
+def _log_touch(to, subject, template_id):
+    """Record the touch in outbound_jobs (WS-F learning loop, 2026-07-13).
+
+    Deterministic bookkeeping only — reply-watcher later flips the row to
+    outcome='replied' so the weekly digest can rank steps by reply rate.
+    Shielded: a ledger failure must never block the campaign run.
+    """
+    try:
+        import sys as _sys
+        wsroot = str(Path(__file__).resolve().parents[1])
+        if wsroot not in _sys.path:
+            _sys.path.insert(0, wsroot)
+        from runtime.db import connect as _connect
+        from runtime.touch_log import log_touch as _lt
+        conn = _connect()
+        try:
+            _lt(conn, to=to, channel="email", template_id=template_id,
+                subject=subject, source="campaign-engine", status="sent")
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"  (touch-log skipped: {type(exc).__name__})")
+
 
 def _log_email_send(to, message_id):
     """Append a minimal send record to the ops log so flag_health can probe it."""
@@ -581,6 +669,7 @@ def run_new_leads(run_quota=40):
             with open(PIPELINE_LOG, "a") as f:
                 f.write(json.dumps(entry) + "\n")
             _log_email_send(email, detail)  # ops probe surface
+            _log_touch(email, subject, "campaign-step1")  # learning-loop ledger
             print("✅")
             sent_count += 1
             daily_sent += 1
@@ -650,12 +739,17 @@ def run_campaigns():
                 log_smb_block(lead, step_stage)
                 print(f"  🚫 {lead['email']} [{lead['category']}] — BLOCKED (local SMB ICP killed)")
                 continue
+            if is_blocked_corporate_domain(lead):
+                log_domain_block(lead, step_stage)
+                print(f"  🚫 {lead['email']} [{lead['category']}] — BLOCKED (corporate domain)")
+                continue
             subject, body = builder(lead)
             print(f"  → {lead['email']} [{lead['category']}] [{days_since(lead['first_ts'])}d]", end=" ")
-            ok, detail = send_email(lead["email"], subject, body)
+            ok, detail = send_email(lead["email"], subject, body, cold=False)
             if ok:
                 log_entry(lead, step_stage, {"resend_id": detail})
                 _log_email_send(lead["email"], detail)  # ops probe surface
+                _log_touch(lead["email"], subject, f"campaign-{step_stage}")  # learning-loop ledger
                 print("✅")
                 sent += 1
                 total_sent += 1
@@ -697,7 +791,8 @@ def show_stats():
                 buckets["sequence_complete"] += 1
             else:
                 step_stage, min_days, max_days = result
-                age = days_since(lead["first_ts"])
+                timing_ts = lead.get("contacted_ts") or lead["first_ts"]
+                age = days_since(timing_ts)
                 if age < min_days:
                     buckets[f"waiting_{step_stage}"] += 1
                 elif age <= max_days:
@@ -739,6 +834,7 @@ def preview_step(n):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--followups-only", action="store_true")
     parser.add_argument("--stats", action="store_true")
     parser.add_argument("--preview", type=int)
     args = parser.parse_args()
@@ -747,6 +843,8 @@ if __name__ == "__main__":
         show_stats()
     elif args.preview:
         preview_step(args.preview)
+    elif args.followups_only:
+        run_campaigns()
     elif args.run:
         run_new_leads(run_quota=40)
         run_campaigns()

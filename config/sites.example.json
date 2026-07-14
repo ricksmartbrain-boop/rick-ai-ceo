@@ -1,0 +1,25 @@
+{
+  "checks": [
+    {
+      "name": "Partner Connector Production",
+      "kind": "http",
+      "target": "https://api.partners.belkins.io/health",
+      "contains": "ok"
+    },
+    {
+      "name": "Partner Connector Staging",
+      "kind": "http",
+      "target": "https://staging-api.partners.belkins.io/health"
+    },
+    {
+      "name": "Rick Vault",
+      "kind": "path",
+      "target": "$RICK_DATA_ROOT"
+    },
+    {
+      "name": "404 Telegram Bot",
+      "kind": "process",
+      "target": "telegram-sync"
+    }
+  ]
+}

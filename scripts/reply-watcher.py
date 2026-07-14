@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
-"""Reply-watcher — 10-minute active monitor for ICP cold-email sequences.
+"""Reply-watcher — 10-minute fast-lane for real inbound human replies.
 
-Watches all sequence-active ICP workflows for:
-  (a) Inbound replies  → immediate escalation + auto-draft (opus-4-7)
-  (b) Resend opens     → warm-signal tracking (no escalation unless reply)
+RE-KEYED 2026-07-13 (inbound-capture repair): the old version watched
+workflows WHERE kind='qualified_lead' AND stage='sequence-active' — a set
+nothing has created since the May pruning. Result: 5,639 consecutive no-op
+runs since 2026-05-22 while real replies (Adam/Neurvance price ask,
+SyncBank consult) went unwatched. It now keys on the REAL inbound sources:
+the imap-watcher triage JSONL (classified by reply-classifier) and the
+email_threads table.
 
-On first reply detection:
-  1. Generates a draft response via claude-opus-4-7 / gpt-5.4 (NO auto-send)
-  2. Saves draft  → ~/rick-vault/mailbox/drafts/auto/{wf_id}.json
+Also removed here: the direct Gmail IMAP check (destructive RFC822 fetch
+set \\Seen and raced imap-watcher — single-consumer inbox rule: ONLY
+runtime.inbound.imap_watcher touches IMAP; everything downstream reads
+triage) and the Resend open-tracker (it keyed on the same dead workflow set).
+
+On first detection of a new classified human reply:
+  1. Generates a draft response via claude-opus-4-8 (NO auto-send)
+  2. Saves draft  → ~/rick-vault/mailbox/drafts/auto/{triage_id}.json
   3. Fires notify_operator_deduped with PURPOSE=revenue (bypasses dedup)
-  4. Marks workflow stage='replied' so sequencer stops Day-3+ touches
+  4. Marks the email_threads row status='replied' + intent_class,
+     and inserts a follow_up_queue row (routing into follow-up)
   5. Writes reply-watcher.jsonl event row
-  6. Updates digest: "Reply watch {elapsed}h: {N} replies, {M} opens"
-
-Gmail IMAP is checked when GMAIL_IMAP_USER + GMAIL_APP_PASSWORD are set.
-Resend email opens are cross-checked via API for each tracked email ID.
+  6. Updates digest: "Reply watch: {N} replies (watching {M} rows)"
 
 State file: ~/rick-vault/control/reply-watcher-state.json
   {
-    "handled": { "<wf_id>": "<iso_ts>" },      # already escalated
-    "open_signals": { "<email>": "<iso_ts>" },  # first open detected
+    "handled": { "<triage_row_id>": "<iso_ts>" },   # already escalated
+    "open_signals": {},                              # legacy, unused
     "last_run": "<iso_ts>"
   }
 
@@ -32,12 +39,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import imaplib
-import email as email_module
 import json
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -57,9 +61,16 @@ DRAFT_DIR   = DATA_ROOT / "mailbox" / "drafts" / "auto"
 TRIAGE_DIR  = DATA_ROOT / "mailbox" / "triage"
 
 # Models — smart-models invariant: only full models for draft generation
-DRAFT_MODEL_ANTHROPIC = "claude-opus-4-7"
+DRAFT_MODEL_ANTHROPIC = "claude-opus-4-8"
 DRAFT_MODEL_OPENAI    = "gpt-4o"     # fallback if Anthropic unavailable
-REPLY_WATCH_HOURS     = 7 * 24      # scan window for reply-router.jsonl
+
+# Classifier labels that mean "a human wrote to us and it's warm enough to
+# fast-lane". unsubscribe / not_interested / objection / automated_notification
+# are handled by the router alone (suppression, closed-lost, noise-archive).
+WATCH_LABELS = {
+    "sales_inquiry", "pricing_question", "scheduling_request", "question",
+    "objection_with_counter", "referral_request", "support_request",
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,19 +78,6 @@ REPLY_WATCH_HOURS     = 7 * 24      # scan window for reply-router.jsonl
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _elapsed_hours(since_iso: str) -> float:
-    """Hours since an ISO timestamp (UTC)."""
-    try:
-        if since_iso.endswith("Z"):
-            since_iso = since_iso[:-1] + "+00:00"
-        dt = datetime.fromisoformat(since_iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-    except Exception:
-        return 0.0
 
 
 def _log_event(row: dict) -> None:
@@ -103,103 +101,22 @@ def _save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Load sequence-active ICP workflows
+# 1. Load classified human replies from the triage pipe (the real source)
 # ---------------------------------------------------------------------------
 
-def _load_icp_workflows(conn) -> list[dict]:
-    """Return all sequence-active ICP workflows with email + send context.
-    
-    Handles both flat context_json (email at top level) and nested
-    trigger_payload.email structures used by the founder-discovery pipeline.
+def _load_watch_rows(handled: dict[str, str], verbose: bool = False) -> list[dict]:
+    """Return unhandled classified triage rows with a WATCH_LABELS label.
+
+    Reads today's + yesterday's inbound-*.jsonl (imap-watcher output, labels
+    added in-place by reply-classifier). Rows without a classification yet are
+    left for a later run — the classifier fills them within its own 10-min loop.
     """
-    rows = conn.execute(
-        """
-        SELECT w.id, w.title, w.stage, w.context_json, w.created_at,
-               oj.id AS ob_id,
-               json_extract(oj.result_json,'$.resend_id') AS resend_id,
-               json_extract(oj.payload_json,'$.subject') AS sent_subject,
-               json_extract(oj.payload_json,'$.body_md')  AS sent_body
-        FROM   workflows w
-        LEFT   JOIN outbound_jobs oj ON oj.lead_id = w.id
-                                    AND oj.channel = 'email'
-        WHERE  w.stage = 'sequence-active'
-          AND  w.kind  = 'qualified_lead'
-        ORDER  BY w.created_at ASC
-        """,
-    ).fetchall()
-
-    seen: dict[str, dict] = {}
-    for r in rows:
-        wf_id = r["id"]
-        ctx = json.loads(r["context_json"]) if r["context_json"] else {}
-        # Email may be at top-level or nested under trigger_payload
-        tp    = ctx.get("trigger_payload") or {}
-        email = (
-            ctx.get("email") or
-            tp.get("email") or
-            ""
-        ).lower().strip()
-        if not email:
-            continue
-        if wf_id not in seen:
-            seen[wf_id] = {
-                "wf_id":        wf_id,
-                "title":        r["title"],
-                "stage":        r["stage"],
-                "email":        email,
-                "name":         ctx.get("name") or tp.get("name") or "",
-                "company":      ctx.get("company") or tp.get("company") or tp.get("domain") or "",
-                "opener_body":  ctx.get("opener_body") or r["sent_body"] or "",
-                "opener_subj":  ctx.get("opener_subject") or r["sent_subject"] or "",
-                "icp_score":    ctx.get("icp_score") or tp.get("icp_score") or 0,
-                "created_at":   r["created_at"] or "",
-                "resend_id":    r["resend_id"] or "",
-                "ob_id":        r["ob_id"] or "",
-            }
-        elif r["resend_id"] and not seen[wf_id]["resend_id"]:
-            seen[wf_id]["resend_id"] = r["resend_id"]
-
-    return list(seen.values())
-
-
-# ---------------------------------------------------------------------------
-# 2. Reply detection
-# ---------------------------------------------------------------------------
-
-def _load_reply_router(cutoff_iso: str) -> dict[str, dict]:
-    """Return {email: row} from reply-router.jsonl since cutoff."""
-    replies: dict[str, dict] = {}
-    path = DATA_ROOT / "operations" / "reply-router.jsonl"
-    if not path.exists():
-        return replies
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-            ts  = r.get("ran_at", "")
-            em  = r.get("email", "").lower().strip()
-            if ts >= cutoff_iso and em and em not in replies:
-                replies[em] = {
-                    "ts":      ts,
-                    "label":   r.get("label", ""),
-                    "body":    r.get("body", r.get("subject", "")),
-                    "source":  "reply-router",
-                    "raw":     r,
-                }
-        except Exception:
-            pass
-    return replies
-
-
-def _load_triage_files(cutoff_iso: str) -> dict[str, dict]:
-    """Return {email: row} from mailbox/triage/inbound-*.jsonl files."""
-    replies: dict[str, dict] = {}
+    rows: list[dict] = []
     if not TRIAGE_DIR.exists():
-        return replies
+        return rows
     today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    seen_ids: set[str] = set()
     for day in (today, yesterday):
         tpath = TRIAGE_DIR / f"inbound-{day}.jsonl"
         if not tpath.exists():
@@ -209,168 +126,54 @@ def _load_triage_files(cutoff_iso: str) -> dict[str, dict]:
             if not line:
                 continue
             try:
-                r   = json.loads(line)
-                ts  = r.get("classified_at") or r.get("ingested_at", "")
-                em  = r.get("from", "").lower().strip()
-                if ts >= cutoff_iso and em and em not in replies:
-                    replies[em] = {
-                        "ts":     ts,
-                        "label":  r.get("classification", ""),
-                        "body":   r.get("body", r.get("subject", "")),
-                        "source": f"inbound-{day}",
-                        "raw":    r,
-                    }
+                r = json.loads(line)
             except Exception:
-                pass
-    return replies
-
-
-def _check_gmail_imap(target_emails: set[str], cutoff_iso: str, verbose: bool = False) -> dict[str, dict]:
-    """Check Gmail IMAP for unread replies from target emails.
-    
-    Returns {email: reply_dict} if found. Skips gracefully when creds absent.
-    """
-    replies: dict[str, dict] = {}
-    imap_user = os.getenv("GMAIL_IMAP_USER", "").strip()
-    app_pass  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-    if not imap_user or not app_pass:
-        if verbose:
-            print("  [imap] GMAIL_IMAP_USER / GMAIL_APP_PASSWORD not set — skipping IMAP check")
-        return replies
-
-    try:
-        conn = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        conn.login(imap_user, app_pass)
-        conn.select("INBOX")
-
-        # Search unread since cutoff date
-        since_date = datetime.fromisoformat(cutoff_iso.replace("Z", "+00:00")).strftime("%d-%b-%Y")
-        _, msg_ids = conn.search(None, f'(UNSEEN SINCE "{since_date}")')
-        id_list = msg_ids[0].split() if msg_ids[0] else []
-
-        for mid in id_list[:50]:  # cap at 50 to stay fast
-            _, data = conn.fetch(mid, "(RFC822)")
-            raw = data[0][1] if data and data[0] else b""
-            msg = email_module.message_from_bytes(raw)
-            from_addr = email_module.utils.parseaddr(msg.get("From", ""))[1].lower().strip()
-            if from_addr not in target_emails:
                 continue
-            # Extract text body
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ct = part.get_content_type()
-                    if ct == "text/plain":
-                        body = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                        break
-            else:
-                body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
-
-            replies[from_addr] = {
-                "ts":     _now_iso(),
-                "label":  "imap_unread",
-                "body":   body[:2000],
-                "source": "gmail-imap",
-                "raw":    {"subject": msg.get("Subject",""), "from": msg.get("From","")},
-            }
-
-        conn.logout()
-        if verbose and replies:
-            print(f"  [imap] Found {len(replies)} unread replies from target emails")
-
-    except Exception as exc:
-        if verbose:
-            print(f"  [imap] Error: {exc}")
-
-    return replies
-
-
-# ---------------------------------------------------------------------------
-# 3. Resend opens
-# ---------------------------------------------------------------------------
-
-def _check_resend_opens(wfs: list[dict], verbose: bool = False) -> dict[str, str]:
-    """Query Resend API for email open events.
-    
-    Returns {email: first_open_ts} for opened emails.
-    """
-    opens: dict[str, str] = {}
-    api_key = os.getenv("RESEND_API_KEY", "").strip()
-    if not api_key:
-        return opens
-
-    try:
-        import urllib.request
-        import urllib.error
-
-        # Build email→wf_id map from those with resend_id
-        resend_id_map: dict[str, str] = {}   # resend_id → email
-        for wf in wfs:
-            if wf["resend_id"]:
-                resend_id_map[wf["resend_id"]] = wf["email"]
-
-        # For workflows without a stored resend_id, search by recipient in the bulk list
-        email_set = {wf["email"] for wf in wfs}
-        email_to_resend: dict[str, list[str]] = {e: [] for e in email_set}
-
-        # Fetch recent 100 emails from Resend
-        req = urllib.request.Request(
-            "https://api.resend.com/emails?limit=100",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-
-        for em_rec in data.get("data", []):
-            rid   = em_rec.get("id", "")
-            to_list = em_rec.get("to", [])
-            evt   = em_rec.get("last_event", "")
-            for to_addr in to_list:
-                norm = to_addr.lower().strip()
-                if norm in email_set:
-                    email_to_resend[norm].append(rid)
-                    if evt == "opened":
-                        opens[norm] = em_rec.get("created_at", _now_iso())
-                        if verbose:
-                            print(f"  [resend] Open detected: {norm} | resend_id={rid}")
-
-        # For emails with stored resend_id, fetch individual event detail
-        for rid, em_addr in resend_id_map.items():
-            if em_addr in opens:
+            rid   = r.get("id") or ""
+            label = r.get("classification") or ""
+            em    = (r.get("from") or "").lower().strip()
+            if not rid or rid in seen_ids or rid in handled:
                 continue
-            try:
-                req2 = urllib.request.Request(
-                    f"https://api.resend.com/emails/{rid}",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                with urllib.request.urlopen(req2, timeout=8) as resp2:
-                    detail = json.loads(resp2.read())
-                if detail.get("last_event") == "opened":
-                    opens[em_addr] = detail.get("created_at", _now_iso())
-                    if verbose:
-                        print(f"  [resend] Open confirmed via detail: {em_addr}")
-            except Exception:
-                pass
+            if label not in WATCH_LABELS or not em:
+                continue
+            # Defense in depth — imap-watcher already skips self-sends
+            if em.endswith("@meetrick.ai") or em == "vladislav@belkins.io":
+                continue
+            seen_ids.add(rid)
+            rows.append(r)
+    if verbose and rows:
+        print(f"  [triage] {len(rows)} new classified human repl(ies)")
+    return rows
 
-    except Exception as exc:
-        if verbose:
-            print(f"  [resend] API error: {exc}")
 
-    return opens
+def _row_ctx(row: dict) -> dict:
+    """Build the drafting/alert context from a triage row."""
+    em = (row.get("from") or "").lower().strip()
+    return {
+        "triage_id":   row.get("id") or "",
+        "email":       em,
+        "name":        row.get("from_name") or "",
+        "company":     em.rpartition("@")[2],
+        "opener_subj": row.get("subject") or "",
+        "opener_body": "",
+        "label":       row.get("classification") or "",
+        "thread_id":   row.get("thread_id") or "",
+        "received_at": row.get("received_at") or row.get("ingested_at") or "",
+    }
 
 
 # ---------------------------------------------------------------------------
-# 4. Auto-drafter — opus-4-7 / gpt-5.4 only
+# 2. Auto-drafter — opus-4-8 / gpt fallback only (smart-models invariant)
 # ---------------------------------------------------------------------------
 
-def _generate_draft(wf: dict, reply_body: str, reply_label: str, dry_run: bool, verbose: bool) -> dict | None:
-    """Generate a reply draft using claude-opus-4-7. Falls back to gpt-5.4.
-    
-    NO auto-send. Returns draft dict or None on failure.
+def _generate_draft(ctx: dict, reply_body: str, reply_label: str, dry_run: bool, verbose: bool) -> dict | None:
+    """Generate a reply draft using claude-opus-4-8. NO auto-send.
+
+    Returns draft dict or None on failure.
     """
     if dry_run:
         return {
-            "draft_body": f"[DRY-RUN DRAFT]\nRe: {wf['opener_subj']}\n\nThanks for replying, {wf['name']}. [Generated response would appear here]",
+            "draft_body": f"[DRY-RUN DRAFT]\nRe: {ctx['opener_subj']}\n\nThanks for replying, {ctx['name']}. [Generated response would appear here]",
             "model":      DRAFT_MODEL_ANTHROPIC,
             "dry_run":    True,
         }
@@ -378,15 +181,13 @@ def _generate_draft(wf: dict, reply_body: str, reply_label: str, dry_run: bool, 
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     openai_key    = os.getenv("OPENAI_API_KEY", "").strip()
 
-    prompt = f"""You are Rick, AI CEO of meetrick.ai — sharp, warm, commercially serious. 
-Draft a reply to this cold-email response. 
+    prompt = f"""You are Rick, AI CEO of meetrick.ai — sharp, warm, commercially serious.
+Draft a reply to this inbound email.
 
-PROSPECT: {wf['name']} at {wf['company']} (ICP score: {wf['icp_score']})
-ORIGINAL EMAIL SUBJECT: {wf['opener_subj']}
-ORIGINAL EMAIL BODY:
-{wf['opener_body']}
+SENDER: {ctx['name']} ({ctx['email']})
+THEIR SUBJECT: {ctx['opener_subj']}
 
-PROSPECT'S REPLY:
+THEIR MESSAGE:
 {reply_body[:1500]}
 
 REPLY INTENT LABEL: {reply_label}
@@ -397,8 +198,8 @@ Draft a reply that:
 - Is 3-5 sentences max — punchy, not corporate
 - Signs off as Rick, AI CEO, meetrick.ai
 - NO auto-send: this is for Vlad's review. Write the email body only, no subject line.
+- NEVER commit to payments, prices, discounts, or contract terms — those are owner-only.
 
-If label is 'not_interested' or 'unsubscribe': write a graceful 1-sentence close.
 If label is 'sales_inquiry': move toward a 15-min call.
 If label is 'question': answer directly + CTA."""
 
@@ -429,7 +230,7 @@ If label is 'question': answer directly + CTA."""
             if verbose:
                 print(f"  [drafter] Anthropic error: {exc}")
 
-    # Fallback: OpenAI gpt-5.4
+    # Fallback: OpenAI
     if openai_key:
         try:
             import urllib.request
@@ -444,6 +245,7 @@ If label is 'question': answer directly + CTA."""
                 headers={
                     "Authorization": f"Bearer {openai_key}",
                     "Content-Type":  "application/json",
+                    "User-Agent": "meetrick-rick/1.0",
                 },
                 method="POST",
             )
@@ -458,21 +260,22 @@ If label is 'question': answer directly + CTA."""
     return None
 
 
-def _save_draft(wf_id: str, wf: dict, draft: dict, reply_info: dict) -> str:
-    """Save draft to ~/rick-vault/mailbox/drafts/auto/{wf_id}.json. Returns path."""
+def _save_draft(ctx: dict, draft: dict, row: dict) -> str:
+    """Save draft to ~/rick-vault/mailbox/drafts/auto/{triage_id}.json. Returns path."""
     DRAFT_DIR.mkdir(parents=True, exist_ok=True)
-    path = DRAFT_DIR / f"{wf_id}.json"
+    path = DRAFT_DIR / f"{ctx['triage_id']}.json"
     payload = {
-        "wf_id":          wf_id,
-        "prospect_email": wf["email"],
-        "prospect_name":  wf["name"],
-        "company":        wf["company"],
-        "reply_body":     reply_info.get("body", ""),
-        "reply_label":    reply_info.get("label", ""),
-        "reply_ts":       reply_info.get("ts", ""),
-        "reply_source":   reply_info.get("source", ""),
+        "triage_id":      ctx["triage_id"],
+        "prospect_email": ctx["email"],
+        "prospect_name":  ctx["name"],
+        "company":        ctx["company"],
+        "reply_body":     (row.get("body") or "")[:2000],
+        "reply_label":    ctx["label"],
+        "reply_ts":       ctx["received_at"],
+        "reply_source":   "triage",
+        "thread_id":      ctx["thread_id"],
         "draft_body":     draft.get("draft_body", ""),
-        "draft_subject":  f"Re: {wf['opener_subj']}",
+        "draft_subject":  f"Re: {ctx['opener_subj']}",
         "model":          draft.get("model", ""),
         "review_required": True,
         "auto_send":      False,
@@ -483,29 +286,65 @@ def _save_draft(wf_id: str, wf: dict, draft: dict, reply_info: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 5. Workflow stage update
+# 3. Thread + follow-up routing (email_threads / follow_up_queue)
 # ---------------------------------------------------------------------------
 
-def _mark_replied(conn, wf_id: str, dry_run: bool) -> None:
-    """Set stage='replied' on the workflow so sequencer stops Day-3+ touches."""
+def _mark_thread_replied(conn, ctx: dict, draft_path: str, dry_run: bool) -> dict:
+    """Mark the email_threads row replied + queue a follow-up. Replaces the old
+    _mark_replied (which flipped a workflow stage nothing creates anymore)."""
+    out = {"thread_updated": 0, "follow_up_queued": 0}
     if dry_run:
-        return
+        return out
     now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        "UPDATE workflows SET stage='replied', updated_at=? WHERE id=?",
-        (now, wf_id),
-    )
-    conn.commit()
+    thread_id = ctx["thread_id"]
+    try:
+        if thread_id:
+            cur = conn.execute(
+                "UPDATE email_threads SET status='replied', intent_class=?, updated_at=? "
+                "WHERE thread_id=?",
+                (ctx["label"], now, thread_id),
+            )
+            out["thread_updated"] = cur.rowcount
+        # Route into follow-up: one pending row per thread/email
+        fq_thread = thread_id or ctx["email"]
+        existing = conn.execute(
+            "SELECT id FROM follow_up_queue WHERE thread_id=? AND status='pending' LIMIT 1",
+            (fq_thread,),
+        ).fetchone()
+        if not existing:
+            follow_up_at = (datetime.now() + timedelta(days=2)).isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT INTO follow_up_queue (prospect_id, thread_id, follow_up_at, attempts, "
+                "max_attempts, last_intent, status, draft_path, created_at, updated_at) "
+                "VALUES (NULL, ?, ?, 0, 4, ?, 'pending', ?, ?, ?)",
+                (fq_thread, follow_up_at, ctx["label"], draft_path, now, now),
+            )
+            out["follow_up_queued"] = 1
+        conn.commit()
+        # WS-F (2026-07-13): close the learning loop — link this reply back
+        # to the originating outbound_jobs touch row(s) and credit the
+        # subject/pitch variant a win in skill_variants. Deterministic
+        # (lead_id = recipient email), shielded so a ledger failure never
+        # blocks reply handling.
+        try:
+            from runtime.touch_log import mark_replied
+            linked = mark_replied(conn, ctx["email"])
+            out["touches_linked"] = len(linked)
+        except Exception as exc:
+            out["touch_link_error"] = str(exc)[:120]
+    except Exception as exc:
+        out["error"] = str(exc)[:200]
+    return out
 
 
 # ---------------------------------------------------------------------------
-# 6. Notify operator
+# 4. Notify operator
 # ---------------------------------------------------------------------------
 
-def _fire_alert(conn, wf: dict, reply_info: dict, draft_path: str, dry_run: bool, verbose: bool) -> str:
+def _fire_alert(conn, ctx: dict, row: dict, draft_path: str, dry_run: bool, verbose: bool) -> str:
     """Fire notify_operator_deduped with purpose=revenue (bypasses dedup). Returns result."""
     if dry_run:
-        print(f"  [DRY-RUN] ALERT: 🎯 REPLY from {wf['email']} ({wf['company']}) | label={reply_info.get('label','?')} | draft→{draft_path}")
+        print(f"  [DRY-RUN] ALERT: 🎯 REPLY from {ctx['email']} | label={ctx['label']} | draft→{draft_path}")
         return "dry-run"
     try:
         from runtime.engine import notify_operator_deduped
@@ -513,65 +352,37 @@ def _fire_alert(conn, wf: dict, reply_info: dict, draft_path: str, dry_run: bool
         print("  [alert] ImportError: runtime.engine not found")
         return "import-error"
 
-    preview = reply_info.get("body", "")[:300].replace("\n", " ")
+    preview = (row.get("body") or "")[:300].replace("\n", " ")
     text = (
-        f"🎯 REPLY DETECTED — {wf['name']} @ {wf['company']} ({wf['email']})\n"
-        f"Label: {reply_info.get('label','?')} | ICP: {wf['icp_score']}\n"
+        f"🎯 REPLY DETECTED — {ctx['name']} ({ctx['email']})\n"
+        f"Label: {ctx['label']}\n"
         f"Preview: {preview}\n"
-        f"Draft staged: {Path(draft_path).name} (review required — NO auto-send)\n"
-        f"wf_id: {wf['wf_id']}"
+        f"Draft staged: {Path(draft_path).name if draft_path else '(draft failed)'} (review required — NO auto-send)\n"
+        f"triage_id: {ctx['triage_id']}"
     )
+    # workflow_id stays None: triage ids are not workflows rows and
+    # notification_log.workflow_id has a FK to workflows(id).
     result = notify_operator_deduped(
         conn,
         text,
         kind="reply_watcher_hit",
         dedup_window_hours=168,
-        workflow_id=wf["wf_id"],
+        workflow_id=None,
         lane="outreach",
         purpose="revenue",     # URGENT — bypasses dedup
     )
     return result
 
 
-def _fire_open_signal(conn, email: str, wf: dict, open_ts: str, dry_run: bool, verbose: bool) -> str:
-    """Warm-signal alert for an open without a reply. Deduped per wf (24h)."""
-    if dry_run:
-        if verbose:
-            print(f"  [DRY-RUN] OPEN signal: {email} @ {wf.get('company','?')}")
-        return "dry-run"
-    try:
-        from runtime.engine import notify_operator_deduped
-    except ImportError:
-        return "import-error"
-
-    text = (
-        f"👁 OPEN SIGNAL — {wf.get('name','')} @ {wf.get('company','')} ({email}) "
-        f"opened the outreach email. No reply yet. Warming.\n"
-        f"wf_id: {wf.get('wf_id','')}"
-    )
-    return notify_operator_deduped(
-        conn,
-        text,
-        kind="reply_watcher_open",
-        dedup_window_hours=24,
-        workflow_id=wf.get("wf_id"),
-        lane="outreach",
-        purpose="ops",
-    )
-
-
 # ---------------------------------------------------------------------------
-# 7. Digest update
+# 5. Digest update
 # ---------------------------------------------------------------------------
 
-def _update_digest(n_replies: int, n_opens: int, elapsed_h: float, wf_count: int) -> None:
+def _update_digest(n_replies: int, watched: int) -> None:
     """Append a reply-watch line to today's activity digest / daily note."""
     today = datetime.now().strftime("%Y-%m-%d")
     digest_path = DATA_ROOT / "control" / "briefings" / f"reply-watch-{today}.md"
-    line = (
-        f"Reply watch {elapsed_h:.0f}h: {n_replies} replies, "
-        f"{n_opens} opens (watching {wf_count} ICP wfs)\n"
-    )
+    line = f"Reply watch: {n_replies} replies (watching {watched} triage rows)\n"
     digest_path.parent.mkdir(parents=True, exist_ok=True)
     with digest_path.open("a", encoding="utf-8") as fh:
         fh.write(f"[{_now_iso()}] {line}")
@@ -585,14 +396,12 @@ def _update_digest(n_replies: int, n_opens: int, elapsed_h: float, wf_count: int
             with daily_note.open("a", encoding="utf-8") as fh:
                 fh.write(f"\n{marker}\n- {line}")
         else:
-            # Replace last line under that marker
             lines = content.splitlines()
             for i in range(len(lines) - 1, -1, -1):
                 if lines[i].startswith("- Reply watch"):
                     lines[i] = f"- {line.strip()}"
                     break
             else:
-                # append under marker
                 idx = next(i for i, l in enumerate(lines) if l.startswith(marker))
                 lines.insert(idx + 1, f"- {line.strip()}")
             daily_note.write_text("\n".join(lines), encoding="utf-8")
@@ -607,131 +416,64 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
 
     state = _load_state()
     handled: dict[str, str] = state.get("handled", {})
-    open_signals: dict[str, str] = state.get("open_signals", {})
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
     try:
-        # 1. Load ICP workflows
-        wfs = _load_icp_workflows(conn)
-        if not wfs:
-            msg = f"reply-watcher: 0 sequence-active ICP workflows found"
+        rows = _load_watch_rows(handled, verbose=verbose)
+        if not rows:
             if verbose:
-                print(msg)
-            _log_event({"ts": _now_iso(), "event": "no_wfs", "wf_count": 0})
-            return {"wf_count": 0, "new_replies": 0, "new_opens": 0, "elapsed_h": 0.0}
+                print("reply-watcher: no new classified human replies in triage")
+            _log_event({"ts": _now_iso(), "event": "idle", "watched": 0})
+            return {"watched": 0, "new_replies": 0, "dry_run": dry_run}
 
-        if verbose:
-            print(f"Watching {len(wfs)} sequence-active ICP wf(s):")
-            for w in wfs:
-                print(f"  {w['wf_id']} | {w['email']} | {w['company']} | elapsed {_elapsed_hours(w['created_at']):.1f}h")
-
-        email_to_wf = {w["email"]: w for w in wfs}
-        target_emails = set(email_to_wf.keys())
-
-        # 2. Load replies from all sources
-        cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=REPLY_WATCH_HOURS)).isoformat(timespec="seconds") + "Z"
-        reply_map = _load_reply_router(cutoff_iso)
-        reply_map.update(_load_triage_files(cutoff_iso))  # triage files win
-        reply_map.update(_check_gmail_imap(target_emails, cutoff_iso, verbose=verbose))
-
-        # 3. Check Resend opens
-        open_map = _check_resend_opens(wfs, verbose=verbose)
-
-        # 4. Process each ICP workflow
         new_replies = 0
-        new_opens   = 0
+        for row in rows:
+            ctx = _row_ctx(row)
+            if verbose:
+                print(f"\n  *** REPLY: {ctx['email']} label={ctx['label']}")
 
-        for wf in wfs:
-            wf_id  = wf["wf_id"]
-            em     = wf["email"]
-
-            # --- Reply handling ---
-            reply_info = reply_map.get(em)
-            already_handled = wf_id in handled
-
-            if reply_info and not already_handled:
-                new_replies += 1
+            # Generate draft (smart-models invariant: opus-4-8 first)
+            draft = _generate_draft(ctx, row.get("body") or "", ctx["label"], dry_run, verbose)
+            draft_path = ""
+            if draft:
+                draft_path = _save_draft(ctx, draft, row) if not dry_run else "(dry-run)"
                 if verbose:
-                    print(f"\n  *** REPLY: {em} ({wf['company']}) label={reply_info.get('label','?')}")
+                    print(f"  Draft saved: {draft_path}")
+            elif verbose:
+                print(f"  WARNING: Draft generation failed for {ctx['triage_id']}")
 
-                # Generate draft (smart-models invariant: opus-4-7 / gpt-5.4 only)
-                draft = _generate_draft(wf, reply_info.get("body", ""), reply_info.get("label", ""), dry_run, verbose)
-                draft_path = ""
-                if draft:
-                    draft_path = _save_draft(wf_id, wf, draft, reply_info)
-                    if verbose:
-                        print(f"  Draft saved: {draft_path}")
-                else:
-                    if verbose:
-                        print(f"  WARNING: Draft generation failed for {wf_id}")
+            alert_result = _fire_alert(conn, ctx, row, draft_path, dry_run, verbose)
+            routing = _mark_thread_replied(conn, ctx, draft_path, dry_run)
 
-                # Fire alert
-                alert_result = _fire_alert(conn, wf, reply_info, draft_path, dry_run, verbose)
+            if not dry_run:
+                handled[ctx["triage_id"]] = _now_iso()
+            new_replies += 1
 
-                # Mark replied (stop Day-3+ sequencer touches)
-                _mark_replied(conn, wf_id, dry_run)
+            _log_event({
+                "ts":          _now_iso(),
+                "event":       "reply_detected",
+                "triage_id":   ctx["triage_id"],
+                "email":       ctx["email"],
+                "label":       ctx["label"],
+                "thread_id":   ctx["thread_id"],
+                "draft_path":  draft_path,
+                "alert":       alert_result,
+                "routing":     routing,
+                "dry_run":     dry_run,
+            })
 
-                # Update state
-                if not dry_run:
-                    handled[wf_id] = _now_iso()
-
-                # Log event
-                _log_event({
-                    "ts":          _now_iso(),
-                    "event":       "reply_detected",
-                    "wf_id":       wf_id,
-                    "email":       em,
-                    "company":     wf["company"],
-                    "label":       reply_info.get("label", ""),
-                    "source":      reply_info.get("source", ""),
-                    "draft_path":  draft_path,
-                    "alert":       alert_result,
-                    "dry_run":     dry_run,
-                })
-
-            # --- Open signal handling (only if not already replied) ---
-            open_ts = open_map.get(em)
-            if open_ts and em not in open_signals and not reply_info:
-                new_opens += 1
-                open_result = _fire_open_signal(conn, em, wf, open_ts, dry_run, verbose)
-                if not dry_run:
-                    open_signals[em] = open_ts
-                _log_event({
-                    "ts":     _now_iso(),
-                    "event":  "open_detected",
-                    "wf_id":  wf_id,
-                    "email":  em,
-                    "company": wf["company"],
-                    "open_ts": open_ts,
-                    "alert":  open_result,
-                    "dry_run": dry_run,
-                })
-                if verbose:
-                    print(f"  OPEN: {em} @ {wf['company']}")
-
-        # 5. Compute elapsed hours since earliest sequence start
-        earliest_ts = min((w["created_at"] for w in wfs), default=_now_iso())
-        elapsed_h   = _elapsed_hours(earliest_ts)
-
-        # 6. Update digest
         if not dry_run:
-            _update_digest(new_replies, new_opens, elapsed_h, len(wfs))
-
-        # 7. Save state
-        state["handled"]      = handled
-        state["open_signals"] = open_signals
-        state["last_run"]     = _now_iso()
-        if not dry_run:
+            _update_digest(new_replies, len(rows))
+            state["handled"]  = handled
+            state["last_run"] = _now_iso()
             _save_state(state)
 
         summary = {
             "ts":          _now_iso(),
-            "wf_count":    len(wfs),
+            "watched":     len(rows),
             "new_replies": new_replies,
-            "new_opens":   new_opens,
-            "elapsed_h":   round(elapsed_h, 1),
             "dry_run":     dry_run,
         }
         _log_event({"event": "run_summary", **summary})
@@ -746,7 +488,7 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Reply-watcher: 10-min ICP reply monitor")
+    parser = argparse.ArgumentParser(description="Reply-watcher: 10-min triage fast-lane for human replies")
     parser.add_argument("--dry-run", action="store_true", help="No DB writes / no alerts")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
@@ -761,10 +503,8 @@ def main() -> int:
     mode   = "[DRY-RUN] " if args.dry_run else ""
     print(
         f"{mode}reply-watcher | "
-        f"watching={result['wf_count']} wfs | "
-        f"elapsed={result['elapsed_h']}h | "
-        f"new_replies={result['new_replies']} | "
-        f"new_opens={result['new_opens']}"
+        f"watched={result.get('watched', 0)} triage rows | "
+        f"new_replies={result.get('new_replies', 0)}"
     )
     return 0
 

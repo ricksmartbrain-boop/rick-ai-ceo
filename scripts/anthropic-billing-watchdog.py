@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Anthropic Billing Watchdog — self-healing layer for gateway auth-state.json
+"""Anthropic Billing Watchdog — self-healing layer for gateway auth-profile state
 
 Runs every 15 min via launchd (ai.rick.anthropic-billing-watchdog.plist).
 
+Auth state lives in SQLite (openclaw-agent.sqlite, table auth_profile_state,
+state_key='primary') since the 2026 migration off auth-state.json.
+
 Each tick:
-  1. Probe Anthropic API directly (claude-opus-4-7, max_tokens=10)
-  2. If 200 OK AND auth-state has disabledUntil set → clear it + restart gateway
-  3. If HTTP 400 / credit balance too low → leave disable intact, log warning
+  1. Probe Anthropic API directly (claude-opus-4-8, max_tokens=10)
+  2. If 200 OK AND auth state has disabledUntil set → clear it + restart gateway
+  3. If HTTP 400 / credit balance too low → leave disable intact, log warning,
+     and Telegram-alert ops-alerts on transition (prev probe OK → failing) plus
+     once per 24h while it persists
   4. Any other status → log error, leave state alone
 
 Invariants enforced:
-  - Smart-models only: probes with claude-opus-4-7 (fallback: claude-sonnet-4-6).
+  - Smart-models only: probes with claude-opus-4-8 (fallback: claude-sonnet-4-6).
     Never mini/nano.
   - Credits direction: ONLY clears disables. Never creates them.
   - Idempotent: if already clean, just log "ok" and exit.
@@ -22,9 +27,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,9 +39,10 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-AUTH_STATE_FILE = Path(
-    "/Users/rickthebot/.openclaw/agents/main/agent/auth-state.json"
+AUTH_DB_FILE = Path(
+    "/Users/rickthebot/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 )
+AUTH_STATE_KEY = "primary"
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 LOG_FILE = DATA_ROOT / "operations" / "billing-watchdog.jsonl"
 
@@ -42,10 +50,21 @@ ANTHROPIC_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 PROBE_URL = "https://api.anthropic.com/v1/messages"
 
 # Smart-models invariant: test with opus first, fallback to sonnet. Never mini.
-PROBE_MODELS = ["claude-opus-4-7", "claude-sonnet-4-6"]
+PROBE_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6"]
 
-# Provider key as it appears in auth-state.json usageStats
+# Provider key as it appears in the auth-profile state usageStats
 PROVIDER_KEY = "anthropic:default"
+
+# Telegram alerting (tg-topic.sh convention: ops-alerts topic in team chat)
+RICK_ENV_FILES = [
+    Path.home() / ".openclaw/workspace/config/rick.env",
+    Path.home() / "clawd/config/rick.env",
+]
+TEAM_CHAT_ID_DEFAULT = "-1003781085932"
+OPS_ALERTS_THREAD_ID = "34"
+ALERT_EVENT = "credits_low_alert_sent"
+PROBE_STATUSES = ("ok", "cleared", "credits_low", "error")
+ALERT_REPEAT_SECONDS = 24 * 3600
 
 TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -61,22 +80,49 @@ def log(entry: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auth-state helpers
+# Auth-state helpers (SQLite: auth_profile_state, state_key='primary')
 # ---------------------------------------------------------------------------
 def read_auth_state() -> dict:
-    if not AUTH_STATE_FILE.exists():
+    if not AUTH_DB_FILE.exists():
         return {}
     try:
-        return json.loads(AUTH_STATE_FILE.read_text(encoding="utf-8"))
+        con = sqlite3.connect(AUTH_DB_FILE, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT state_json FROM auth_profile_state WHERE state_key = ?",
+                (AUTH_STATE_KEY,),
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return {}
+        return json.loads(row[0])
     except Exception as exc:
         log({"event": "auth_state_read_error", "status": "error", "error": str(exc)})
         return {}
 
 
 def write_auth_state(state: dict) -> None:
-    tmp = AUTH_STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(AUTH_STATE_FILE)
+    """Targeted UPDATE of the single primary row; one sub-second transaction.
+
+    WAL mode on the gateway DB tolerates this concurrent writer."""
+    payload = json.dumps(state, separators=(",", ":"))
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    con = sqlite3.connect(AUTH_DB_FILE, timeout=5)
+    try:
+        with con:
+            cur = con.execute(
+                "UPDATE auth_profile_state SET state_json = ?, updated_at = ? "
+                "WHERE state_key = ?",
+                (payload, now_ms, AUTH_STATE_KEY),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    f"auth_profile_state UPDATE touched {cur.rowcount} rows "
+                    f"(expected 1) — aborted"
+                )
+    finally:
+        con.close()
 
 
 def get_provider_entry(state: dict) -> dict:
@@ -159,6 +205,86 @@ def probe_anthropic() -> tuple[int, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Telegram alerting
+# ---------------------------------------------------------------------------
+def _rick_env(name: str) -> str:
+    """Env var, falling back to rick.env files (never logs values)."""
+    val = os.getenv(name, "")
+    if val:
+        return val
+    for env_file in RICK_ENV_FILES:
+        if not env_file.exists():
+            continue
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return ""
+
+
+def send_telegram_alert(text: str) -> tuple[bool, str]:
+    """POST to ops-alerts topic. Returns (ok, message_id_or_error)."""
+    token = _rick_env("RICK_TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False, "RICK_TELEGRAM_BOT_TOKEN not set"
+    chat_id = _rick_env("RICK_TEAM_CHAT_ID") or TEAM_CHAT_ID_DEFAULT
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "message_thread_id": OPS_ALERTS_THREAD_ID,
+        "text": text,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            desc = json.loads(exc.read()).get("description", str(exc))
+        except Exception:
+            desc = str(exc)
+        return False, f"HTTP {exc.code}: {desc}"[:200]
+    except Exception as exc:
+        return False, str(exc)[:200]
+    if body.get("ok"):
+        return True, str(body.get("result", {}).get("message_id", "?"))
+    return False, str(body.get("description", body))[:200]
+
+
+def read_alert_context() -> tuple[str | None, float | None]:
+    """Scan the jsonl for (last probe status, last alert epoch seconds)."""
+    last_probe: str | None = None
+    last_alert: float | None = None
+    if not LOG_FILE.exists():
+        return None, None
+    try:
+        for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            ts_raw = entry.get("ts", "")
+            if entry.get("event") == ALERT_EVENT:
+                try:
+                    last_alert = datetime.fromisoformat(ts_raw).timestamp()
+                except Exception:
+                    pass
+            elif entry.get("status") in PROBE_STATUSES:
+                last_probe = entry["status"]
+    except Exception:
+        return None, None
+    return last_probe, last_alert
+
+
+# ---------------------------------------------------------------------------
 # Gateway restart
 # ---------------------------------------------------------------------------
 def restart_gateway() -> tuple[bool, str]:
@@ -230,6 +356,7 @@ def main() -> int:
     )
 
     if is_credit_low:
+        prev_status, last_alert_ts = read_alert_context()
         log({
             "event": "credits_low",
             "status": "credits_low",
@@ -238,6 +365,35 @@ def main() -> int:
             "error": error_msg[:300],
             "disable_left_intact": disabled,
         })
+
+        # Alert on OK→failing transition, then once per 24h while it persists
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        transition = prev_status in ("ok", "cleared")
+        repeat_due = (
+            last_alert_ts is None
+            or now_epoch - last_alert_ts >= ALERT_REPEAT_SECONDS
+        )
+        if transition or repeat_due:
+            alert_kind = "transition" if transition else "daily_repeat"
+            tg_ok, tg_detail = send_telegram_alert(
+                f"🚨 [billing-watchdog] Anthropic credits LOW "
+                f"(HTTP {status_code}, probe {PROBE_MODELS[0]}). "
+                f"Brain is on fallback model. Manual top-up needed "
+                f"(Anthropic Plans & Billing). "
+                f"Alert kind: {alert_kind}."
+            )
+            log({
+                "event": ALERT_EVENT,
+                "status": "credits_low",
+                "alert_kind": alert_kind,
+                "telegram_ok": tg_ok,
+                "telegram_detail": tg_detail,
+            })
+            print(
+                f"[{TS}] 📣 Telegram alert ({alert_kind}): "
+                f"{'sent, message_id=' + tg_detail if tg_ok else 'FAILED: ' + tg_detail}"
+            )
+
         print(
             f"[{TS}] ⚠️  Credits low (HTTP {status_code}) "
             f"— disable left intact: {disabled}"
@@ -259,4 +415,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-alert":
+        msg = sys.argv[2] if len(sys.argv) > 2 else "[billing-watchdog] test alert"
+        ok, detail = send_telegram_alert(msg)
+        print(f"test-alert: {'OK message_id=' + detail if ok else 'FAILED: ' + detail}")
+        sys.exit(0 if ok else 2)
     sys.exit(main())

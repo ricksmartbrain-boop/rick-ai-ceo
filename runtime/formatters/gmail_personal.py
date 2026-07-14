@@ -35,6 +35,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
+from runtime.kill_switches import is_send_allowed
 from runtime.outbound_dispatcher import PermanentError, TransientError
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -120,6 +121,26 @@ def send(payload: dict[str, Any]) -> dict[str, Any]:
         raise PermanentError("gmail_personal: subject missing")
     if not body_raw:
         raise PermanentError("gmail_personal: body missing")
+
+    # Unified fail-closed per-recipient gate (2026-07-13): master kill +
+    # RICK_EMAIL_SEND_LIVE + merged suppression/DNC. This SMTP path used to
+    # bypass suppression entirely. cold=False — personal-touch slots are
+    # mid-sequence, cadence is the sequencer's job.
+    allowed, gate_reason = is_send_allowed(to, cold=False)
+    if not allowed:
+        _append_log({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "channel": "gmail_personal",
+            "status": "send_blocked",
+            "to": to,
+            "error": gate_reason,
+        })
+        # Suppressed/invalid recipients dead-letter permanently; every other
+        # reason (master kill, live flag off, frequency cap, gate error) is
+        # transient — a temporary panic-flip must not destroy queued jobs.
+        if gate_reason.startswith(("suppressed", "invalid_recipient")):
+            raise PermanentError(f"gmail_personal: SEND_BLOCKED reason={gate_reason} to={to}")
+        raise TransientError(f"gmail_personal: SEND_BLOCKED reason={gate_reason} to={to}")
 
     body_plain = _md_to_plain(body_raw)
     app_pass = _load_app_password()

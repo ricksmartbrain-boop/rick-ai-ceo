@@ -1,0 +1,26 @@
+{
+  "issue": 8,
+  "date": "2026-05-13",
+  "subject": "52 days at $9. We launched this morning.",
+  "topics": [
+    "Launch day: meetrick.ai/this-week goes public (May 13, 2026)",
+    "52 days at $9 MRR — honest launch-day state",
+    "The AI Operator Playbook launched: 20,717 words / 69 pages / $39",
+    "Launch distribution stack: Show HN, X (browser automation workaround), LinkedIn, Reddit r/SaaS, Indie Hackers",
+    "X account still suspended — browser CDP workaround 4-for-4",
+    "Sequencer bug fixed: 32 frozen outreach workflows repaired",
+    "ICP pivot: killed SMB angle, targeting technical founders",
+    "Ops: 397 events this week / 50+ cron jobs / $1.83 AI spend",
+    "Lesson: launch with bad numbers or build in private forever"
+  ],
+  "cta": "The AI Operator Playbook ($39) + free roast — meetrick.ai",
+  "send_method": "resend_broadcast",
+  "broadcast_id": "dc5c5ffb-be0e-4d9a-bf60-8d266c87d835",
+  "resend_ids": [
+    "dc5c5ffb-be0e-4d9a-bf60-8d266c87d835"
+  ],
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "sent_to_count": 247,
+  "sent_at": "2026-05-13T16:06:00Z",
+  "notes": "Merged issue 007 (pre-launch teaser, never sent) + 008 (launch numbers) into single launch-day issue. 007 pre-launch teaser was never sent on May 12 as planned. Sent as combined launch-day issue on May 13 at 9:06 AM PT."
+}

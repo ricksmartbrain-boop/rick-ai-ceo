@@ -8,7 +8,11 @@ Hard-bounces and complaints are auto-suppressed in:
   ~/rick-vault/mailbox/suppression.txt
 
 Writes a poll.done sentinel row after every run so flag_health.py can detect
-liveness (probe key: RICK_BOUNCE_POLL_LIVE, threshold 1.0h).
+liveness (probe key: RICK_BOUNCE_POLL_LIVE, threshold 1.0h). When the Phase-1
+list fetch succeeds, the sentinel also carries resend_sends_1h/_24h — how many
+emails Resend itself processed in those windows — which bounce-rate-guardian.py
+uses as a bounce-rate denominator matched to the bounce universe (the local
+email-sends.jsonl ledger undercounts: some send paths bypass it).
 
 Two-phase scan:
   Phase 1: Resend list API top-100 emails (sorted newest first, page param is no-op).
@@ -47,6 +51,10 @@ AUTO_SUPPRESS_EVENTS = {"bounced", "complained"}  # both kill sender rep
 # Emails logged in email-sends.jsonl within this window get a direct ID check.
 SEND_CHECK_WINDOW_DAYS = 7
 
+# last_event values meaning the email never actually went out — excluded from
+# the resend_sends_* denominator counts written to the poll.done sentinel.
+NEVER_SENT_EVENTS = {"canceled", "failed", "scheduled"}
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -72,6 +80,45 @@ def fetch_email_list() -> list[dict]:
     req = Request(f"{RESEND_BASE}/emails?limit=100", headers=_headers(), method="GET")
     resp = urlopen(req, timeout=20)
     return json.loads(resp.read()).get("data", [])
+
+
+def _parse_created_at(raw: object) -> datetime | None:
+    """Parse Resend created_at, e.g. '2026-07-13 14:09:01.105047+00' (UTC)."""
+    if not raw:
+        return None
+    ts = str(raw).strip().replace("Z", "+00:00")
+    if ts.endswith("+00"):  # bare '+00' offset rejected by fromisoformat < 3.11
+        ts += ":00"
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def count_window_sends(emails: list[dict]) -> tuple[int, int]:
+    """Return (sends_1h, sends_24h) that Resend itself processed, by created_at.
+
+    This universe matches how bounces are detected (ALL traffic on the API key,
+    including send paths that bypass email-sends.jsonl), so the guardian can
+    compute an honest rate. NOTE: the list API returns only the newest 100
+    emails (page param is a no-op), so above 100 sends/24h these counts are a
+    lower bound — resend_list_len in the sentinel shows when the cap is hit.
+    """
+    now = datetime.now(timezone.utc)
+    c1h = c24h = 0
+    for e in emails:
+        if e.get("last_event") in NEVER_SENT_EVENTS:
+            continue
+        dt = _parse_created_at(e.get("created_at"))
+        if dt is None:
+            continue
+        age = now - dt
+        if age <= timedelta(hours=24):
+            c24h += 1
+            if age <= timedelta(hours=1):
+                c1h += 1
+    return c1h, c24h
 
 
 def fetch_email_by_id(email_id: str) -> dict | None:
@@ -247,9 +294,13 @@ def main() -> None:
     counters = {"bounces": 0, "complaints": 0, "suppressed": 0, "errors": 0}
 
     # ── Phase 1: list API — top 100 most-recent emails ────────────────────────
+    resend_sends_1h = resend_sends_24h = resend_list_len = None
     try:
-        for email in fetch_email_list():
+        emails = fetch_email_list()
+        for email in emails:
             process_email(email, known_ids, suppressions, resolved_ids, counters)
+        resend_sends_1h, resend_sends_24h = count_window_sends(emails)
+        resend_list_len = len(emails)
     except HTTPError as e:
         print(f"  ERROR list API HTTP {e.code}: {e.reason}", file=sys.stderr)
         counters["errors"] += 1
@@ -283,6 +334,11 @@ def main() -> None:
         "direct_checked": direct_checked,
         "errors": counters["errors"],
     }
+    # Keys absent when the list fetch failed → guardian falls back to ledger.
+    if resend_sends_24h is not None:
+        sentinel["resend_sends_1h"] = resend_sends_1h
+        sentinel["resend_sends_24h"] = resend_sends_24h
+        sentinel["resend_list_len"] = resend_list_len
     append_bounce_row(sentinel)
 
     print(

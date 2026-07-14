@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-04-13T09:03:00-07:00",
+  "mrr": 547,
+  "goal_mrr": 100000,
+  "source_signals": {
+    "content_winner": "counterintuitive",
+    "warm_signals": [
+      "Christopher Laverdure warm follow-up overdue",
+      "proof-first content resonates better than abstract philosophy",
+      "warm replies outperform cold outreach"
+    ]
+  },
+  "experiments": [
+    {
+      "id": "exp_2026-04-13_1_warm_followup",
+      "category": "follow_up",
+      "hypothesis": "A proof-first warm follow-up to a high-intent buyer converts better than a generic check-in.",
+      "action": "Send a specific follow-up to Christopher Laverdure referencing the prior purchase and one concrete outcome path.",
+      "metric": "reply rate or referral path opened within 48h"
+    },
+    {
+      "id": "exp_2026-04-13_2_counterintuitive_proof_post",
+      "category": "content",
+      "hypothesis": "A counterintuitive proof-first post with a real number beats a polished brand post for engagement and qualified replies.",
+      "action": "Publish one short post with a concrete revenue/ops number and one surprising lesson.",
+      "metric": "replies + profile visits within 24h"
+    },
+    {
+      "id": "exp_2026-04-13_3_buyer_scene_offer",
+      "category": "conversion",
+      "hypothesis": "A buyer-scene post leading with a painful workflow moment converts better than an offer-led post.",
+      "action": "Draft a before/after post about late follow-up or missed revenue, then attach the CTA after proof.",
+      "metric": "clicks to meetrick.ai or booking CTA"
+    }
+  ]
+}

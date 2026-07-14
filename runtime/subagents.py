@@ -143,6 +143,7 @@ def build_task_prompt(spec: SubagentSpec, task: str, context: dict[str, Any] | N
 - Actions requiring approval: {', '.join(spec.approval_required) or 'none'}
 - Max spend per task: ${spec.max_spend_usd:.2f}
 - If you cannot resolve something, escalate to Rick with a clear summary of what you tried and what's needed.
+- NEVER cancel, relabel, or "clean up" workflows or jobs, resolve/deny approvals, write directly to the runtime DB's workflows/jobs/approvals tables, or kill Rick processes — even if the data looks synthetic, duplicate, stale, or like a drill. Drills intentionally look synthetic; cancelling them defeats their purpose. If something looks wrong, report it and escalate — cleanup decisions belong to the owner.
 - Write outputs to ~/rick-vault/ using appropriate paths.
 - Be concise. Ship outcomes, not plans."""
 
@@ -567,7 +568,7 @@ def dispatch_openclaw(
         pass
 
     if tokens_in or tokens_out or tokens_cache_read:
-        # Anthropic pricing (sonnet-4-6 baseline; opus-4-7 is ~5x but we don't
+        # Anthropic pricing (sonnet-4-6 baseline; opus-4-8 is ~5x but we don't
         # know provider-side rate here). Cache read @ 10% of base input; cache
         # write @ 125% of base input. Output = output rate.
         base_in_per_m = 3.0

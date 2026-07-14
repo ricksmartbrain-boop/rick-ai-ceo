@@ -147,6 +147,24 @@ def run_probe(suppressed: dict[str, str]) -> int:
         return 0
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%dT")
+    existing_keys: set[tuple[str, str, str]] = set()
+    if VIOLATIONS_FILE.exists():
+        try:
+            for raw in VIOLATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("violation") != "send_to_suppressed":
+                    continue
+                send_entry = row.get("send_entry") if isinstance(row.get("send_entry"), dict) else {}
+                existing_keys.add((
+                    str(row.get("to") or "").strip().lower(),
+                    str(row.get("send_ts") or ""),
+                    str(send_entry.get("message_id") or send_entry.get("id") or ""),
+                ))
+        except OSError:
+            pass
     violations: list[dict] = []
 
     with SENDS_FILE.open(encoding="utf-8") as fh:
@@ -163,6 +181,9 @@ def run_probe(suppressed: dict[str, str]) -> int:
                 continue
             to = (entry.get("to") or "").strip().lower()
             if to in suppressed:
+                key = (to, str(ts), str(entry.get("message_id") or entry.get("id") or ""))
+                if key in existing_keys:
+                    continue
                 violations.append({
                     "ts": now_iso(),
                     "violation": "send_to_suppressed",

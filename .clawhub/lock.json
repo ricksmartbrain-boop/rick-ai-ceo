@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "skills": {
+    "sag": {
+      "version": "1.0.0",
+      "installedAt": 1773344603448
+    },
+    "summarize": {
+      "version": "1.0.0",
+      "installedAt": 1773344606884
+    },
+    "self-improving-agent": {
+      "version": "3.0.13",
+      "installedAt": 1775830035289
+    },
+    "skill-creator": {
+      "version": "0.1.0",
+      "installedAt": 1774866803988
+    },
+    "ontology": {
+      "version": "1.0.4",
+      "installedAt": 1774866805305
+    },
+    "api-gateway": {
+      "version": "1.0.75",
+      "installedAt": 1775130484026
+    },
+    "admapix": {
+      "version": "1.0.28",
+      "installedAt": 1775130485907
+    },
+    "agent-browser-clawdbot": {
+      "version": "0.1.0",
+      "installedAt": 1775830196592
+    }
+  }
+}

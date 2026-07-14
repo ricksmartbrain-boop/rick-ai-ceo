@@ -2,7 +2,7 @@
 """
 founder-discovery-pipeline.py
 Founder ICP discovery at scale: scrape GitHub trending + ProductHunt + HN Show HN,
-load existing lead files, score via opus-4-7 (route=review), generate personalized
+load existing lead files, score via opus-4-8 (route=review), generate personalized
 openers, and insert qualified_lead workflows.
 
 Usage:
@@ -413,6 +413,50 @@ def fetch_hn_show_hn() -> list[dict[str, Any]]:
 
 # ── Named-founder email discovery ───────────────────────────────────────────
 
+# xurl guard (2026-07-12): without an OAuth2 user token in ~/.xurl, EVERY xurl
+# invocation auto-launches the OAuth2 browser flow (x.com/i/oauth2/authorize)
+# and blocks — one browser tab per call. Unguarded, this pipeline made up to
+# 6 xurl calls per lead ("hundreds of X login tabs" storm). Gate every call:
+# skip when X credits are depleted or no OAuth2 token exists, and hard-cap
+# failures per run instead of retrying unbounded.
+_XURL_MAX_FAILURES = 3
+_XURL_STATE = {"failures": 0, "disabled": ""}
+
+
+def _xurl_disable(reason: str) -> None:
+    _XURL_STATE["disabled"] = reason
+    print(
+        f"[x-lookup] ERROR: X/Twitter lookup disabled — {reason}. "
+        "Skipping all further xurl calls this run.",
+        file=sys.stderr,
+    )
+
+
+def _xurl_ready() -> bool:
+    if _XURL_STATE["disabled"]:
+        return False
+    if os.environ.get("RICK_X_CREDITS_DEPLETED", "false").strip().lower() == "true":
+        _xurl_disable("RICK_X_CREDITS_DEPLETED=true (X API credits exhausted)")
+        return False
+    if _XURL_STATE["failures"] >= _XURL_MAX_FAILURES:
+        _xurl_disable(
+            f"{_XURL_STATE['failures']} xurl failures (max {_XURL_MAX_FAILURES})"
+        )
+        return False
+    try:
+        token_store = (Path.home() / ".xurl").read_text(encoding="utf-8")
+    except OSError:
+        token_store = ""
+    if "oauth2" not in token_store:
+        _xurl_disable(
+            "no OAuth2 user token in ~/.xurl — xurl would open a browser "
+            "login tab per call (run: npx -y @xdevplatform/xurl auth oauth2 "
+            "--app meetrick --headless)"
+        )
+        return False
+    return True
+
+
 def discover_named_founder_email(
     domain: str, name: str = "", context: str = "", hn_author: str = "",
 ) -> tuple[str, str]:
@@ -503,42 +547,51 @@ def discover_named_founder_email(
             pass  # GitHub search failed — fall through
 
     # ── (c1) X/Twitter best-effort lookup ─────────────────────────────────────────
-    # Current X auth is often blocked; this is best-effort and safe to fail open.
-    try:
-        import subprocess
-        x_search = subprocess.run(
-            ["xurl", "search", domain_clean, "-n", "10"],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            cwd=str(ROOT),
-        )
-        if x_search.returncode == 0 and x_search.stdout.strip():
-            blob = x_search.stdout.strip()
-            usernames = set(re.findall(r"@([A-Za-z0-9_]{1,15})", blob))
-            # Some responses are JSON-ish; also capture username fields directly.
-            usernames.update(re.findall(r'"username"\s*:\s*"([A-Za-z0-9_]{1,15})"', blob))
-            for username in list(usernames)[:5]:
-                try:
-                    x_user = subprocess.run(
-                        ["xurl", "user", username],
-                        capture_output=True,
-                        text=True,
-                        timeout=12,
-                        cwd=str(ROOT),
-                    )
-                    if x_user.returncode != 0:
+    # GUARDED (2026-07-12): every xurl call without an OAuth2 user token opens a
+    # browser login tab and blocks (see _xurl_ready above). Never call xurl
+    # unless it can run headless; count failures and stop at _XURL_MAX_FAILURES.
+    if _xurl_ready():
+        try:
+            import subprocess
+            x_search = subprocess.run(
+                ["xurl", "search", domain_clean, "-n", "10"],
+                capture_output=True,
+                text=True,
+                timeout=12,
+                cwd=str(ROOT),
+            )
+            if x_search.returncode != 0:
+                _XURL_STATE["failures"] += 1
+            if x_search.returncode == 0 and x_search.stdout.strip():
+                blob = x_search.stdout.strip()
+                usernames = set(re.findall(r"@([A-Za-z0-9_]{1,15})", blob))
+                # Some responses are JSON-ish; also capture username fields directly.
+                usernames.update(re.findall(r'"username"\s*:\s*"([A-Za-z0-9_]{1,15})"', blob))
+                for username in list(usernames)[:5]:
+                    if not _xurl_ready():
+                        break
+                    try:
+                        x_user = subprocess.run(
+                            ["xurl", "user", username],
+                            capture_output=True,
+                            text=True,
+                            timeout=12,
+                            cwd=str(ROOT),
+                        )
+                        if x_user.returncode != 0:
+                            _XURL_STATE["failures"] += 1
+                            continue
+                        profile = x_user.stdout or ""
+                        emails = re.findall(r"[A-Za-z0-9._%+-]+@" + re.escape(domain_clean), profile, flags=re.I)
+                        for candidate in emails:
+                            cand = candidate.lower().strip()
+                            if cand and not is_role_account(cand):
+                                return cand, f"x-profile:{username}"
+                    except Exception:
+                        _XURL_STATE["failures"] += 1
                         continue
-                    profile = x_user.stdout or ""
-                    emails = re.findall(r"[A-Za-z0-9._%+-]+@" + re.escape(domain_clean), profile, flags=re.I)
-                    for candidate in emails:
-                        cand = candidate.lower().strip()
-                        if cand and not is_role_account(cand):
-                            return cand, f"x-profile:{username}"
-                except Exception:
-                    continue
-    except Exception:
-        pass
+        except Exception:
+            _XURL_STATE["failures"] += 1
 
     # ── (c2) ProductHunt maker search ───────────────────────────────────────────────
     ph_token = os.environ.get("PRODUCTHUNT_API_TOKEN") or os.environ.get("PH_API_TOKEN") or ""
@@ -605,7 +658,7 @@ def heuristic_pre_filter(lead: dict[str, Any]) -> bool:
 
 def score_lead_batch(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Score each lead using founder-icp-scorer.py batch mode."""
-    print(f"  → Scoring {len(leads)} leads via opus-4-7 (route=review)...")
+    print(f"  → Scoring {len(leads)} leads via opus-4-8 (route=review)...")
     # Write to temp JSONL
     import tempfile
     tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", mode="w", delete=False, encoding="utf-8")
@@ -658,7 +711,7 @@ def score_lead_batch(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ── Opener generation ─────────────────────────────────────────────────────────
 
 def generate_opener(lead: dict[str, Any]) -> dict[str, str]:
-    """Generate personalized cold-email subject + opener via opus-4-7."""
+    """Generate personalized cold-email subject + opener via opus-4-8."""
     name = lead.get("name") or lead.get("company") or "Founder"
     company = lead.get("company") or lead.get("domain") or ""
     context = lead.get("context") or ""
@@ -710,7 +763,7 @@ Return JSON only:
         return {
             "subject": str(parsed.get("subject", fallback_subj))[:120],
             "body": str(parsed.get("body", fallback_body))[:3000],
-            "model_used": getattr(result, "model", "claude-opus-4-7"),
+            "model_used": getattr(result, "model", "claude-opus-4-8"),
         }
     except Exception:
         return {"subject": fallback_subj, "body": fallback_body, "model_used": "fallback"}
@@ -747,7 +800,7 @@ def create_workflow(lead: dict[str, Any], opener: dict[str, str]) -> dict[str, A
         "subject": opener["subject"],
         "body": opener["body"],
         "generated_at": NOW_UTC,
-        "model_used": opener.get("model_used", "claude-opus-4-7"),
+        "model_used": opener.get("model_used", "claude-opus-4-8"),
         "auto_fire": False,
         "draft": True,
         "do_not_send_before_approval": True,
@@ -888,8 +941,8 @@ def main() -> None:
         print("  ⚠ No candidates after filtering — check data sources")
         return
 
-    # 4. Score all via opus-4-7
-    print(f"[4/6] Scoring {len(filtered)} candidates via opus-4-7 (route=review)...")
+    # 4. Score all via opus-4-8
+    print(f"[4/6] Scoring {len(filtered)} candidates via opus-4-8 (route=review)...")
     scored = score_lead_batch(filtered)
 
     # Sort by score descending
@@ -915,7 +968,7 @@ def main() -> None:
     print(f"\nScore distribution: min={min(scores):.2f} avg={sum(scores)/len(scores):.2f} max={max(scores):.2f}")
 
     # 5. Generate openers + create workflows
-    print(f"\n[5/6] Generating opus-4-7 personalized openers for {len(top)} leads...")
+    print(f"\n[5/6] Generating opus-4-8 personalized openers for {len(top)} leads...")
     created = []
     skipped_existing = []
 

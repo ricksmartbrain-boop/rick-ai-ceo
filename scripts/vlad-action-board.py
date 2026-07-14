@@ -301,6 +301,65 @@ def _gather_auto_drafts() -> list[Task]:
     return _gather_auto_drafts_legacy()
 
 
+def _auto_draft_is_actionable(path: Path, data: dict) -> bool:
+    """Return true for real reply drafts that still need a human send/discard call."""
+    haystack = " ".join(
+        str(value or "")
+        for value in (
+            path.name,
+            data.get("wf_id"),
+            data.get("draft_id"),
+            data.get("thread_id"),
+            data.get("body"),
+            data.get("draft_body"),
+        )
+    ).lower()
+    if any(marker in haystack for marker in ("synthetic", "wf_test", "msg-001-test", "dry-run draft")):
+        return False
+    return bool(
+        data.get("draft_body")
+        or data.get("body")
+        or data.get("reply_body")
+        or data.get("text")
+    )
+
+
+def _auto_draft_dedupe_key(data: dict) -> tuple[str, str, str]:
+    """Collapse regenerated drafts for the same inbound into one approval item."""
+    recipient = str(
+        data.get("prospect_email")
+        or data.get("from_email")
+        or data.get("to")
+        or data.get("email")
+        or ""
+    ).strip().lower()
+    inbound_ts = str(data.get("reply_ts") or data.get("replied_at") or data.get("thread_id") or "").strip()
+    subject = str(data.get("draft_subject") or data.get("subject") or "").strip().lower()
+    return (recipient, inbound_ts, subject)
+
+
+def _load_actionable_auto_drafts() -> list[tuple[Path, dict]]:
+    files = sorted(DRAFTS_AUTO_DIR.glob("*.json"))
+    chosen: dict[tuple[str, str, str], tuple[Path, dict]] = {}
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _auto_draft_is_actionable(path, data):
+            continue
+        key = _auto_draft_dedupe_key(data)
+        current = chosen.get(key)
+        if current is None:
+            chosen[key] = (path, data)
+            continue
+        current_created = _parse_ts(current[1].get("created_at") or current[1].get("ran_at"))
+        candidate_created = _parse_ts(data.get("created_at") or data.get("ran_at"))
+        if candidate_created and (current_created is None or candidate_created > current_created):
+            chosen[key] = (path, data)
+    return sorted(chosen.values(), key=lambda item: item[0].name)
+
+
 def _gather_auto_drafts_legacy() -> list[Task]:
     """LEGACY fallback: file-walk over mailbox/drafts/auto/ for pending send-approvals.
 
@@ -311,18 +370,14 @@ def _gather_auto_drafts_legacy() -> list[Task]:
     if not DRAFTS_AUTO_DIR.is_dir():
         return tasks
 
-    files = sorted(DRAFTS_AUTO_DIR.glob("*.json"))
-    if not files:
+    drafts = _load_actionable_auto_drafts()
+    if not drafts:
         return tasks
 
     overdue_count = 0
     oldest_ts: Optional[datetime] = None
 
-    for f in files:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    for _, data in drafts:
         created = _parse_ts(data.get("created_at") or data.get("ran_at"))
         if created and (oldest_ts is None or created < oldest_ts):
             oldest_ts = created
@@ -333,50 +388,38 @@ def _gather_auto_drafts_legacy() -> list[Task]:
 
     # Summarise by from_email for detail
     froms = []
-    for f in files[:5]:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            # Various field names used across draft schemas
-            from_str = (
-                data.get("from_email")
-                or data.get("prospect_email")
-                or data.get("from")
-                or data.get("email")
-                or "?"
-            )
-            froms.append(from_str)
-        except Exception:
-            froms.append("?")
-    detail_str = ", ".join(froms) + ("…" if len(files) > 5 else "")
-    first_wf_id = files[0].stem
+    for _, data in drafts[:5]:
+        # Various field names used across draft schemas
+        from_str = (
+            data.get("from_email")
+            or data.get("prospect_email")
+            or data.get("from")
+            or data.get("email")
+            or "?"
+        )
+        froms.append(from_str)
+    detail_str = ", ".join(froms) + ("..." if len(drafts) > 5 else "")
+    first_wf_id = drafts[0][0].stem
     preferred_file = None
-    for f in files:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    for f, data in drafts:
         candidate = str(data.get("wf_id") or f.stem)
         if candidate.startswith("wf_"):
             preferred_file = f
             first_wf_id = candidate
             break
     if preferred_file is None:
-        try:
-            first_data = json.loads(files[0].read_text(encoding="utf-8"))
-            first_wf_id = str(first_data.get("wf_id") or first_wf_id)
-        except Exception:
-            pass
+        first_wf_id = str(drafts[0][1].get("wf_id") or first_wf_id)
 
     tasks.append(Task(
         section="APPROVALS NEEDED",
         priority="P0",
-        label=f"Send or discard {len(files)} auto-drafted reply/replies",
+        label=f"Send or discard {len(drafts)} auto-drafted reply/replies",
         detail=f"From: {detail_str}  |  Path: mailbox/drafts/auto/  |  Run: python3 scripts/send-draft.py {first_wf_id}",
-        est_mins=3 * len(files),
+        est_mins=3 * len(drafts),
         blocked="Hot sales leads go cold — Rick can't advance these threads without approval",
         overdue=is_overdue,
         created_ts=oldest_ts,
-        count=len(files),
+        count=len(drafts),
     ))
     return tasks
 
@@ -673,7 +716,7 @@ def _gather_anthropic_billing() -> list[Task]:
         section="MANUAL FIXES",
         priority="P0",
         label=f"Anthropic billing failure — {len(skip_events)} full-chain skip(s) in last 24h",
-        detail=f"claude-opus-4-7 failing. {balance_note}  |  console.anthropic.com/settings/billing",
+        detail=f"claude-opus-4-8 failing. {balance_note}  |  console.anthropic.com/settings/billing",
         est_mins=5,
         blocked="All review-route LLM jobs fail silently (auto-drafts, reply router, Fenix)",
         overdue=False,

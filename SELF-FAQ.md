@@ -60,7 +60,7 @@ Check `jobs.last_error`. If same error twice in 24h → `status='escalated'` + T
 `runtime.engine.reap_stuck_subagents` runs on every heartbeat — it flips runs in `subagent_heartbeat` table to `status='ghosted'` after 20min without a beat. Check `~/rick-vault/operations/subagent-runs/sa_*.json` for the actual exit code + stderr.
 
 **Q: My LLM call is slow / falling back. What's happening?**
-Check `~/rick-vault/operations/llm-fallback-events.jsonl` (added 2026-04-22). Each line = one primary failure that fell through to a fallback. Filter by route to find which is broken. Default chain: `claude-sonnet-4-6` → `gpt-5.4-mini` → `claude-opus-4-6`.
+Check `~/rick-vault/operations/llm-fallback-events.jsonl` (added 2026-04-22). Each line = one primary failure that fell through to a fallback. Filter by route to find which is broken. Default chain: `claude-sonnet-4-6` → `gpt-5.4-mini` → `claude-opus-4-8`.
 
 **Q: A LaunchAgent isn't firing. What now?**
 1. `launchctl list | grep ai.rick.<name>` — confirm loaded.

@@ -31,6 +31,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sqlite3
@@ -51,7 +52,9 @@ if str(ROOT) not in sys.path:
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OPS_DIR = DATA_ROOT / "operations"
 STATE_FILE = OPS_DIR / "roast-lead-poll-state.json"
+LOCK_FILE = OPS_DIR / "roast-lead-poll.lock"
 LOG_FILE = OPS_DIR / "roast-lead-poll.jsonl"
+CONVERSIONS_LOG = DATA_ROOT / "logs" / "conversions.log"
 
 # Use MEETRICK_ROAST_API_BASE exclusively — do NOT inherit MEETRICK_API_BASE
 # which is shared with (and currently points at) the RSS Railway ingest
@@ -108,6 +111,45 @@ def _log(event: str, **fields: Any) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def _log_roast_capture(lead_id: str, payload: dict, source: str | None) -> None:
+    """Record a real roast capture in the conversion ledger.
+
+    This is intentionally tied to the live dispatch path only. Dry runs and
+    empty/test leads stay out of conversions.log so Fable grades real captures,
+    not instrumentation noise.
+    """
+    email = (payload.get("email") or "").strip()
+    domain = (payload.get("domain") or "").strip()
+    if not email and not domain:
+        return
+    # Reserved-test-domain guard (2026-07-13 ws-e): match on the EMAIL's domain
+    # too, not just the lead domain — a canary like test-roast-canary@example.com
+    # against a real site domain leaked into conversions.log and polluted grading.
+    email_domain = email.lower().rsplit("@", 1)[-1] if "@" in email else ""
+    if (
+        email.lower() in {"test@example.com", "user@example.com"}
+        or domain.endswith("example.com")
+        or email_domain in {"example.com", "example.org", "example.net"}
+    ):
+        return
+    try:
+        CONVERSIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": _utcnow_iso(),
+            "event": "roast_capture",
+            "stage": "capture",
+            "lead_id": lead_id,
+            "email": email,
+            "domain": domain,
+            "url": payload.get("url") or "",
+            "source": source or "roast_capture",
+        }
+        with CONVERSIONS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        _log("conversion_log.error", lead_id=lead_id, error=str(e)[:200])
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +264,18 @@ def main() -> int:
 
     _ensure_dirs()
 
+    # Single-instance lock — the cursor is read at start and written at end,
+    # so two overlapping runs both see the old last_id and double-dispatch
+    # (observed 2026-07-13: rl_2bc7f76e15c7faf7 dispatched twice, 30s apart).
+    # Held for the whole run; released automatically on process exit.
+    lock_handle = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _log("run.skip.locked")
+        print("roast-lead-poll: another instance is running — skipping (no-op).")
+        return 0
+
     env_live = os.getenv("RICK_ROAST_LEAD_POLL_LIVE", "0").strip() == "1"
     live = env_live and not args.dry_run
     limit = max(1, min(100, args.limit))
@@ -270,7 +324,7 @@ def main() -> int:
             if not payload["email"] and not payload["domain"]:
                 skipped += 1
                 _log("dispatch.skip_empty", lead_id=lead_id)
-                if lead_id and lead_id > new_max:
+                if lead_id:
                     new_max = lead_id
                 continue
 
@@ -295,6 +349,7 @@ def main() -> int:
                         source=lead.get("source"),
                         info=info,
                     )
+                    _log_roast_capture(lead_id, payload, lead.get("source"))
                     # Lane Q bonus integration — fire roast-case-study drafter
                     # subprocess so Vlad gets a LinkedIn-shaped sharable card
                     # in the customer Telegram topic for every dispatched lead.
@@ -320,14 +375,20 @@ def main() -> int:
                 else:
                     failed += 1
                     _log("dispatch.fail", lead_id=lead_id, info=info)
-                    # Don't advance new_max past a failed lead — try again next run.
-                    continue
+                    # Don't advance new_max past a failed lead — stop the
+                    # batch here so it retries next run. (Ids are RANDOM hex;
+                    # the API returns rows in creation order and new_max must
+                    # track response order, never a lexicographic max —
+                    # continuing would let later leads bury this one.)
+                    break
 
-            if lead_id and lead_id > new_max:
+            if lead_id:
                 new_max = lead_id
         except Exception as e:
             failed += 1
             _log("dispatch.error", lead_id=lead.get("id"), error=str(e)[:200])
+            # Same cursor rule: never advance past a lead we failed to handle.
+            break
 
     # Advance state ONLY when live — dry-run must NOT mutate state, otherwise
     # a quick `--dry-run` accidentally skips real leads when live runs next

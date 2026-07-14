@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Rick Guardian — ONE consolidated deterministic watchdog (no LLM calls).
+
+Designed to run every 30 min via launchd; cheap and silent when healthy.
+
+Checks:
+  1. SESSION COST   — estimate per-session USD today from OpenClaw session
+                      JSONL usage records (~/.openclaw/agents/*/sessions/).
+                      OpenClaw records usage.cost.total as $0.00, so we
+                      compute est = tokens x config prices. Alerts when a
+                      single session exceeds per_session_cap_usd today, or
+                      total est spend exceeds RICK_LLM_DAILY_CAP_USD
+                      (default 15, env or rick.env).
+  2. SENDER WATCHDOG— alert if the email outbox (~/rick-vault/mailbox/outbox
+                      *.md durable queue used by email-sequence-send.py) has
+                      pending items older than 24h while delivered=0 in 24h.
+  3. WEBHOOK WATCH  — read-only GET /v1/webhook_endpoints; alert while the
+                      configured endpoint status != enabled (max once/day).
+  4. ZOMBIE DETECTOR— config-driven list of jobs whose log is active but
+                      whose side-effect artifacts have not been touched.
+  5. CHURN GUARD    — customers with status='canceling' lapsing within 7d.
+
+Alerts go to Telegram ops-alerts (same mechanism as
+anthropic-billing-watchdog.py), deduped via the notification_dedupe table
+(same pattern as runtime/engine.py notify_operator_deduped). If Telegram is
+unreachable, alerts append to ~/rick-vault/control/alerts-pending.jsonl.
+
+Idempotent, deduped, loud on its own failures (exit 2 + self-alert).
+
+Log: ~/rick-vault/operations/rick-guardian.jsonl
+Config: config/rick-guardian.json (pricing, caps, zombie job list)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Config / paths
+# ---------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_FILE = ROOT / "config" / "rick-guardian.json"
+DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+DB_FILE = DATA_ROOT / "runtime" / "rick-runtime.db"
+LOG_FILE = DATA_ROOT / "operations" / "rick-guardian.jsonl"
+ALERTS_FALLBACK = DATA_ROOT / "control" / "alerts-pending.jsonl"
+OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
+EMAIL_SEND_LOGS = [
+    DATA_ROOT / "operations" / "email-sends.jsonl",
+    DATA_ROOT / "operations" / "email-sequence-send.jsonl",
+]
+OPENCLAW_AGENTS_DIR = Path.home() / ".openclaw" / "agents"
+
+RICK_ENV_FILES = [
+    Path.home() / ".openclaw/workspace/config/rick.env",
+    Path.home() / "clawd/config/rick.env",
+]
+TEAM_CHAT_ID_DEFAULT = "-1003781085932"
+OPS_ALERTS_THREAD_ID = "34"
+TAIL_BYTES = 1024 * 1024  # only read the last 1MB of large send logs
+
+NOW = datetime.now(timezone.utc)
+TS = NOW.isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def log(entry: dict) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry.setdefault("ts", TS)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Env helper (never logs values) — same pattern as anthropic-billing-watchdog
+# ---------------------------------------------------------------------------
+def _rick_env(name: str) -> str:
+    val = os.getenv(name, "")
+    if val:
+        return val
+    for env_file in RICK_ENV_FILES:
+        if not env_file.exists():
+            continue
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Telegram alerting (ops-alerts topic, billing-watchdog convention)
+# ---------------------------------------------------------------------------
+def send_telegram_alert(text: str) -> tuple[bool, str]:
+    token = _rick_env("RICK_TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False, "RICK_TELEGRAM_BOT_TOKEN not set"
+    chat_id = _rick_env("RICK_TEAM_CHAT_ID") or TEAM_CHAT_ID_DEFAULT
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "message_thread_id": OPS_ALERTS_THREAD_ID,
+        "text": text,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            desc = json.loads(exc.read()).get("description", str(exc))
+        except Exception:
+            desc = str(exc)
+        return False, f"HTTP {exc.code}: {desc}"[:200]
+    except Exception as exc:
+        return False, str(exc)[:200]
+    if body.get("ok"):
+        return True, str(body.get("result", {}).get("message_id", "?"))
+    return False, str(body.get("description", body))[:200]
+
+
+# ---------------------------------------------------------------------------
+# Dedupe via notification_dedupe (pattern from engine.notify_operator_deduped)
+# ---------------------------------------------------------------------------
+def _dedup_hash(text: str, kind: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha1(f"{kind}|{normalized}".encode("utf-8")).hexdigest()[:16]
+
+def _dedup_allowed(kind: str, text: str, window_hours: int) -> bool:
+    """True if this alert should be sent (first-seen or window elapsed)."""
+    h = _dedup_hash(text, kind)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    con = sqlite3.connect(DB_FILE, timeout=5)
+    try:
+        row = con.execute(
+            "SELECT last_alerted_at, count_since_alert FROM notification_dedupe "
+            "WHERE dedup_hash = ?",
+            (h,),
+        ).fetchone()
+        if row is None:
+            con.execute(
+                "INSERT INTO notification_dedupe (dedup_hash, kind, first_seen_at, "
+                "last_alerted_at, count_since_alert, last_text, total_seen) "
+                "VALUES (?, ?, ?, ?, 0, ?, 1)",
+                (h, kind, now_iso, now_iso, text[:500]),
+            )
+            con.commit()
+            return True
+        try:
+            last_alerted = datetime.fromisoformat(row[0])
+        except (ValueError, TypeError):
+            last_alerted = datetime.now() - timedelta(hours=window_hours + 1)
+        if datetime.now() - last_alerted >= timedelta(hours=window_hours):
+            con.execute(
+                "UPDATE notification_dedupe SET last_alerted_at=?, count_since_alert=0, "
+                "last_text=?, total_seen=total_seen+1 WHERE dedup_hash=?",
+                (now_iso, text[:500], h),
+            )
+            con.commit()
+            return True
+        con.execute(
+            "UPDATE notification_dedupe SET count_since_alert=count_since_alert+1, "
+            "total_seen=total_seen+1, last_text=? WHERE dedup_hash=?",
+            (text[:500], h),
+        )
+        con.commit()
+        return False
+    finally:
+        con.close()
+
+
+def alert(kind: str, text: str, window_hours: int = 24) -> str:
+    """Dedupe -> Telegram -> fallback file. Returns disposition string."""
+    try:
+        allowed = _dedup_allowed(kind, text, window_hours)
+    except Exception as exc:
+        # Dedup must never swallow a real alert
+        log({"event": "dedup_error", "kind": kind, "error": str(exc)[:200]})
+        allowed = True
+    if not allowed:
+        log({"event": "alert_suppressed", "kind": kind, "text": text[:200]})
+        return "suppressed"
+    tg_ok, tg_detail = send_telegram_alert(text)
+    if tg_ok:
+        log({"event": "alert_sent", "kind": kind, "message_id": tg_detail,
+             "text": text[:300]})
+        return "sent"
+    ALERTS_FALLBACK.parent.mkdir(parents=True, exist_ok=True)
+    with ALERTS_FALLBACK.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": TS, "kind": kind, "text": text,
+                            "telegram_error": tg_detail}) + "\n")
+    log({"event": "alert_fallback_file", "kind": kind,
+         "telegram_error": tg_detail, "text": text[:300]})
+    return "fallback_file"
+
+
+# ---------------------------------------------------------------------------
+# Check 1: session cost (OpenClaw session JSONL -> est USD today)
+# ---------------------------------------------------------------------------
+def _price(pricing_sorted: list, model: str, tok: list) -> float | None:
+    for key, rates in pricing_sorted:
+        if key in model:
+            return (tok[0] * rates[0] + tok[1] * rates[1]
+                    + tok[2] * rates[2] + tok[3] * rates[3]) / 1e6
+    return None
+
+def check_session_cost(cfg: dict, alerts: list) -> dict:
+    pricing_sorted = sorted(cfg["session_pricing"].items(),
+                            key=lambda kv: len(kv[0]), reverse=True)
+    per_session_cap = float(cfg.get("per_session_cap_usd", 5.0))
+    daily_cap = float(_rick_env("RICK_LLM_DAILY_CAP_USD")
+                      or cfg.get("daily_cap_usd_default", 15.0))
+    today = TS[:10]
+    midnight = datetime(NOW.year, NOW.month, NOW.day,
+                        tzinfo=timezone.utc).timestamp()
+
+    session_files: list[str] = []
+    for agent_dir in OPENCLAW_AGENTS_DIR.glob("*/sessions"):
+        with os.scandir(agent_dir) as it:
+            for e in it:
+                if not e.name.endswith(".jsonl") or "trajectory" in e.name:
+                    continue
+                if e.stat().st_mtime >= midnight:
+                    session_files.append(e.path)
+
+    per_session: dict[str, float] = {}
+    per_session_models: dict[str, dict] = {}
+    unpriced_tokens = 0
+    for path in session_files:
+        est = 0.0
+        models: dict[str, float] = {}
+        try:
+            with open(path, "r", errors="replace") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "message":
+                        continue
+                    if str(d.get("timestamp", ""))[:10] != today:
+                        continue
+                    m = d.get("message") or {}
+                    if m.get("role") != "assistant":
+                        continue
+                    u = m.get("usage")
+                    if not u:
+                        continue
+                    tok = [u.get("input", 0) or 0, u.get("output", 0) or 0,
+                           u.get("cacheRead", 0) or 0, u.get("cacheWrite", 0) or 0]
+                    model = m.get("model") or "unknown"
+                    cost = _price(pricing_sorted, model, tok)
+                    if cost is None:
+                        unpriced_tokens += sum(tok)
+                        continue
+                    est += cost
+                    models[model] = models.get(model, 0.0) + cost
+        except OSError:
+            continue
+        if est > 0:
+            key = Path(path).name
+            per_session[key] = est
+            per_session_models[key] = models
+
+    total = sum(per_session.values())
+    top = sorted(per_session.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
+    for name, est in per_session.items():
+        if est > per_session_cap:
+            model_bits = ", ".join(
+                f"{k} ${v:.2f}" for k, v in sorted(
+                    per_session_models[name].items(),
+                    key=lambda kv: kv[1], reverse=True)[:3])
+            alerts.append(alert(
+                "guardian:session_cost",
+                f"🚨 [rick-guardian] Session {name} est ${est:.2f} today "
+                f"({today}) — over ${per_session_cap:.2f}/session cap. "
+                f"Models: {model_bits}. Runaway-session risk (Jul 10 pattern).",
+            ))
+    if total > daily_cap:
+        alerts.append(alert(
+            "guardian:daily_llm_spend",
+            f"🚨 [rick-guardian] Total est LLM spend ${total:.2f} today "
+            f"({today}) exceeds daily cap ${daily_cap:.2f} "
+            f"(RICK_LLM_DAILY_CAP_USD). Top sessions: "
+            + ", ".join(f"{n} ${e:.2f}" for n, e in top),
+        ))
+    return {
+        "sessions_with_spend": len(per_session),
+        "files_scanned": len(session_files),
+        "est_total_usd": round(total, 2),
+        "daily_cap_usd": daily_cap,
+        "per_session_cap_usd": per_session_cap,
+        "top_sessions": [{"file": n, "est_usd": round(e, 2)} for n, e in top],
+        "unpriced_tokens": unpriced_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check 2: sender watchdog (outbox pending >24h while delivered=0)
+# ---------------------------------------------------------------------------
+def _tail_lines(path: Path) -> list[str]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+                f.readline()  # drop partial line
+            return f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+def check_sender(alerts: list) -> dict:
+    pending = list(OUTBOX_DIR.rglob("*.md")) if OUTBOX_DIR.exists() else []
+    oldest_age_h = 0.0
+    if pending:
+        oldest = min(p.stat().st_mtime for p in pending)
+        oldest_age_h = (NOW.timestamp() - oldest) / 3600.0
+
+    cutoff = NOW - timedelta(hours=24)
+    delivered_24h = 0
+    for log_path in EMAIL_SEND_LOGS:
+        for line in _tail_lines(log_path):
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("status") != "sent":
+                continue
+            ts_raw = str(row.get("ts") or row.get("timestamp") or "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                delivered_24h += 1
+
+    stuck = len(pending) > 0 and oldest_age_h >= 24 and delivered_24h == 0
+    if stuck:
+        alerts.append(alert(
+            "guardian:sender_stuck",
+            f"🚨 [rick-guardian] Email queue STUCK: {len(pending)} pending "
+            f"draft(s) in mailbox/outbox, oldest {oldest_age_h:.0f}h old, "
+            f"0 delivered in 24h. Check email-sequence-send / channel pause.",
+        ))
+    return {
+        "pending": len(pending),
+        "oldest_pending_hours": round(oldest_age_h, 1),
+        "delivered_24h": delivered_24h,
+        "stuck": stuck,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check 3: Stripe webhook endpoint status (read-only GET)
+# ---------------------------------------------------------------------------
+def check_stripe_webhook(cfg: dict, alerts: list) -> dict:
+    webhook_id = cfg.get("stripe_webhook_id", "")
+    key = _rick_env("STRIPE_SECRET_KEY")
+    if not key:
+        raise RuntimeError("STRIPE_SECRET_KEY not available")
+    req = urllib.request.Request(
+        "https://api.stripe.com/v1/webhook_endpoints?limit=100",
+        headers={"Authorization": f"Bearer {key}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = json.loads(resp.read())
+    status = None
+    for ep in body.get("data", []):
+        if ep.get("id") == webhook_id:
+            status = ep.get("status")
+            break
+    if status != "enabled":
+        alerts.append(alert(
+            "guardian:stripe_webhook",
+            f"🚨 [rick-guardian] Stripe webhook {webhook_id} status="
+            f"{status or 'NOT FOUND'} (want: enabled). Payment events are "
+            f"not reaching Rick until this is re-enabled in Stripe dashboard.",
+            window_hours=24,
+        ))
+    return {"webhook_id": webhook_id, "status": status or "not_found",
+            "endpoints_listed": len(body.get("data", []))}
+
+
+# ---------------------------------------------------------------------------
+# Check 4: zombie detector (log active, artifacts untouched)
+# ---------------------------------------------------------------------------
+def check_zombies(cfg: dict, alerts: list) -> dict:
+    results = []
+    for job in cfg.get("zombie_jobs", []):
+        name = job.get("name", "?")
+        quiet_h = float(job.get("max_quiet_hours", 48))
+        window = NOW.timestamp() - quiet_h * 3600
+        log_path = Path(os.path.expanduser(job.get("log", "")))
+        if not log_path.exists():
+            results.append({"name": name, "state": "log_missing"})
+            continue
+        if log_path.stat().st_mtime < window:
+            results.append({"name": name, "state": "not_running"})
+            continue
+        artifacts = [Path(os.path.expanduser(a)) for a in job.get("artifacts", [])]
+        fresh = [a for a in artifacts
+                 if a.exists() and a.stat().st_mtime >= window]
+        if fresh:
+            results.append({"name": name, "state": "healthy"})
+            continue
+        results.append({"name": name, "state": "zombie"})
+        alerts.append(alert(
+            f"guardian:zombie:{name}",
+            f"⚠️ [rick-guardian] ZOMBIE job '{name}': log active within "
+            f"{quiet_h:.0f}h but no side-effect artifacts touched "
+            f"({', '.join(str(a) for a in artifacts)}). It runs but "
+            f"produces nothing.",
+        ))
+    return {"jobs": results,
+            "zombies": [r["name"] for r in results if r["state"] == "zombie"]}
+
+
+# ---------------------------------------------------------------------------
+# Check 5: churn guard (customers canceling with lapse <=7d away)
+# ---------------------------------------------------------------------------
+_DATE_KEYS = ("cancel_at", "cancel_date", "current_period_end", "lapse_at",
+              "ends_at", "period_end")
+
+def _parse_lapse(meta: dict):
+    for key in _DATE_KEYS:
+        raw = meta.get(key)
+        if raw in (None, "", 0):
+            continue
+        if isinstance(raw, (int, float)):
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+def check_churn(alerts: list) -> dict:
+    con = sqlite3.connect(DB_FILE, timeout=5)
+    try:
+        rows = con.execute(
+            "SELECT id, email, metadata_json FROM customers "
+            "WHERE status = 'canceling'"
+        ).fetchall()
+    finally:
+        con.close()
+    lapsing = []
+    for cid, email, meta_raw in rows:
+        try:
+            meta = json.loads(meta_raw or "{}")
+        except Exception:
+            meta = {}
+        lapse = _parse_lapse(meta)
+        days_left = None
+        if lapse is not None:
+            days_left = (lapse - NOW).total_seconds() / 86400.0
+        entry = {"id": cid, "email": email,
+                 "days_left": round(days_left, 1) if days_left is not None else None}
+        if days_left is not None and days_left <= 7:
+            lapsing.append(entry)
+            alerts.append(alert(
+                f"guardian:churn:{cid}",
+                f"🚨 [rick-guardian] CHURN: {email} is canceling and lapses "
+                f"in {days_left:.1f} day(s). Save-play window is closing.",
+            ))
+        elif lapse is None:
+            # No lapse date recorded — could already be inside the 7d window.
+            # Err loud (once/day) rather than silently missing a save window.
+            lapsing.append({**entry, "note": "no lapse date in metadata"})
+            alerts.append(alert(
+                f"guardian:churn:{cid}",
+                f"🚨 [rick-guardian] CHURN: {email} is canceling but has NO "
+                f"lapse date in customers.metadata_json — cannot tell how "
+                f"close the deadline is. Sync cancel_at/current_period_end "
+                f"from Stripe.",
+            ))
+    return {"canceling": len(rows), "lapsing_7d_or_unknown": lapsing}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        msg = f"🚨 [rick-guardian] SELF-FAILURE: cannot read config {CONFIG_FILE}: {exc}"
+        print(msg, file=sys.stderr)
+        try:
+            alert("guardian:self_error", msg, window_hours=6)
+        except Exception:
+            pass
+        log({"event": "self_error", "error": str(exc)[:300]})
+        return 2
+
+    checks = [
+        ("session_cost", lambda a: check_session_cost(cfg, a)),
+        ("sender", check_sender),
+        ("stripe_webhook", lambda a: check_stripe_webhook(cfg, a)),
+        ("zombies", lambda a: check_zombies(cfg, a)),
+        ("churn", check_churn),
+    ]
+    alerts: list[str] = []
+    results: dict = {}
+    errors: list[str] = []
+    for name, fn in checks:
+        try:
+            results[name] = fn(alerts)
+        except Exception as exc:
+            errors.append(name)
+            results[name] = {"error": str(exc)[:300]}
+            alerts.append(alert(
+                "guardian:self_error",
+                f"🚨 [rick-guardian] check '{name}' crashed: {str(exc)[:200]}",
+                window_hours=6,
+            ))
+
+    fired = [a for a in alerts if a in ("sent", "fallback_file")]
+    log({"event": "run", "results": results, "alerts": alerts,
+         "errors": errors})
+
+    for name, _ in checks:
+        print(f"[{TS}] {name}: {json.dumps(results[name], default=str)[:300]}")
+    print(f"[{TS}] alerts fired={len(fired)} suppressed="
+          f"{alerts.count('suppressed')} check_errors={len(errors)}")
+
+    if errors:
+        return 2
+    return 1 if fired else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,32 @@
+{
+  "spend_threshold_usd": 500,
+  "always_ask": [
+    "legal",
+    "compliance",
+    "irreversible-brand",
+    "token-launch",
+    "production-architecture",
+    "fiverr-gig-publish",
+    "fiverr-delivery"
+  ],
+  "act_then_notify": [
+    "reversible-content",
+    "reversible-site-change",
+    "routine-ops-fix",
+    "fiverr-inquiry-response",
+    "launch"
+  ],
+  "overnight_mode": {
+    "allowed_actions": [
+      "reversible-content",
+      "reversible-site-change",
+      "routine-ops-fix",
+      "fiverr-inquiry-response",
+      "launch"
+    ],
+    "still_requires_approval": [
+      "fiverr-gig-publish",
+      "fiverr-delivery"
+    ]
+  }
+}

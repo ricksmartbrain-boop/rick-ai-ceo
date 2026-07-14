@@ -1,0 +1,146 @@
+workflow_uid,canonical_title,kind,status,owner,created_at,last_seen_at,source_paths_count,aliases_count,objective_fingerprint
+wf_93bbc08e98b7,adaptive heartbeat scheduler,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3c28d6e6ee1f533b
+wf_2cff89b8bdf3,adaptive heartbeat scheduler,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,3cbe5612da0c8e62
+wf_b1a4b431878e,adaptive trigger governor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,e66ec87861920599
+wf_0a19c8bde20c,adaptive trigger governor,automation control,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,db3facaa02ad3ea9
+wf_aab50c449a5f,admission canonicalization gateway v4,intake quality,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,375326f66f316935
+wf_a24052b9c00a,authoritative family control plane,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,f5488817e9d13e6c
+wf_9e9dff72ac0d,authoritative family control plane,control plane,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,af6b76ce9afe968c
+wf_52ccb1fc5c0d,authoritative workflow family registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,167cc9d382d449d9
+wf_bdd73a759fa4,authoritative workflow family registry,control plane,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,9f553d300e3c83f9
+wf_8458d3ec0610,blocker storm suppressor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,aa76bf53ad9212d9
+wf_058a71fbc5dd,canonical admission gateway v3,intake quality,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,d827a6b6bf53ebee
+wf_3bc1246d82d4,canonical initiative registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,c79444587de15b4c
+wf_2c17d7dbb0f0,canonical initiative registry,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,11,11,ae1aa209a3a56dad
+wf_712aa2d12eca,canonical run admission controller,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,8420ff74a55a31de
+wf_e39a1f421404,canonical run admission controller,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,d78c1cf1d4c99754
+wf_b4458746ecb2,canonical workflow admission gateway v3,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,e2510bd354177813
+wf_ba89813b8f5b,canonical workflow admission gateway v3,intake quality,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,1ee76e8593eaaede
+wf_975e6a0dc440,canonical workflow contract test suite,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,a5ab7252fa43492a
+wf_e6be6a0afe45,canonical workflow identity service,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,918967c2bbb6e284
+wf_c1a5abdd76fb,canonical workflow identity service,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,427c76100ab049df
+wf_87d4a906d644,canonical workflow spec normalizer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,87447cb206c53031
+wf_9adf4300b12f,canonical workflow spec normalizer,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,0d40d5cc0cc55446
+wf_509c5e036a03,churn budget dashboard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,4f81dae119c4dd24
+wf_73c7f48970e0,completion aware heartbeat scheduler,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,c8b6b02c3a888ffd
+wf_438f45b52a4a,completion evidence registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,16d769a244eefd6a
+wf_df3ac05120a0,completion evidence registry,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,c6d5446a8c17c98c
+wf_53ae836427c7,completion proof enforcer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,48409df9c247d650
+wf_5b7e0bd341c7,completion proof enforcer,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,80d175fede5f43c1
+wf_23dc7b44a5b0,control plane observability pack,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,4a5ee5579b894c05
+wf_9ad95f980e7d,creation time payload sanitizer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,85d36b39142cc073
+wf_19f5dd97583f,creation time payload sanitizer,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,0d0349322116046d
+wf_5a7154373764,daemon health monitor with alerting,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,76eb3a13979c45eb
+wf_2a369b449113,daemon health monitor with alerting,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,33f9e27061b3be1f
+wf_e8ed878d4c35,daily proof wall,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3d831501867b2099
+wf_2fa7bc5481ae,daily proof wall,dashboard,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,9d1390f726bccd2a
+wf_38701b81aa25,daily ship gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,100b3143b0a3d0ad
+wf_1261e3139edc,daily ship gate,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,10,10,769685e494e4d8f6
+wf_06f47b762ac1,deterministic orchestrator gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,90c59f21e4cbebcd
+wf_29c051062e05,deterministic orchestrator gate,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,701bc62f8d5d2afb
+wf_3c15514d17ce,evidence backed completion orchestrator,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,1d4a5dba27bd8a59
+wf_1dbef52531cf,evidence backed completion orchestrator,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,8b23c7711353a723
+wf_d1b9a73b81a7,execution lease manager,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,86cf8c47d4a385f2
+wf_c92275768c6f,execution lease manager,scheduler reliability,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,3af8eafa9a932ddc
+wf_bc3c5741da55,external proof collector,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,2fbfb43bb27157a1
+wf_308cc4b5a222,family aware heartbeat suppression layer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,490ffcdee0afb005
+wf_8beb2b51a9dc,family idempotency gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,68fc0d2895c307b1
+wf_52b600d4f5ef,family idempotency gate,workflow platform control,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,04d55d3ba91cefee
+wf_7ea7ac758289,family lifecycle authority,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,0046ff0a07f657a7
+wf_1d687e327fb0,family lifecycle authority,control plane,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,7483ce11cca92a48
+wf_dda4bd817427,follow up sla board,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,14b75cb7edaf83dc
+wf_c78a8f509732,fulfillment delivery reliability layer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,7a2a3325469fe8f3
+wf_f78778cc6d90,fulfillment pipeline auto recovery dag,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,5fe651df91763e90
+wf_7917f7942cc5,fulfillment pipeline auto recovery dag,new workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,2f9e012e2a79b8cd
+wf_87cd2db6acc2,inbox idempotency guard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ff463e77ed2e3790
+wf_239b17fe65ef,incident centric daemon supervisor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,7e9771a4e021d788
+wf_899bc44575bd,incident circuit breaker + alert compres,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,59c103bb1b656868
+wf_aaa51d736cc9,incident circuit breaker alert compression,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,0cb1950d0dd46fcc
+wf_b93e1a023054,incident lifecycle console,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,e6b0642f838bc51f
+wf_b7d085c06e2a,incident object + cooldown manager,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,c5be49ef11ea4db8
+wf_9c2dc75672da,incident object cooldown manager,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,5fe2f97752db1a2d
+wf_7ac5581bc27d,initiative idempotency layer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,e123ad854c438270
+wf_0db4ff82e249,initiative idempotency layer,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,f744444b9776149d
+wf_e4f6de7f4c05,initiative merge assistant,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,98e3044492476e07
+wf_ad98bee5fb75,input validation gate for inbound reques,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ae1d82a92ba46655
+wf_2799fd262933,landing page contract tester,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,8ec6427c962ce03f
+wf_d3d45033669e,landing page contract tester,quality guardrail,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,28a1870ec5351787
+wf_350df3b85d96,landing page quality gate pipeline,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3b33f361b3409dec
+wf_2ab214e20050,landing page quality gate pipeline,quality control,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,22094680d5da7296
+wf_a8e6be49bf4e,landing page release controller,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b43bc474dcf4d52e
+wf_8e9249fd7e3d,landing page release controller,quality control,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,ed24e48f83db5187
+wf_2fe65514adb6,landing page step diagnostic workflow,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b7c3590fc7296b73
+wf_3d25baff8855,landing page step diagnostic workflow,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,a30b7b9c5fd0f50e
+wf_7e37ac32f354,landing page step repair and smoke test,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,9556a3cacd7ce251
+wf_1f8daa625550,landing page step repair and smoke test,bug fix workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,df0b72c2f6d49f59
+wf_6d309a39a80a,ledger integrity monitor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,8f928b1e1f055106
+wf_2f724cd0b98f,ledger integrity monitor,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,13e51eef00eff00f
+wf_c270884fa4e2,ops quality scorecard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,bd34d0b703643347
+wf_8b3366db518d,ops vs output scoreboard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,c9fbf9271dd8dd5e
+wf_5ee62d476e57,ops vs output scoreboard,dashboard,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,3,3,25676150334342c5
+wf_db71b416376a,orchestration regression dashboard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,6c347e5463829763
+wf_9d713027f73a,outbound escalation triage layer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b6037c871678d4f5
+wf_b0ed1bcf0ef1,outcome first scheduler,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,bc72081b9258b293
+wf_84e1aca98c32,outcome first scheduler,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,354468fe36d9c725
+wf_175570240c94,outcome proof gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3c08c632f84a9c87
+wf_1a0d0bd81730,outcome proof gate,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,3b35aa3c81e018b0
+wf_9d6e40d022f8,outcome quota dashboard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3fed078da2f620ff
+wf_bbd833d1c8c0,pipeline balance planner,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,71dc3c9732d71190
+wf_7f2fb5aa3a1b,pre admission canonicalization gateway v,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,627c924020de3021
+wf_83191f313b52,pre admission canonicalization gateway v2,intake quality,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,2,2,31bffec7f282f0a7
+wf_28bd25c214dc,pre queue canonical admission gateway,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ad2fb957c6075d46
+wf_8c413222d032,pre queue canonical admission gateway,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,80fbb10e779e7f8e
+wf_72b3322ca538,preflight gatekeeper for landing page ou,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ecc92e8c07b91891
+wf_ebde2cb6e385,preflight gatekeeper for landing page outputs,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,c71a4919fe79f942
+wf_ec8c2d76ba87,proof of work minimum,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,104084fbe7797842
+wf_cf166baf2825,proof of work minimum,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,3,3,c136df9e726ffdc0
+wf_2cc6154f3729,queue hygiene linter,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,8033e35f5c1b4d96
+wf_7b5d59b1fd0f,reflection coverage reconciler,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,f8a3a2c4133130cc
+wf_23149730882e,retry budget and cooldown governor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ee90020f95bb04ea
+wf_2ff01a217e45,retry budget and cooldown governor,reliability control,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,a7b9270007e9873a
+wf_d1d2bf82701b,run budget governor,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,bc8bf42ed43029d6
+wf_d816e54a3f24,run churn observatory,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,3d70644a6974c23c
+wf_8732cc644f08,run churn observatory,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,f8a9ec919f931abc
+wf_da4d7b6ffed2,run deduplication controller,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b3403b92c3e4eab3
+wf_d704be1304b9,run deduplication controller,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,0903fb0cf0478369
+wf_8af4297348e2,run family deduplicator,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ab81fc5bda1b3d22
+wf_c788d9c4e436,run family deduplicator,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,08f5fdac3c5dcb99
+wf_e80b8218f9aa,run receipt and suppression registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,77eeed085f3dc941
+wf_94b8fee3bc3e,run receipt and suppression registry,control plane,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,29bf8308e1f04ae8
+wf_e71b2893659e,scheduler eligibility engine,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b21c91d3cac81c56
+wf_ddf9a666750f,scheduler eligibility engine,scheduler improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,121ce16c96f444d5
+wf_814386fe0267,scheduler quiet mode with terminal proof,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,77434f1a5e5a4e10
+wf_fa146c933532,scheduler quiet mode with terminal proofs,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,498c364d92833f63
+wf_e89e344ef63f,ship something: shipping cadence stalled,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,ee13a1d2bc46bbda
+wf_2650e115aaf3,signal hunt scan meetrick icp v1,unknown,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,bf44d43892271994
+wf_38c10e508b21,smart heartbeat throttle,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,1938aa97984c9b5d
+wf_671cfeba814a,smart heartbeat throttle,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,d45f70abd79c0a6e
+wf_fc8c166e2ce3,spec and title sanitizer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,289e0ad5061784de
+wf_7886488e2a23,spec and title sanitizer,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,9fdf86ebd3edf042
+wf_740480beb8fc,step idempotency and run lock middleware,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,117faec4d37d6a1b
+wf_5f56eb1c5947,step idempotency and run lock middleware,execution safety,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,46a56e83f555fb0d
+wf_e875296dd51a,trigger provenance and idempotency dashb,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,b3153fa59b6ed8de
+wf_e226d14d2077,unblock: signal hunt scan,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,9e53f63a8c06fdd8
+wf_5ec34c4f7cd8,unblock: the agent memory playbook,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,cb13f2d2cbba0e57
+wf_ca35476bda11,unblock: unblock: initiative: {'title':,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,da2939b08b3e3414
+wf_cce469d847f2,unblock: unblock: signal hunt scan,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,d3f600769236e193
+wf_6c299a3502e6,unblock: working title,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,d6fcd84e09cd6f0d
+wf_6c93843558df,unified orchestration control plane,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,a694820e6ff08456
+wf_c5536c9dda56,unified orchestration control plane,workflow platform,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,38a30e470a0c60db
+wf_e028eeff9510,unified orchestration policy engine,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,91e6dec7252748c0
+wf_d4d25ed3558e,unified output release gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,d9d5bc6d322e574b
+wf_19a3ac03c268,unified workflow invocation registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,1cd8ff4ea1d2b2ed
+wf_746783ace6b7,unified workflow invocation registry,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,e9a95f76b50d11d2
+wf_df443cdcfcb9,verified completion gate,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,11360820442dc91b
+wf_548371442ae4,verified completion gate,automation,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,60a6a226b292a10e
+wf_d8ba090da0c4,workflow adoption review,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,6cc5acb76a233de8
+wf_f48045438873,workflow completion guardrail,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,e1f0ffc5c7b63417
+wf_bd0c8dcbca69,workflow completion guardrail,workflow,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,3,3,1b8f3c2e1bffc5d8
+wf_27efaa16fa7e,workflow deduplication guard,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,6784024f4d7c3c8f
+wf_dac4cc69236c,workflow deduplication guard,system improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,03598c7f909441a9
+wf_ac2d763f60f2,workflow family canonicalizer,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,bf609983a41397c4
+wf_8bef571c1e6e,workflow family identity service,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,0e702169df283f06
+wf_6e719a01ae2c,workflow family identity service,control plane,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,3,3,b5378eab6edc64ad
+wf_9cfa1da4204e,workflow family state machine,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,4cadd2d308ad2ff7
+wf_84c647e9ed5c,workflow family state machine,workflow improvement,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:39:25+00:00,1,1,7002cd8a053e08d6
+wf_b736a99b9e4f,workflow idempotency registry,initiative,queued,rick,2026-05-23T10:21:29+00:00,2026-05-23T10:21:29+00:00,1,0,415c16e054180733

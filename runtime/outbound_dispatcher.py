@@ -306,9 +306,26 @@ def _process_one(conn, job) -> dict:
             summary["status"] = f"fenix-{gate['action']}"
             summary["reason"] = gate["reason"]
             return summary
-    except Exception:
-        # Never let the gate itself break the send pipeline.
-        pass
+    except Exception as exc:
+        # Observe mode: never let the gate itself break the send pipeline.
+        # LIVE mode: a crashed gate must fail CLOSED, not open — otherwise
+        # the flag promises protection the pipeline doesn't deliver.
+        if os.getenv("RICK_FENIX_LIVE", "").strip() == "1":
+            conn.execute(
+                """
+                UPDATE outbound_jobs
+                   SET status='fenix-error',
+                       last_error=?,
+                       finished_at=?,
+                       attempts=attempts+1
+                 WHERE id=?
+                """,
+                (f"fenix gate crashed: {type(exc).__name__}: {exc}"[:400], _now_iso(), job["id"]),
+            )
+            conn.commit()
+            summary["status"] = "fenix-error"
+            summary["reason"] = f"fenix gate crashed while live: {type(exc).__name__}"
+            return summary
 
     attempts = int(job["attempts"] or 0) + 1
     try:

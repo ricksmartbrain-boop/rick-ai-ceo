@@ -1,0 +1,36 @@
+{
+  "products": {
+    "404-agency": {
+      "current_mrr": 0,
+      "target_mrr": 5000,
+      "priority": "P2"
+    },
+    "personal-brand": {
+      "current_mrr": 0,
+      "target_mrr": 15000,
+      "priority": "P1"
+    },
+    "info-products": {
+      "current_mrr": 0,
+      "target_mrr": 40000,
+      "priority": "P1"
+    },
+    "lingualive": {
+      "current_mrr": 31.96,
+      "target_mrr": 10000,
+      "priority": "P3",
+      "owner": "khrystyna",
+      "rick_attributable": false,
+      "note": "PORTFOLIO (not Rick's revenue) — Rick handles fulfillment ops only. 4x $7.99 subs (Stripe 2026-07-13). 2 already canceling: haeuslsi ends 2026-07-19, diane 2026-07-29 -> drops to 15.98. Product built/operated by Khrystyna; Rick had zero acquisition role. Never count in Rick MRR."
+    },
+    "meetrick.ai": {
+      "name": "meetrick.ai",
+      "current_mrr": 9.0,
+      "growth_potential": 9,
+      "speed_to_cash": 8,
+      "strategic_value": 9,
+      "status": "active",
+      "note": "1 real customer: Rick Pro $9/mo since 2026-03-23. $0 ever at $29/$499 tiers. Old revenue_now=538 was phantom (2x $269 legacy Folderly subs in the shared Stripe account). Rick MRR (meetrick only) = 9.0; LinguaLive 31.96 is portfolio (Khrystyna's, not Rick's) and drops to 15.98 after 2026-07-29 churn — report the two numbers separately, never summed. Source: Stripe 2026-07-13, owner-confirmed attribution."
+    }
+  }
+}

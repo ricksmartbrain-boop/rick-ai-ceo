@@ -1,0 +1,21 @@
+const { chromium } = require('/opt/homebrew/lib/node_modules/playwright');
+(async()=>{
+ const browser=await chromium.connectOverCDP('http://127.0.0.1:9225');
+ const p=browser.contexts()[0].pages()[0];
+ await p.goto('https://www.linkedin.com/feed/',{waitUntil:'domcontentloaded',timeout:30000});
+ await p.waitForTimeout(4000);
+ const btn = p.locator('[role="button"]').filter({ hasText: 'Start a post' }).first();
+ const box = await btn.boundingBox();
+ if (box) await p.mouse.click(box.x+box.width/2, box.y+box.height/2);
+ await p.waitForTimeout(3000);
+ const composer = p.locator('[role="dialog"]').filter({ hasText: 'What do you want to talk about?' }).first();
+ const editor = composer.getByRole('textbox').first();
+ console.log('before', await editor.evaluate(el => ({text: el.innerText, html: el.innerHTML, cls: el.className})));
+ await editor.click({timeout:10000});
+ await p.keyboard.insertText('hello world');
+ await p.waitForTimeout(1000);
+ console.log('after', await editor.evaluate(el => ({text: el.innerText, html: el.innerHTML, cls: el.className})));
+ const btns = await composer.getByRole('button').evaluateAll(els => els.map(el => ({t:(el.textContent||'').trim(), aria:el.getAttribute('aria-label')||'', disabled:el.disabled||el.getAttribute('aria-disabled')})));
+ console.log(JSON.stringify(btns.slice(0,10), null, 2));
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

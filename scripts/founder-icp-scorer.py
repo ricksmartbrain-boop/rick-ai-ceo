@@ -10,7 +10,7 @@ Inputs:
   - homepage text (or a homepage URL that will be fetched)
 
 Primary gate:
-  route='review' → claude-opus-4-7 via runtime.llm.generate_text
+  route='review' → claude-opus-4-8 via runtime.llm.generate_text
 
 Examples:
   python3 scripts/founder-icp-scorer.py --email hi@acme.dev --domain acme.dev --homepage-url https://acme.dev
@@ -438,7 +438,7 @@ def _as_row(record: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     _load_env_files()
-    ap = argparse.ArgumentParser(description="Score founder ICP fit using opus-4-7 (route=review).")
+    ap = argparse.ArgumentParser(description="Score founder ICP fit using opus-4-8 (route=review).")
     ap.add_argument("--email", default="")
     ap.add_argument("--domain", default="")
     ap.add_argument("--homepage-text", default="")

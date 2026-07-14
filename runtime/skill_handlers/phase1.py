@@ -195,7 +195,7 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "- intent: string (what they want)\n"
         "- urgency: low/medium/high\n"
         "- budget_signal: string (any price/budget mentions)\n"
-        "- best_product_match: string (one of: starter-kit-9, playbook-29, toolkit-97, managed-499, enterprise-2500)\n"
+        "- best_product_match: string (one of: free-roast, rick-pro-29, managed-499)\n"
         "- summary: 1-2 sentence lead summary\n"
         "Output ONLY valid JSON."
         f"{pattern_context}"
@@ -207,7 +207,7 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "intent": "general inquiry",
         "urgency": "medium",
         "budget_signal": "none detected",
-        "best_product_match": "playbook-29",
+        "best_product_match": "rick-pro-29",
         "summary": f"Inbound lead from {lead_source}.",
     })
     result = generate_text("analysis", prompt, fallback)
@@ -314,7 +314,7 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
             try:
                 txt = intake_md.read_text(encoding="utf-8", errors="replace")
                 dossier = {"name": lead_id, "summary": txt[:600],
-                           "source": "iris-intake", "best_product_match": "playbook-29"}
+                           "source": "iris-intake", "best_product_match": "rick-pro-29"}
             except OSError:
                 pass
 
@@ -339,8 +339,8 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
-        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
-        "managed-499, enterprise-2500),\n"
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
+        "Managed is pilot-first via meetrick.ai/pilot),\n"
         "disqualify_reason: string explanation if total_score < 5 OR clear vendor pitch / spam / "
         "off-ICP, else null.\n"
         "Output ONLY valid JSON."
@@ -357,14 +357,14 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "- fit_score: How well do they match our ICP (founders, operators, builders)? "
         "(unknown = 5, plausible = 6-7, confirmed = 8+)\n"
         "- budget_score: Can they afford the recommended product? (unknown = 5 — most can afford "
-        "$9-29; only score below 5 if explicit budget objection)\n"
+        "the $29 Rick Pro; only score below 5 if explicit budget objection)\n"
         "- urgency_score: How soon will they buy? (engaged in conversation = 5+, "
         "asked about pricing/timing = 7+)\n\n"
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
-        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
-        "managed-499, enterprise-2500),\n"
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
+        "Managed is pilot-first via meetrick.ai/pilot),\n"
         "disqualify_reason: string ONLY if vendor pitch / spam / explicit off-fit; otherwise null "
         "even when total_score < 5 (let the pitch stage decide).\n"
         "Output ONLY valid JSON."
@@ -372,7 +372,7 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
     qualify_warm = (
         "You are Rick, an AI CEO scoring a lead — WARM MODE. Rick is early-stage; every real human "
         "conversation has option value. Default to 'warm' unless there is an EXPLICIT disqualify "
-        "signal (vendor pitch, spam, abuse, explicit 'remove me'). Lower the bar — a $9 starter-kit "
+        "signal (vendor pitch, spam, abuse, explicit 'remove me'). Lower the bar — a $29 Rick Pro "
         "buyer today is data and a future testimonial.\n\n"
         "Lead dossier: {{DOSSIER}}\n\n"
         "Score this lead 1-10 on (be generous, but stay honest about the schema):\n"
@@ -380,14 +380,14 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "any question = 7+)\n"
         "- fit_score: How well do they match our ICP? (unknown = 6, anyone building or running "
         "anything = 7+)\n"
-        "- budget_score: Can they afford the recommended product? (unknown = 6 — recommend the $9 "
-        "or $29 tier when in doubt; never go below 5 unless explicit no-budget)\n"
+        "- budget_score: Can they afford the recommended product? (unknown = 6 — recommend the free "
+        "roast or $29 Rick Pro when in doubt; never go below 5 unless explicit no-budget)\n"
         "- urgency_score: How soon will they buy? (engaged = 6, asked anything specific = 7+)\n\n"
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5 — should be RARE in this mode),\n"
-        "recommended_product: best product match (one of: starter-kit-9, playbook-29, toolkit-97, "
-        "managed-499, enterprise-2500). Default to starter-kit-9 or playbook-29 unless clear "
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
+        "Managed is pilot-first via meetrick.ai/pilot). Default to free-roast or rick-pro-29 unless clear "
         "signal for higher tier.\n"
         "disqualify_reason: string ONLY for explicit disqualify signals (vendor / spam / abuse / "
         "explicit opt-out); null otherwise.\n"
@@ -425,7 +425,7 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
     fallback = json.dumps({
         "intent_score": 5, "fit_score": 5, "budget_score": 5, "urgency_score": 5,
         "total_score": 5, "qualification": "warm",
-        "recommended_product": dossier.get("best_product_match", "playbook-29"),
+        "recommended_product": dossier.get("best_product_match", "rick-pro-29"),
         "disqualify_reason": None,
     })
     result = generate_text("analysis", prompt, fallback)
@@ -533,15 +533,16 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         lines = ledger_path.read_text(encoding="utf-8").strip().splitlines()[-20:]
         recent_ops = f"Rick's recent operations (last 20 actions):\n" + "\n".join(lines[-10:])
 
-    product = qualification.get("recommended_product", "playbook-29")
+    product = qualification.get("recommended_product", "rick-pro-29")
+    # Real live catalog (2026-07-13): Free roast, Rick Pro $29/mo,
+    # Managed $499/mo pilot-first via meetrick.ai/pilot. The old
+    # starter-kit-9/toolkit-97/enterprise-2500 tiers never existed at checkout.
     product_prices = {
-        "starter-kit-9": ("AI CEO Starter Kit", 9),
-        "playbook-29": ("AI CEO Playbook", 29),
-        "toolkit-97": ("AI CEO Toolkit", 97),
-        "managed-499": ("Managed AI CEO", 499),
-        "enterprise-2500": ("Enterprise AI CEO", 2500),
+        "free-roast": ("Free Roast (meetrick.ai/roast)", 0),
+        "rick-pro-29": ("Rick Pro", 29),
+        "managed-499": ("Managed AI CEO (pilot-first — meetrick.ai/pilot)", 499),
     }
-    product_name, price = product_prices.get(product, ("AI CEO Playbook", 29))
+    product_name, price = product_prices.get(product, ("Rick Pro", 29))
 
     # === Wave 3 Thompson variants picker — first skill to use it (2026-04-22) ===
     # Lazy-seed 2 baseline variants on first call so picker has something to roll.
@@ -644,6 +645,14 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     result = generate_text("writing", prompt, fallback)
     path = write_file(deal_dir / "pitch-draft.md", result.content)
 
+    # WS-F (2026-07-13): sidecar so pitch_send can stamp the variant onto the
+    # outbound_jobs touch row — reply linkage needs (skill, variant) at send time.
+    try:
+        write_file(deal_dir / "pitch-meta.json", json.dumps(
+            {"skill": "pitch_draft", "variant": active_variant_id}, indent=2))
+    except Exception:
+        pass
+
     # Quality proxy for variant outcome — heuristic, not human-judged.
     # Replace with reply-rate signal once Phase G inbound matures (~Week 2).
     body_lc = (result.content or "").lower()
@@ -706,8 +715,8 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
     pitch_path = deal_dir / "pitch-draft.md"
     pitch = pitch_path.read_text(encoding="utf-8") if pitch_path.exists() else "Pitch not found."
 
-    product = qualification.get("recommended_product", "playbook-29")
-    price = {"starter-kit-9": 9, "playbook-29": 29, "toolkit-97": 97, "managed-499": 499, "enterprise-2500": 2500}.get(product, 29)
+    product = qualification.get("recommended_product", "rick-pro-29")
+    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499}.get(product, 29)
 
     # For $499+ deals, require founder approval
     if price >= 499:
@@ -740,6 +749,9 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
         "pitch_markdown": pitch,
         "created_at": now_iso(),
         "status": "pending",
+        # Sprint hard rule (2026-07-13): 2h owner veto window before the
+        # gated outbox sender may pick this up (notify_text below is the ping).
+        "send_after": (datetime.now() + timedelta(hours=2)).isoformat(timespec="seconds"),
     }
     write_file(outbox_file, json.dumps(outbox_payload, indent=2))
 
@@ -774,6 +786,36 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
         )
         md_path.write_text(frontmatter + clean_body + "\n", encoding="utf-8")
 
+    # WS-F (2026-07-13): record the queued touch in outbound_jobs so the
+    # learning loop can later link a reply back to (skill, variant).
+    # handle_outbox_send flips this row to status='sent' via outbox_file.
+    if email and "@" in email:
+        try:
+            from runtime.touch_log import log_touch as _log_touch
+            meta = {}
+            meta_path = deal_dir / "pitch-meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    meta = {}
+            touch_subject = ""
+            for ln in pitch.splitlines()[:5]:
+                m = re.match(r"^\*\*Subject:\*\*\s*(.+)", ln, re.IGNORECASE)
+                if m:
+                    touch_subject = m.group(1).strip()[:120]
+                    break
+            _log_touch(
+                connection, to=email, channel="email",
+                template_id=f"pitch:{meta.get('variant', 'baseline')}",
+                subject=touch_subject,
+                variant=meta.get("variant", ""), skill=meta.get("skill", ""),
+                source=source, status="queued",
+                outbox_file=outbox_file.name, workflow_id=workflow["id"],
+            )
+        except Exception:
+            pass
+
     # Update prospect status
     connection.execute(
         "UPDATE prospect_pipeline SET status = 'pitched', last_contact_at = ?, updated_at = ? WHERE username = ?",
@@ -806,7 +848,7 @@ def handle_followup_sequence(connection: sqlite3.Connection, workflow: sqlite3.R
     prompt = (
         "You are Rick, writing a 3-email follow-up sequence for a prospect who was pitched but hasn't bought.\n"
         f"Prospect: {dossier.get('name', lead_id)}\n"
-        f"Product pitched: {dossier.get('best_product_match', 'playbook-29')}\n\n"
+        f"Product pitched: {dossier.get('best_product_match', 'rick-pro-29')}\n\n"
         "Write 3 follow-up emails:\n"
         "## Day 2: Value-add (share a useful insight, no hard sell)\n"
         "## Day 5: Social proof (cite a customer win or Rick's own metrics)\n"
@@ -879,7 +921,7 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
     total_score = qualification.get("total_score", 5)
 
     # 2026-04-24: pattern READ side fanned to close_or_escalate. Strategy
-    # route is opus-4-7 (smart) — pattern context helps Rick make better
+    # route is opus-4-8 (smart) — pattern context helps Rick make better
     # close/escalate calls based on past wins on similar deals.
     picked_patterns: list[dict] = []
     pattern_context = ""
@@ -1483,6 +1525,8 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
     pending = []
     sent = 0
     errors = 0
+    deferred = 0
+    earliest_deferred = ""
 
     for f in sorted(outbox_dir.iterdir()):
         if not f.suffix == ".json":
@@ -1493,9 +1537,16 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
             continue
         if msg.get("status") != "pending":
             continue
-        # Check scheduled send time
+        # Check scheduled send time. Deferred items are surfaced in the
+        # summary (2026-07-14): this handler runs only as a workflow job
+        # step, so a silent skip here strands the item until something
+        # else drains the outbox — the cron drain email-send-outbox.py
+        # picks them up, but the deferral must at least be visible.
         send_after = msg.get("send_after", "")
         if send_after and send_after > now_iso():
+            deferred += 1
+            if not earliest_deferred or send_after < earliest_deferred:
+                earliest_deferred = send_after
             continue
         pending.append((f, msg))
 
@@ -1505,6 +1556,46 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
             continue
 
         try:
+            try:
+                from runtime.kill_switches import ChannelPaused, assert_channel_active, record_send, is_send_allowed
+                assert_channel_active(connection, "email")
+            except ChannelPaused as exc:
+                return StepOutcome(
+                    summary=f"Outbox send paused by email safety gate: {exc.reason}",
+                    artifacts=[],
+                    workflow_stage="outbox-paused",
+                )
+            except Exception as exc:
+                return StepOutcome(
+                    summary=f"Outbox send refused because email safety gate is unavailable: {type(exc).__name__}: {exc}",
+                    artifacts=[],
+                    workflow_stage="outbox-paused",
+                )
+
+            # Unified fail-closed per-recipient gate (2026-07-13).
+            # Default cold=False (outbox pitches go to leads already in
+            # conversation) but honor an explicit cold flag on the outbox
+            # item — founder-sourcer drafts are first-touch cold and must
+            # get the 7-day cold frequency cap. Strictly strengthens the gate.
+            allowed, gate_reason = is_send_allowed(to_email, cold=bool(msg.get("cold", False)))
+            if not allowed:
+                record_event(
+                    connection,
+                    workflow["id"],
+                    job["id"],
+                    "outbox_send_blocked",
+                    {"summary": f"SEND_BLOCKED reason={gate_reason} to={to_email}"},
+                )
+                if gate_reason.startswith("suppressed"):
+                    # Permanent: park the message so it never retries.
+                    msg["status"] = "blocked"
+                    msg["error"] = f"SEND_BLOCKED reason={gate_reason}"[:200]
+                    errors += 1
+                    write_file(f, json.dumps(msg, indent=2))
+                # Non-permanent blocks (master kill / live flag / frequency
+                # cap) leave the file pending for a later run.
+                continue
+
             import urllib.request
             body_md = msg.get("body_markdown", msg.get("pitch_markdown", ""))
             subject = "Message from Rick"
@@ -1524,13 +1615,34 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
             req = urllib.request.Request(
                 "https://api.resend.com/emails",
                 data=send_payload,
-                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json", "User-Agent": "meetrick-rick/1.0"},
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=15)
+            record_send(connection, "email")
             msg["status"] = "sent"
             msg["sent_at"] = now_iso()
             sent += 1
+
+            # WS-F (2026-07-13): flip the queued touch row to sent; if no
+            # queued row exists for this outbox file (item queued before the
+            # ledger existed, or by a path that doesn't pre-log), insert one
+            # so every send is still counted. Shielded — bookkeeping must
+            # never fail a send that already went out.
+            try:
+                from runtime.touch_log import log_touch as _log_touch, mark_touch_sent as _mark_sent
+                if _mark_sent(connection, f.name) == 0:
+                    _log_touch(
+                        connection, to=to_email, channel="email",
+                        template_id=msg.get("type", "outbox"),
+                        subject=subject,
+                        variant=msg.get("variant", ""), skill=msg.get("skill", ""),
+                        source=msg.get("source_channel", "outbox"),
+                        status="sent", outbox_file=f.name,
+                        workflow_id=workflow["id"],
+                    )
+            except Exception:
+                pass
         except Exception as exc:
             msg["status"] = "error"
             msg["error"] = str(exc)[:200]
@@ -1545,8 +1657,11 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         if msg.get("status") == "sent":
             f.rename(sent_dir / f.name)
 
+    summary = f"Outbox processed: {sent} sent, {errors} errors, {len(pending) - sent - errors} remaining"
+    if deferred:
+        summary += f", {deferred} deferred (earliest send_after {earliest_deferred})"
     return StepOutcome(
-        summary=f"Outbox processed: {sent} sent, {errors} errors, {len(pending) - sent - errors} remaining",
+        summary=summary,
         artifacts=[],
         workflow_stage="outbox-processed",
     )

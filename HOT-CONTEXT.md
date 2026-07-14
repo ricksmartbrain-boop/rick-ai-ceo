@@ -1,0 +1,1 @@
+/Users/rickthebot/rick-vault/memory/hot-context.md

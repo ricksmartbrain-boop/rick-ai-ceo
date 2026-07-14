@@ -22,6 +22,7 @@ import re
 from pathlib import Path
 revdir = Path('$VAULT') / 'revenue'
 real_mrr = 9.0
+subs = None
 src = 'fallback (no reconciliation file)'
 if revdir.is_dir():
     recs = sorted(revdir.glob('reconciliation-*.md'))
@@ -31,8 +32,12 @@ if revdir.is_dir():
         if m:
             real_mrr = float(m.group(1))
             src = recs[-1].name
-print(f'- MRR: \${real_mrr:.2f}/mo (real, phantom \$547 stripped — source: {src})')
-print('- Customers: 1 paying real subscription (sub_1TEGyAD9G3v6e0Osa0sgsrVk)')
+        m2 = re.search(r'Real paying subscriptions[:\*\s]+([0-9]+)', text)
+        if m2:
+            subs = int(m2.group(1))
+print(f'- MRR: \${real_mrr:.2f}/mo (real, phantoms excluded — source: {src})')
+if subs is not None:
+    print(f'- Customers: {subs} paying real subscription(s)')
 " 2>/dev/null || echo "- MRR: \$9/mo (fallback)"
 echo ""
 
@@ -81,16 +86,34 @@ echo "## Open Blockers"
 python3 -c "
 import json
 from pathlib import Path
+blockers = []
 state_file = Path('$STATE')
 if state_file.exists():
-    s = json.loads(state_file.read_text())
-    blockers = s.get('blockers', [])
-    if blockers:
-        for b in blockers[:3]:
-            text = b if isinstance(b, str) else b.get('text', str(b))
-            print(f'- {text}')
-    else:
-        print('- None')
+    try:
+        s = json.loads(state_file.read_text())
+        for b in s.get('blockers', [])[:3]:
+            blockers.append(b if isinstance(b, str) else b.get('text', str(b)))
+    except Exception:
+        pass
+# Billing-watchdog last-state: active billing_400 / provider-disable = blocker
+wd_log = Path('$VAULT') / 'operations' / 'billing-watchdog.jsonl'
+if wd_log.exists():
+    last = None
+    for line in wd_log.read_text(errors='replace').splitlines():
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get('status') in ('ok', 'cleared', 'credits_low', 'error') \
+                and 'api_status' in e:
+            last = e
+    if last and last.get('status') == 'credits_low':
+        blockers.insert(0,
+            'BILLING: Anthropic credits low (HTTP %s) as of %s — provider disabled, brain on fallback, manual top-up needed'
+            % (last.get('api_status'), last.get('ts')))
+if blockers:
+    for text in blockers[:4]:
+        print(f'- {text}')
 else:
     print('- None')
 " 2>/dev/null || echo "- None"

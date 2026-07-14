@@ -1,0 +1,46 @@
+{
+  "main_agent_id": "rick",
+  "session": {
+    "maintenance": {
+      "enabled": true,
+      "mode": "enforce",
+      "max_disk_mb": 2048,
+      "max_session_age_days": 45,
+      "max_topic_sessions_per_channel": 200,
+      "keep_recent_sessions": 50
+    },
+    "telegram": {
+      "thread_mode": "hybrid",
+      "workflow_session_pattern": "agent:{main_agent_id}:telegram:group:{chat_id}:topic:{thread_id}",
+      "fixed_operational_topics": [
+        "ceo-hq",
+        "approvals",
+        "product-lab",
+        "distribution",
+        "customer",
+        "ops-alerts"
+      ]
+    },
+    "dm": {
+      "status": "prepared",
+      "enabled": false,
+      "scope": "per-channel-peer",
+      "allowed_purposes": [
+        "support",
+        "customer"
+      ],
+      "notes": "Keep customer/support DMs disabled until launch stability is proven."
+    },
+    "memory_flush": {
+      "enabled": true,
+      "write_before_compaction": true,
+      "prompt_file": "templates/openclaw/memory-flush.prompt.md",
+      "vault_targets": [
+        "$RICK_DATA_ROOT/control",
+        "$RICK_DATA_ROOT/memory",
+        "$RICK_DATA_ROOT/projects",
+        "$RICK_DATA_ROOT/customers"
+      ]
+    }
+  }
+}

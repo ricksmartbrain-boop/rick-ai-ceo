@@ -141,7 +141,7 @@ start = time.monotonic()
 
 def call_anthropic() -> str:
     payload = {
-        "model": "claude-opus-4-7",
+        "model": "claude-opus-4-8",
         "max_tokens": 1200,
         "temperature": 0.25,
         "system": "You are Rick: sharp, warm, commercially serious, and concise.",
@@ -264,7 +264,7 @@ except Exception as exc:
     raise SystemExit(1)
 
 elapsed = time.monotonic() - start
-model_name = "claude-opus-4-7" if provider == "anthropic" else "gpt-5.4"
+model_name = "claude-opus-4-8" if provider == "anthropic" else "gpt-5.4"
 provider_label = "Anthropic" if provider == "anthropic" else "OpenAI"
 
 print()

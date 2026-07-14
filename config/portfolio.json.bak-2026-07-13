@@ -1,0 +1,24 @@
+{
+  "products": {
+    "404-agency": {
+      "current_mrr": 0,
+      "target_mrr": 5000,
+      "priority": "P2"
+    },
+    "personal-brand": {
+      "current_mrr": 0,
+      "target_mrr": 15000,
+      "priority": "P1"
+    },
+    "info-products": {
+      "current_mrr": 0,
+      "target_mrr": 40000,
+      "priority": "P1"
+    },
+    "lingualive": {
+      "current_mrr": 0,
+      "target_mrr": 10000,
+      "priority": "P3"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "checks": [
+    {
+      "name": "meetrick.ai",
+      "kind": "http",
+      "target": "https://meetrick.ai",
+      "contains": "Rick"
+    },
+    {
+      "name": "Rick Vault",
+      "kind": "path",
+      "target": "$RICK_DATA_ROOT"
+    }
+  ]
+}

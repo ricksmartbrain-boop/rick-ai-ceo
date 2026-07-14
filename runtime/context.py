@@ -93,7 +93,7 @@ def top_ranked_projects(limit: int = 10) -> list[dict]:
 
 
 def latest_revenue_snapshot() -> dict:
-    candidates = sorted(REVENUE_DIR.glob("*.md"))
+    candidates = sorted(p for p in REVENUE_DIR.glob("*.md") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.stem))
     if not candidates:
         return {"available": False}
 
@@ -103,19 +103,41 @@ def latest_revenue_snapshot() -> dict:
     gap_match = re.search(r"\|\s*Gap\s*\|\s*([^\|]+)\|", text)
     period_match = re.search(r"\*\*Period:\*\*\s*(.+)", text)
 
+    def parse_net(path: Path) -> float:
+        match = re.search(r"\|\s*Period Net Revenue\s*\|\s*([^\|]+)\|", read_text(path))
+        if not match:
+            return 0.0
+        try:
+            return float(re.sub(r"[^\d.\-]", "", match.group(1)) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    velocity_path = REVENUE_DIR / "velocity.json"
+    try:
+        velocity = json.loads(read_text(velocity_path)) if velocity_path.exists() else {}
+    except json.JSONDecodeError:
+        velocity = {}
+
     return {
         "available": True,
         "path": str(latest),
         "date": latest.stem,
         "period": period_match.group(1).strip() if period_match else "unknown",
         "net": net_match.group(1).strip() if net_match else "unknown",
+        "rev_7d": f"${sum(parse_net(path) for path in candidates[-7:]):.2f}",
+        "mrr": f"${float(velocity.get('current_mrr', 0.0) or 0.0):.2f}",
+        "mrr_delta_7d": f"${float(velocity.get('delta_7d', 0.0) or 0.0):+.2f}",
         "gap": gap_match.group(1).strip() if gap_match else "n/a",
     }
 
 
-def open_approval_count() -> int:
-    approvals_path = CONTROL_DIR / "approvals.md"
-    return sum(1 for line in read_text(approvals_path).splitlines() if line.startswith("|") and "| open |" in line)
+def open_approval_count(connection: sqlite3.Connection) -> int:
+    # Count from the runtime DB (source of truth), not the approvals.md mirror —
+    # the mirror goes stale and under-reported open approvals (2026-07-14).
+    # Matches proactive.py/engine.py counting.
+    return connection.execute(
+        "SELECT COUNT(*) FROM approvals WHERE status = 'open'"
+    ).fetchone()[0]
 
 
 def dependency_gap_summary() -> str:
@@ -363,7 +385,14 @@ def _compact_revenue() -> dict:
         logging.getLogger("rick.context").warning("revenue_context_line failed: %s", exc)
     snapshot = latest_revenue_snapshot()
     if snapshot.get("available"):
-        return {"available": True, "summary": f"{snapshot['date']}: net={snapshot['net']} gap={snapshot['gap']}"}
+        return {
+            "available": True,
+            "summary": (
+                f"{snapshot['date']}: MRR={snapshot.get('mrr', 'unknown')} "
+                f"rev_7d={snapshot.get('rev_7d', 'unknown')} "
+                f"net={snapshot['net']} gap={snapshot['gap']}"
+            ),
+        }
     return {"available": False}
 
 
@@ -451,7 +480,7 @@ def build_context_pack(connection: sqlite3.Connection, workflow_row: sqlite3.Row
         "business": {
             "top_ranked_projects": top_ranked_projects(),
             "latest_revenue": _compact_revenue(),
-            "open_approvals": open_approval_count(),
+            "open_approvals": open_approval_count(connection),
             "dependency_gaps": dependency_gap_summary(),
             "ops_health": ops_health_summary(),
             "runtime_lanes": runtime_lane_snapshot(connection),

@@ -541,7 +541,8 @@ smoke_digest() {
 smoke_email() {
   local env_file="$1"
   local recipient="$2"
-  "$PYTHON_BIN" - "$env_file" "$recipient" <<'PY'
+  local workspace_root="$3"
+  "$PYTHON_BIN" - "$env_file" "$recipient" "$workspace_root" <<'PY'
 import json
 import os
 import sys
@@ -550,6 +551,7 @@ from pathlib import Path
 
 env_file = Path(sys.argv[1])
 recipient = sys.argv[2]
+workspace_root = Path(sys.argv[3])
 values = {}
 for line in env_file.read_text().splitlines():
     line = line.strip()
@@ -567,6 +569,34 @@ api_key = values.get('RESEND_API_KEY', '')
 from_addr = values.get('MEETRICK_FROM_EMAIL', 'Rick <hello@meetrick.ai>')
 if not api_key:
     raise SystemExit('RESEND_API_KEY missing')
+
+data_root = Path(values.get('RICK_DATA_ROOT') or os.environ.get('RICK_DATA_ROOT') or (Path.home() / 'rick-vault'))
+suppression_file = data_root / 'mailbox' / 'suppression.txt'
+if suppression_file.exists():
+    target = recipient.strip().lower()
+    for raw in suppression_file.read_text(encoding='utf-8', errors='replace').splitlines():
+        email = raw.split('#', 1)[0].strip().lower()
+        if email and email == target:
+            raise SystemExit(f'SUPPRESSION VIOLATION BLOCKED: {target}')
+
+try:
+    root = str(workspace_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from runtime.db import connect
+    from runtime.kill_switches import ChannelPaused, assert_channel_active
+
+    conn = connect()
+    try:
+        assert_channel_active(conn, 'email')
+    except ChannelPaused as exc:
+        raise SystemExit(f'EMAIL CHANNEL PAUSED: {exc.reason}')
+    finally:
+        conn.close()
+except SystemExit:
+    raise
+except Exception as exc:
+    raise SystemExit(f'EMAIL SAFETY GATE UNAVAILABLE: {type(exc).__name__}: {exc}')
 
 payload = {
     'from': from_addr,
@@ -816,7 +846,7 @@ rm -f /tmp/rick-install-digest.out /tmp/rick-install-digest.err
 
 if [[ -n "$TEST_EMAIL" ]]; then
   say "Cold-email smoke test to $TEST_EMAIL:"
-  smoke_email "$ENV_FILE" "$TEST_EMAIL"
+  smoke_email "$ENV_FILE" "$TEST_EMAIL" "$INSTALL_ROOT"
 else
   warn "No smoke-test email provided; skipped cold-email send."
 fi

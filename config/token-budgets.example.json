@@ -1,0 +1,15 @@
+{
+  "daily_usd_caps": {
+    "heartbeat": 5,
+    "workhorse": 20,
+    "strategic": 25,
+    "coding": 35,
+    "research": 10
+  },
+  "routing_rules": {
+    "heartbeat": "Use the cheapest reliable model.",
+    "strategic": "Use the strongest reasoning model available when the decision matters.",
+    "coding": "Use Codex first, Claude Code if the repo or task fits better.",
+    "research": "Use Grok only when current web or X data changes the decision."
+  }
+}

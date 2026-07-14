@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+VLAD_PLAYBOOK_URL = "https://dive.vladyslavpodoliako.com/?utm_source=nurture&utm_medium=email"
+
 # ─────────────────────────────────────────────────────────────────────
 # /roast capture sequence — 7 emails over 7 days
 # ─────────────────────────────────────────────────────────────────────
@@ -44,7 +46,10 @@ P.S. The roast that earned a screenshot? Reply with which line you're going to p
 
 —
 
-meetrick.ai/this-week — Rick auto-publishes weekly receipts of every commit, send, and reply. Audit before you trust.""",
+meetrick.ai/this-week — Rick auto-publishes weekly receipts of every commit, send, and reply. Audit before you trust.
+
+Also worth bookmarking: Vlad's AI operator field manual — 44 chapters, no gate, built from running Belkins, Folderly, the newsletter, and the rest of the stack:
+{{vlad_playbook_url}}&utm_campaign=roast_d0""",
     },
     {
         "day": 1,
@@ -112,6 +117,9 @@ If your answer is in those five, the AI CEO Kit at meetrick.ai/agents-kit?utm_so
 
 If your answer is something else, reply and tell me. The list grows.
 
+If you want the deeper operating-system version of this, Vlad published the full playbook here:
+{{vlad_playbook_url}}&utm_campaign=roast_d3
+
 — Vlad (founder)""",
     },
     {
@@ -151,7 +159,10 @@ Thanks for letting Rick roast you. Real founders, real receipts.
 
 — Vlad
 
-P.S. If you want to see what we ship in real-time, meetrick.ai/this-week is the auto-publishing audit page. No edits, just receipts.""",
+P.S. If you want the broader AI-operator manual behind this whole experiment, read Vlad's Playbook:
+{{vlad_playbook_url}}&utm_campaign=roast_d7
+
+And if you want to see what we ship in real-time, meetrick.ai/this-week is the auto-publishing audit page. No edits, just receipts.""",
     },
 ]
 
@@ -178,7 +189,10 @@ Three things to know before you forget about this email:
 
 —
 
-meetrick.ai/this-week — Rick auto-publishes weekly receipts of every commit, send, and reply. Audit before you trust.""",
+meetrick.ai/this-week — Rick auto-publishes weekly receipts of every commit, send, and reply. Audit before you trust.
+
+For the non-Rick version of the same operating philosophy, Vlad's AI operator field manual is here:
+{{vlad_playbook_url}}&utm_campaign=tax_d0""",
     },
     {
         "day": 1,
@@ -188,7 +202,8 @@ meetrick.ai/this-week — Rick auto-publishes weekly receipts of every commit, s
 The pattern Rick sees most:
 {{leak_specific_paragraph}}
 
-Time-to-implement: a weekend. Cost: $47 (the kit) or free (the playbook — meetrick.ai/playbook).
+Time-to-implement: a weekend. Cost: $47 (the kit) or free if you want the deeper operator field manual first:
+{{vlad_playbook_url}}&utm_campaign=tax_d1
 
 Tomorrow: how to know if it actually worked.
 
@@ -237,7 +252,7 @@ If $47 isn't right (yet), meetrick.ai/pilot is a free 1-week pilot — Rick runs
 
 The reason most founder taxes don't go down is the founder forgets they computed it. The bill goes back to abstract.
 
-If you want a reminder, the newsletter is the cheapest one — Tue/Sat 9am PT, real receipts from running an AI CEO at $9 MRR.
+If you want a reminder, the newsletter is the cheapest one — Tue/Sat 9am PT, real receipts from running an AI CEO in public, live numbers included.
 
 → meetrick.ai/newsletter?utm_source=nurture&utm_medium=email&utm_campaign=tax_d7
 
@@ -269,6 +284,8 @@ def render(step: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     ctx. Missing keys render as empty string (sensible default for nurture
     where some leads don't have all fields).
     """
+    ctx = {"vlad_playbook_url": VLAD_PLAYBOOK_URL, **ctx}
+
     def _sub(text: str) -> str:
         out = text
         for k, v in ctx.items():

@@ -11,6 +11,7 @@ import signal
 from pathlib import Path
 import sqlite3
 import sys
+import time
 
 # 2026-04-24: faulthandler — segfault visibility. Pre-existing daemon
 # segfaults (pid 53429 exit code 11 in run-daemon.sh logs) had ZERO
@@ -214,7 +215,22 @@ def main() -> int:
 
 
 def _run(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
-    init_db(connection)
+    # Bounded retry: transient "database is locked" during init/migration
+    # (parallel heavy session holding the write lock) killed 4 daemon
+    # heartbeats on 2026-07-13. 3 attempts, 5s apart, then fail loud.
+    for attempt in range(1, 4):
+        try:
+            init_db(connection)
+            break
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc) or attempt == 3:
+                raise
+            print(
+                f"[db] init_db hit '{exc}' (attempt {attempt}/3), retrying in 5s",
+                file=sys.stderr,
+            )
+            connection.rollback()
+            time.sleep(5)
 
     for warning in validate_config():
         print(f"[config] {warning}", file=sys.stderr)

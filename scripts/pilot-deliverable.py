@@ -2,7 +2,7 @@
 """pilot-deliverable.py — generate the Day-1 proof artifact for a pilot intake.
 
 Input:   one pilot intake row (JSONL line OR --intake-json '{...}').
-Process: crawl founder's company URL → infer ICP → score with opus-4-7 → draft
+Process: crawl founder's company URL → infer ICP → score with opus-4-8 → draft
          10 cold emails with sonnet-4-6 → render a single HTML page.
 Output:  ~/meetrick-site/pilot/<slug>.html (private link-only deliverable) +
          a JSONL row appended to ~/rick-vault/operations/pilot-intake.jsonl.
@@ -12,7 +12,7 @@ Usage:
   python3 scripts/pilot-deliverable.py --jsonl ~/rick-vault/operations/pilot-intake.jsonl --slug rtrvr-ai
 
 Smart-models invariant:
-  - Reasoning  (ICP scoring)        → claude-opus-4-7
+  - Reasoning  (ICP scoring)        → claude-opus-4-8
   - Writing    (cold email drafts)  → claude-sonnet-4-6
   - Never gpt-5.4-mini.
 
@@ -42,7 +42,7 @@ PT = timezone(timedelta(hours=-7))
 USER_AGENT = "Mozilla/5.0 (compatible; RickPilotBot/1.0; +https://meetrick.ai/pilot)"
 
 # Models — load via env so the rest of Rick's chain stays the source of truth.
-MODEL_REASON = os.getenv("RICK_MODEL_REASON", "claude-opus-4-7")
+MODEL_REASON = os.getenv("RICK_MODEL_REASON", "claude-opus-4-8")
 MODEL_WRITE = os.getenv("RICK_MODEL_WRITE", "claude-sonnet-4-6")
 
 
@@ -57,7 +57,12 @@ def slugify(s: str) -> str:
 
 def load_intake(args) -> dict:
     if args.intake_json:
-        return json.loads(args.intake_json)
+        intake = json.loads(args.intake_json)
+        # Normalize: accept 'domain' as fallback for 'company_url'
+        if 'company_url' not in intake and 'domain' in intake:
+            d = intake['domain']
+            intake['company_url'] = d if d.startswith('http') else f'https://{d}'
+        return intake
     if args.jsonl:
         rows = [json.loads(l) for l in Path(args.jsonl).open() if l.strip()]
         if args.slug:
@@ -130,7 +135,7 @@ def claude_call(model: str, prompt: str, max_tokens: int = 1500) -> str:
 
 
 def infer_icp(intake: dict, crawl: dict) -> dict:
-    """Use opus-4-7 to extract ICP from the crawl. Falls back to a deterministic heuristic."""
+    """Use opus-4-8 to extract ICP from the crawl. Falls back to a deterministic heuristic."""
     crawl_blob = "\n\n".join(f"### {u}\n{txt[:1200]}" for u, txt in sorted(crawl.items())) or "(no pages reached)"
     prompt = (
         f"You are Rick, an autonomous revenue agent. The founder of {intake['company_url']} just said yes to a "

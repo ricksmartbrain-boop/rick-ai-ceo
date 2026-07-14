@@ -12,7 +12,7 @@ Touchpoints are owned by the row in **OWNER**: either Rick (autonomous) or Vlad 
 | **Day 3** | First batch fires — ONLY after the founder's one-click approval. Rick monitors deliverability + bounces. Founder gets a `n sent / m bounced` Slack-style email at 17:00 PT. | Rick | YES, but gated on founder approval. |
 | **Day 4** | Reply triage. Rick classifies inbound (warm / cold / unsubscribe / spam). Warm replies surface in a single 09:00 PT digest email titled "Hot threads — your reply needed". Each warm reply gets a draft response Rick wrote in the founder's voice; founder edits & sends. | Rick | Drafts only — founder sends from their own account. |
 | **Day 5** | Same as Day 4 + one bounce-rate / spam-complaint check. If bounce > 5% Rick auto-pauses and emails the founder. | Rick | Auto-pause = yes; resume = no. |
-| **Day 6** | Mid-week summary email. Three numbers only: `sends / replies / hot threads` vs an industry benchmark of `25 sends / 1-2 replies / 0-1 hot`. Plus one diagnosis sentence: "your bottleneck looked like X, the data says Y, here's what week 2 should do." | Rick (via `claude-opus-4-7`) | Yes. |
+| **Day 6** | Mid-week summary email. Three numbers only: `sends / replies / hot threads` vs an industry benchmark of `25 sends / 1-2 replies / 0-1 hot`. Plus one diagnosis sentence: "your bottleneck looked like X, the data says Y, here's what week 2 should do." | Rick (via `claude-opus-4-8`) | Yes. |
 | **Day 7** | Final pilot summary at 09:00 PT. Single CTA: **"Keep Rick running this lane — $499/mo Pro, starts Monday. Reply 'in' or 'out'."** No tier menu. No "or schedule a call". One word reply unlocks the Stripe link in Vlad's reply (NEVER auto-billed). | Rick (draft) → Vlad (send) | Drafted; Vlad sends. |
 | **Day 8** | If "in": Vlad sends Stripe link manually. If "out": Vlad sends a one-line "thanks, here's the artifact PDF for your records, 30-day re-open offer" reply. If silence: 1 follow-up on Day 10, then close as `dropped_post_pilot`. | Vlad | Manual. |
 
@@ -22,7 +22,7 @@ Touchpoints are owned by the row in **OWNER**: either Rick (autonomous) or Vlad 
 - **No tier menu on Day 7.** $99 starter and $1500 Custom are NOT offered to pilot-converters. One choice = $499 Pro. Memo: `~/.openclaw/workspace/docs/pilot-pricing-recommendation.md`.
 - **No auto-send in week 1.** Every batch needs a one-click founder approval. Deliverability matters more than velocity.
 - **No new crons.** Day-2 through Day-7 emails are scheduled by the existing `sequencer` once the Day-1 deliverable is generated. Owner: `scripts/pilot-deliverable.py` writes a `pilot_intake` row that the sequencer picks up.
-- **Smart-models invariant:** Day-1 ICP scoring → `claude-opus-4-7`. Day-1 / Day-2 cold email drafts → `claude-sonnet-4-6`. Day-6 diagnosis → `claude-opus-4-7`. Never `gpt-5.4-mini`. Never downgrade.
+- **Smart-models invariant:** Day-1 ICP scoring → `claude-opus-4-8`. Day-1 / Day-2 cold email drafts → `claude-sonnet-4-6`. Day-6 diagnosis → `claude-opus-4-8`. Never `gpt-5.4-mini`. Never downgrade.
 
 ## What success looks like
 

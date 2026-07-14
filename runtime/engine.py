@@ -263,6 +263,20 @@ DEFAULT_LANE_POLICY: dict[str, dict[str, int]] = {
     "research-lane": {"priority": 35, "max_running": 2},
 }
 
+
+class RuntimeEngine:
+    """Compatibility wrapper for the legacy runtime health probe."""
+
+    def status(self) -> dict[str, Any]:
+        from runtime.db import connect
+
+        connection = connect()
+        try:
+            init_db(connection)
+            return status_summary(connection)
+        finally:
+            connection.close()
+
 WORKFLOW_LANE_OVERRIDES = {
     "info_product_launch": "product-lane",
     "post_purchase_fulfillment": "customer-lane",
@@ -1886,9 +1900,26 @@ def queue_post_purchase_workflow(
     amount_usd: float = 0.0,
     delivery_url: str = "",
     source: str = "manual",
+    product_name: str = "",
 ) -> str:
     if source_workflow_id is None:
-        source_workflow = {"title": "", "slug": "", "project": "rick-v6", "context_json": "{}"}
+        # Poll-sourced purchases have no source workflow — the product name
+        # from the delivery map is the only human-readable title available.
+        # Slug must come from it too: an empty slug produced malformed
+        # product_slugs like "-buyer-<email>" (observed 2026-07-14). A
+        # missing name must FAIL LOUD: slugify('') silently returns
+        # 'workflow', which would just be a different garbage slug.
+        if not product_name.strip():
+            raise RuntimeErrorBase(
+                "product_name is required for poll-sourced fulfillment "
+                "(empty name would derive a garbage product_slug)"
+            )
+        source_workflow = {
+            "title": product_name.strip(),
+            "slug": slugify(product_name),
+            "project": "rick-v6",
+            "context_json": "{}",
+        }
         source_context = {}
     else:
         source_workflow = get_workflow(connection, source_workflow_id)
@@ -1909,6 +1940,7 @@ def queue_post_purchase_workflow(
         "project": source_workflow["project"],
         "source_workflow_id": source_workflow_id,
         "source_workflow_title": source_workflow["title"],
+        "product_name": product_name.strip() or source_workflow["title"],
         "customer_email": normalized_email,
         "customer_name": customer_name.strip(),
         "payment_id": payment_id.strip(),
@@ -1971,12 +2003,70 @@ def queue_initiative_workflow(
 
     slug = slugify(objective)
     title = f"Initiative: {objective[:80]}"
+
+    # Identity gate: resolve_or_create_workflow prevents duplicate initiatives.
+    # - "reuse"        → initiative already exists; return existing db_workflow_id
+    # - "needs_review" → high-similarity match; blocked, enqueued for review
+    # - "create"       → new canonical identity written, proceed normally
+    try:
+        from scripts.workflow_identity_resolver import resolve_or_create_workflow as _resolve
+        _identity = _resolve(title=title, kind="initiative", rationale=objective[:200])
+        if _identity.action == "reuse":
+            try:
+                from runtime.log import get_logger
+                get_logger("rick.engine").info(
+                    "queue_initiative_workflow REUSED existing identity %s for: %s",
+                    _identity.workflow_uid,
+                    title[:80],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return _identity.record.db_workflow_id if _identity.record and _identity.record.db_workflow_id else ""
+        if _identity.action == "needs_review":
+            try:
+                from runtime.log import get_logger
+                get_logger("rick.engine").warning(
+                    "queue_initiative_workflow BLOCKED (needs_review) for: %s — similar to '%s'",
+                    title[:80],
+                    _identity.candidates[0].canonical_title if _identity.candidates else "unknown",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return ""
+        # action == "create": proceed; store db_workflow_id in registry after create
+        _new_uid = _identity.workflow_uid
+    except Exception:  # noqa: BLE001
+        # Resolver unavailable — proceed without gate (fail open, log warning)
+        _new_uid = None
+        try:
+            from runtime.log import get_logger
+            get_logger("rick.engine").warning(
+                "workflow_identity_resolver unavailable; creating initiative without identity gate: %s",
+                title[:80],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     context = {
         "objective": objective,
         "product_slug": slug,
         "project": project,
     }
     workflow_id = create_workflow(connection, "initiative", title, project, context, priority=priority)
+
+    # Back-fill db_workflow_id into the identity registry record
+    if _new_uid:
+        try:
+            from scripts.workflow_identity_resolver import _load_registry, _save_registry, _now_iso
+            _records = _load_registry()
+            for _rec in _records:
+                if _rec.workflow_uid == _new_uid and not _rec.db_workflow_id:
+                    _rec.db_workflow_id = workflow_id
+                    _rec.last_seen_at = _now_iso()
+                    _save_registry(_records)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
     first_step = INITIATIVE_STEPS[0]
     queue_job(
         connection,
@@ -3292,11 +3382,16 @@ def handle_delivery_email(connection: sqlite3.Connection, workflow: sqlite3.Row,
     name = str(context.get("customer_name", "")).strip()
     first_name = (name.split()[0] if name else "").strip() or "there"
     amount_usd = float(context.get("amount_usd", 0.0) or 0.0)
+    product_title = str(
+        context.get("product_name")
+        or context.get("source_workflow_title")
+        or source_workflow["title"]
+    ).strip() or "your purchase"
     prompt = (
         "Write a concise digital product delivery email in markdown.\n"
         "Keep it practical, warm, and operator-like.\n"
         "Include the delivery URL exactly once, a quick-start suggestion, and an invitation to reply with blockers.\n\n"
-        f"Product: {context.get('source_workflow_title', source_workflow['title'])}\n"
+        f"Product: {product_title}\n"
         f"Customer name: {name or 'unknown'}\n"
         f"Customer email: {email}\n"
         f"Delivery URL: {delivery_url}\n"
@@ -3305,9 +3400,9 @@ def handle_delivery_email(connection: sqlite3.Connection, workflow: sqlite3.Row,
     fallback = (
         f"# Delivery Email\n\n"
         f"**To:** {email}\n"
-        f"**Subject:** Your access to {context.get('source_workflow_title', source_workflow['title'])}\n\n"
+        f"**Subject:** Your access to {product_title}\n\n"
         f"Hi {first_name},\n\n"
-        f"Thanks for buying {context.get('source_workflow_title', source_workflow['title'])}.\n\n"
+        f"Thanks for buying {product_title}.\n\n"
         f"Your access link: {delivery_url}\n\n"
         "Best next step: open it now and finish the first useful action today.\n\n"
         "If you hit a blocker, reply and describe it in one sentence.\n\n"
@@ -3316,9 +3411,25 @@ def handle_delivery_email(connection: sqlite3.Connection, workflow: sqlite3.Row,
     result = generate_text("writing", prompt, fallback)
     customer_dir = DATA_ROOT / "customers" / slugify_email(email)
     draft_path = write_file(customer_dir / "delivery-email.md", result.content)
+    # The automatic outbox sender (phase1.handle_outbox_send) consumes ONLY
+    # .json files shaped {to, status: "pending", body_markdown}; a bare .md
+    # here sits in the outbox forever and the customer never gets access.
+    body_md = result.content
+    if "**Subject:**" not in body_md:
+        body_md = f"**Subject:** Your access to {product_title}\n\n{body_md}"
     outbox_path = write_file(
-        DATA_ROOT / "mailbox" / "outbox" / f"{slugify_email(email)}-{source_workflow['slug']}-delivery.md",
-        result.content,
+        DATA_ROOT / "mailbox" / "outbox" / f"{slugify_email(email)}-{source_workflow['slug']}-delivery.json",
+        json.dumps(
+            {
+                "to": email,
+                "status": "pending",
+                "type": "delivery",
+                "product": product_title,
+                "body_markdown": body_md,
+                "created_at": now_iso(),
+            },
+            indent=2,
+        ),
     )
     return StepOutcome(
         summary="Prepared post-purchase delivery email draft.",
@@ -5442,7 +5553,7 @@ def process_one_job(connection: sqlite3.Connection) -> dict[str, Any] | None:
         connection.commit()
         # Record failed outcome — now with cost/model/duration so the learning
         # loop can see which routes + models are cheapest to fail (so failing
-        # cheap is better than failing on opus-4-7).
+        # cheap is better than failing on opus-4-8).
         try:
             _fail_cost = _llm_track.get_and_clear_job_cost(job["id"])
             _fail_duration = (datetime.now() - _job_started_at).total_seconds()
@@ -5576,12 +5687,106 @@ def work(connection: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+# Cleanup guard (2026-07-14): on 2026-07-13 a parallel Iris "heartbeat-cleanup"
+# session resolved approval apr_62dafa5c3a3f (resolved_by='iris') — nothing
+# stopped it from touching REAL open approvals. Non-owner actors may only
+# cancel/resolve items that are verifiably synthetic. Owner path: relay Vlad's
+# explicit Telegram /approve //deny via `runner.py approve|deny ... --actor
+# telegram` (the `telegram --chat-id` relay form requires
+# RICK_TELEGRAM_ALLOWED_CHAT_ID, which is unset live — do not point people at it).
+OWNER_ACTORS = {"telegram", "vlad"}
+
+
+def is_synthetic_item(recipient: Any, request_text: Any = "", title: Any = "", slug: Any = "") -> bool:
+    """True only for verifiably synthetic items: an @example.com recipient
+    (RFC-reserved domain), an explicit [DRILL] marker in request/title, or a
+    drill-* workflow slug. Deliberately narrow — prose like "drill-down" or an
+    example.com address quoted inside a context blob must NOT match, or a REAL
+    item gets misclassified as fair game for automated cleanup (2026-07-14
+    review finding on the earlier any-field regex)."""
+    if str(recipient or "").strip().lower().endswith("@example.com"):
+        return True
+    if "[drill]" in f"{request_text or ''} {title or ''}".lower():
+        return True
+    return str(slug or "").strip().lower().startswith("drill-")
+
+
+def guard_non_owner_mutation(
+    connection: sqlite3.Connection,
+    actor: str,
+    item_kind: str,
+    item_id: str,
+    *fields: Any,
+    workflow_id: str | None = None,
+    job_id: str | None = None,
+) -> str:
+    """Deterministic guard: a non-owner actor (automated cleanup, heartbeat
+    sessions, CLI default 'cli') may cancel/resolve ONLY synthetic items.
+
+    *fields is forwarded positionally to is_synthetic_item:
+    (recipient, request_text, title, slug).
+
+    Returns "" when allowed. On refusal: leaves the item untouched, logs a
+    warning, records a guard_refused_non_owner event, and returns the reason.
+    """
+    if str(actor or "").strip().lower() in OWNER_ACTORS:
+        return ""
+    if is_synthetic_item(*fields):
+        return ""
+    reason = (
+        f"guard refused: non-owner actor '{actor}' may not mutate {item_kind} {item_id} — "
+        "not verifiably synthetic (@example.com recipient / [DRILL] / drill-* slug). Item left "
+        "untouched. Owner decisions come from Vlad in Telegram; relay his explicit decision with: "
+        "python3 runtime/runner.py approve --approval-id <id> --actor telegram (deny for /deny). "
+        "NEVER pass --actor telegram without the founder's stated decision."
+    )
+    try:
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning(reason)
+    except Exception:
+        pass
+    record_event(
+        connection,
+        workflow_id,
+        job_id,
+        "guard_refused_non_owner",
+        {"item_kind": item_kind, "item_id": item_id, "actor": str(actor or "")},
+    )
+    connection.commit()
+    return reason
+
+
 def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision: str, note: str, actor: str) -> dict[str, Any]:
     approval = connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
     if approval is None:
         raise KeyError(f"approval not found: {approval_id}")
     if approval["status"] != "open":
         return {"approval_id": approval_id, "status": approval["status"]}
+
+    workflow = get_workflow(connection, approval["workflow_id"])
+    # Scope the synthetic scan to the actual recipient + explicit markers —
+    # never the whole context blob (a quoted example.com address or prose like
+    # "drill-down" must not open a real item to non-owner cleanup).
+    try:
+        context = json_loads(workflow["context_json"])
+        trigger = context.get("trigger_payload") or {}
+        recipient = str(trigger.get("email") or context.get("customer_email") or context.get("email") or "")
+    except Exception:
+        recipient = ""  # unparseable context ⇒ not verifiably synthetic
+    refusal = guard_non_owner_mutation(
+        connection,
+        actor,
+        "approval",
+        approval_id,
+        recipient,
+        approval["request_text"],
+        workflow["title"],
+        workflow["slug"],
+        workflow_id=workflow["id"],
+        job_id=approval["job_id"],
+    )
+    if refusal:
+        return {"approval_id": approval_id, "status": "refused", "reason": refusal}
 
     stamp = now_iso()
     connection.execute(
@@ -5594,7 +5799,6 @@ def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision:
     )
     close_approval_markdown(approval_id, decision)
 
-    workflow = get_workflow(connection, approval["workflow_id"])
     job = connection.execute("SELECT * FROM jobs WHERE id = ?", (approval["job_id"],)).fetchone()
     if job is None:
         connection.commit()

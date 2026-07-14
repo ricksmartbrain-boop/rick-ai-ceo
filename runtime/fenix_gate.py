@@ -5,7 +5,7 @@ Per `config/subagents.json`, Fenix is the compliance + brand reviewer:
     founder voice (anything saying "I" / "we" / "Vlad" claiming intent)
   - Triggers: outbound_preflight_public, blog_publish_request,
     legal_question_received, press_inquiry
-  - Model: claude-opus-4-7 (smart judgment for edge cases)
+  - Model: claude-opus-4-8 (smart judgment for edge cases)
   - CAN say NO (block). CANNOT auto-approve irreversible commits — escalates.
 
 This module is the integration layer between the outbound_dispatcher and
@@ -154,7 +154,7 @@ def _request_fenix_llm_review(channel: str, payload: dict, matches: list[str]) -
     fallback = json.dumps({"decision": "escalate", "reason": "fenix LLM unreachable, defaulting to human review"})
     try:
         from runtime.llm import generate_text
-        result = generate_text("review", prompt, fallback)  # review route → opus-4-7
+        result = generate_text("review", prompt, fallback)  # review route → opus-4-8
         text_out = (result.content if hasattr(result, "content") else str(result)).strip()
         # Strip code-fence markers if model wrapped in ```json
         text_out = re.sub(r"^```(?:json)?\s*", "", text_out)

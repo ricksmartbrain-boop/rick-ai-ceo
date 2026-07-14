@@ -1,0 +1,27 @@
+# Himalaya email config template
+# Copy to ~/.config/himalaya/config.toml and replace values.
+
+downloads-dir = "~/Downloads"
+
+[accounts.default]
+default = true
+email = "rick@example.com"
+display-name = "Rick"
+backend = "imap"
+
+imap-host = "imap.example.com"
+imap-port = 993
+imap-login = "rick@example.com"
+imap-auth = "passwd"
+imap-passwd-cmd = "cat ~/.config/himalaya/app-password"
+
+smtp-host = "smtp.example.com"
+smtp-port = 465
+smtp-login = "rick@example.com"
+smtp-auth = "passwd"
+smtp-passwd-cmd = "cat ~/.config/himalaya/app-password"
+
+folder.inbox = "INBOX"
+folder.sent = "Sent"
+folder.drafts = "Drafts"
+folder.trash = "Trash"

@@ -5,19 +5,23 @@ Run daily at 6am PT.
 - Checks /subscribers endpoint (observability only, currently 405)
 - Fetches Resend audience contacts
 - Sends personal welcome emails to new external subscribers
-- Scans recent email activity for warm subscribers and sends a single follow-up
-- On Sundays, sends the full weekly broadcast one recipient at a time
+- Welcome-only job. Weekly broadcasts belong exclusively to the Saturday
+  "Rick Weekly Newsletter (Sat)" cron.
 - Appends a human-readable run log to projects/email/newsletter-engine-log.md
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,7 +35,9 @@ RICK_VAULT = Path.home() / "rick-vault"
 ENGINE_LOG = RICK_VAULT / "projects" / "email" / "newsletter-engine-log.md"
 NEWSLETTER_LOG = RICK_VAULT / "projects" / "email" / "newsletter-log.md"
 WELCOME_SENT = RICK_VAULT / "projects" / "email" / "welcome-sent.txt"
-WARM_SENT = RICK_VAULT / "projects" / "email" / "warm-followup-sent.txt"
+LOCK_PATH = RICK_VAULT / "runtime" / "newsletter-engine.lock"
+SKIPPED_ADDRESSES = RICK_VAULT / "logs" / "skipped-addresses.jsonl"
+SUPPRESSION_FILE = RICK_VAULT / "mailbox" / "suppression.txt"
 FROM_EMAIL = "Rick <rick@meetrick.ai>"
 REPLY_TO = "rick@meetrick.ai"
 AUDIENCE_ID = "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd"
@@ -88,31 +94,107 @@ def parse_dt(value: str | None) -> datetime:
     return dt.replace(tzinfo=timezone.utc)
 
 
-def request_json(url: str, method: str = "GET", payload: dict[str, Any] | list[Any] | None = None) -> tuple[int, Any]:
+def request_json(
+    url: str,
+    method: str = "GET",
+    payload: dict[str, Any] | list[Any] | None = None,
+    *,
+    retries: int = 3,
+    timeout: float = 30,
+) -> tuple[int, Any]:
+    if url.startswith(RESEND_BASE):
+        auth = os.environ.get("RESEND_API_KEY", "").strip()
+        body_path = None
+        try:
+            if payload is not None:
+                data = json.dumps(payload)
+            else:
+                data = None
+
+            for attempt in range(retries + 1):
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    body_path = tmp.name
+                try:
+                    cmd = [
+                        "curl",
+                        "-sS",
+                        "-X",
+                        method,
+                        "-H",
+                        f"Authorization: Bearer {auth}",
+                        "-H",
+                        "Accept: application/json",
+                        "-A",
+                        "rick-newsletter-engine/1.0",
+                        url,
+                        "-o",
+                        body_path,
+                        "-w",
+                        "%{http_code}",
+                    ]
+                    if data is not None:
+                        cmd.extend(["-H", "Content-Type: application/json", "--data", data])
+                    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+                    http_status = (proc.stdout or "").strip() or "599"
+                    try:
+                        status = int(http_status)
+                    except ValueError:
+                        status = 599
+                    body = Path(body_path).read_text(encoding="utf-8") if Path(body_path).exists() else ""
+                    if status == 429 and attempt < retries:
+                        retry_after = 1.0 + attempt
+                        time.sleep(retry_after)
+                        continue
+                    try:
+                        parsed = json.loads(body) if body else {}
+                    except Exception:
+                        parsed = {"raw": body}
+                    return status, parsed
+                finally:
+                    if body_path and Path(body_path).exists():
+                        try:
+                            Path(body_path).unlink()
+                        except Exception:
+                            pass
+        except subprocess.TimeoutExpired:
+            return 599, {"error": "curl timeout"}
+
     headers = {}
     key = os.environ.get("RESEND_API_KEY", "").strip()
     if key and url.startswith(RESEND_BASE):
         headers["Authorization"] = f"Bearer {key}"
-        headers["User-Agent"] = "resend-python/2.0.0"
+        headers["User-Agent"] = "rick-newsletter-engine/1.0"
+        headers["Accept"] = "application/json"
     if payload is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
     else:
         data = None
     req = Request(url, data=data, headers=headers, method=method)
-    try:
-        with urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-            return resp.status, json.loads(body) if body else {}
-    except HTTPError as e:
-        body = e.read().decode("utf-8")
+    for attempt in range(retries + 1):
         try:
-            parsed = json.loads(body)
-        except Exception:
-            parsed = {"raw": body}
-        return e.code, parsed
-    except URLError as e:
-        return 599, {"error": str(e)}
+            with urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else {}
+        except HTTPError as e:
+            body = e.read().decode("utf-8")
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = {"raw": body}
+            if e.code == 429 and attempt < retries:
+                retry_after = e.headers.get("Retry-After")
+                try:
+                    sleep_for = float(retry_after) if retry_after else 1.0 + attempt
+                except ValueError:
+                    sleep_for = 1.0 + attempt
+                time.sleep(sleep_for)
+                continue
+            return e.code, parsed
+        except URLError as e:
+            return 599, {"error": str(e)}
+
+    return 599, {"error": "request retry loop exhausted"}
 
 
 def get_all_contacts() -> list[Contact]:
@@ -122,7 +204,7 @@ def get_all_contacts() -> list[Contact]:
         params = {"audience_id": AUDIENCE_ID, "limit": 100}
         if after:
             params["after"] = after
-        status, data = request_json(f"{RESEND_CONTACTS}?{urlencode(params)}")
+        status, data = request_json(f"{RESEND_CONTACTS}?{urlencode(params)}", timeout=120)
         if status != 200:
             raise RuntimeError(f"Resend contacts fetch failed: {status} {data}")
         page = data.get("data", []) or []
@@ -143,37 +225,6 @@ def get_all_contacts() -> list[Contact]:
     return contacts
 
 
-def get_all_emails(max_pages: int = 20) -> list[EmailEvent]:
-    emails: list[EmailEvent] = []
-    after = None
-    pages = 0
-    while pages < max_pages:
-        params = {"limit": 100}
-        if after:
-            params["after"] = after
-        status, data = request_json(f"{RESEND_EMAILS}?{urlencode(params)}")
-        if status != 200:
-            raise RuntimeError(f"Resend emails fetch failed: {status} {data}")
-        page = data.get("data", []) or []
-        for item in page:
-            to_list = item.get("to") or []
-            to_email = to_list[0] if to_list else ""
-            emails.append(
-                EmailEvent(
-                    id=item.get("id", ""),
-                    to_email=to_email,
-                    subject=item.get("subject", ""),
-                    created_at=parse_dt(item.get("created_at")),
-                    last_event=(item.get("last_event") or "").lower(),
-                )
-            )
-        pages += 1
-        if not data.get("has_more") or not page:
-            break
-        after = page[-1].get("id")
-    return emails
-
-
 def load_email_set(path: Path) -> set[str]:
     emails: set[str] = set()
     if not path.exists():
@@ -184,6 +235,71 @@ def load_email_set(path: Path) -> set[str]:
             continue
         emails.add(raw.split("|")[0].strip().lower())
     return emails
+
+
+def load_suppression_set(path: Path = SUPPRESSION_FILE) -> set[str]:
+    emails: set[str] = set()
+    if not path.exists():
+        return emails
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        token = raw.strip().split("#", 1)[0].strip().lower()
+        if "@" not in token:
+            continue
+        emails.add(token.split()[0])
+    return emails
+
+
+def log_skipped_address(email: str, reason: str, stage: str) -> None:
+    SKIPPED_ADDRESSES.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "stage": stage,
+        "email": email,
+        "reason": reason,
+        "source": "newsletter-engine",
+    }
+    with SKIPPED_ADDRESSES.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def pre_send_check(email: str, stage: str, suppression_set: set[str]) -> tuple[bool, str]:
+    normalized = email.strip().lower()
+    if normalized in suppression_set:
+        reason = "suppression_list"
+        log_skipped_address(email, reason, stage)
+        return False, reason
+    try:
+        repo_runtime = Path(__file__).resolve().parents[1] / "runtime"
+        if str(repo_runtime) not in sys.path:
+            sys.path.insert(0, str(repo_runtime))
+        from email_validator import validate_for_outbound  # type: ignore
+    except Exception as exc:
+        reason = f"validator_unavailable:{type(exc).__name__}"
+        log_skipped_address(email, reason, stage)
+        return False, reason
+
+    ok, reason = validate_for_outbound(email)
+    if not ok:
+        log_skipped_address(email, reason, stage)
+    return ok, reason
+
+
+def load_broadcast_sent_set(subject: str, sent_date: str) -> set[str]:
+    sent: set[str] = set()
+    if not NEWSLETTER_LOG.exists():
+        return sent
+    marker = f"## {sent_date} — {subject}"
+    capture_next_recipient = False
+    for raw in NEWSLETTER_LOG.read_text().splitlines():
+        line = raw.strip()
+        if line == marker:
+            capture_next_recipient = True
+            continue
+        if capture_next_recipient:
+            if line.startswith("- "):
+                sent.add(line[2:].split("|", 1)[0].strip().lower())
+            capture_next_recipient = False
+    return sent
 
 
 def append_email_record(path: Path, line: str) -> None:
@@ -220,7 +336,33 @@ def first_name_from_email(email: str) -> str:
     return name.capitalize()
 
 
-def send_email(to_email: str, subject: str, html: str | None = None, text: str | None = None) -> tuple[bool, str]:
+def send_email(
+    to_email: str,
+    subject: str,
+    html: str | None = None,
+    text: str | None = None,
+    *,
+    ignore_channel_pause: bool = False,
+) -> tuple[bool, str]:
+    # Unified fail-closed per-recipient gate (2026-07-13): master kill +
+    # RICK_EMAIL_SEND_LIVE + merged suppression/DNC. cold=False — newsletter
+    # recipients are subscribers, cadence handled by the engine.
+    try:
+        wsroot = str(Path(__file__).resolve().parents[1])
+        if wsroot not in sys.path:
+            sys.path.insert(0, wsroot)
+        from runtime.kill_switches import is_send_allowed
+
+        allowed, gate_reason = is_send_allowed(to_email, cold=False)
+    except Exception as exc:
+        allowed, gate_reason = False, f"gate_unavailable:{type(exc).__name__}:{exc}"
+    if not allowed:
+        log_skipped_address(to_email, gate_reason, "send_gate")
+        print(f"SEND_BLOCKED reason={gate_reason} to={to_email}", file=sys.stderr)
+        return False, f"SEND_BLOCKED {gate_reason}"
+    paused, reason = email_channel_paused()
+    if paused and not ignore_channel_pause:
+        return False, f"email-channel-paused: {reason}"
     payload: dict[str, Any] = {
         "from": FROM_EMAIL,
         "to": [to_email],
@@ -236,6 +378,29 @@ def send_email(to_email: str, subject: str, html: str | None = None, text: str |
     return False, json.dumps(data, ensure_ascii=False)
 
 
+def email_channel_paused() -> tuple[bool, str]:
+    forced_pause = os.environ.get("RICK_EMAIL_CHANNEL_PAUSED", "").strip().lower()
+    if forced_pause in {"1", "true", "yes", "paused"}:
+        return True, os.environ.get("RICK_EMAIL_CHANNEL_PAUSE_REASON", "forced pause").strip()
+    db_path = Path(os.environ.get("RICK_RUNTIME_DB_FILE", str(RICK_VAULT / "runtime" / "rick-runtime.db"))).expanduser()
+    if not db_path.exists():
+        return False, ""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT status, paused_until, pause_reason FROM channel_state WHERE channel='email'").fetchone()
+        conn.close()
+        if not row or row[0] != "paused":
+            return False, ""
+        paused_until = row[1] or ""
+        if paused_until:
+            until = parse_dt(paused_until)
+            if datetime.now(timezone.utc) >= until:
+                return False, ""
+        return True, row[2] or f"paused until {paused_until}"
+    except Exception:
+        return False, ""
+
+
 def welcome_template(email: str) -> tuple[str, str]:
     name = first_name_from_email(email)
     subject = "Welcome aboard"
@@ -245,35 +410,6 @@ def welcome_template(email: str) -> tuple[str, str]:
   <p>Thanks for subscribing. You’re on the list now.</p>
   <p>I keep this one simple, practical, and weirdly honest, real numbers, real tests, no newsletter perfume.</p>
   <p>If you ever want something more specific, just reply.</p>
-  <p>— Rick</p>
-</div>
-""".strip()
-    return subject, html
-
-
-def warm_template(email: str, event: EmailEvent) -> tuple[str, str, str]:
-    name = first_name_from_email(email)
-    signal = "clicked" if event.last_event == "clicked" else "opened"
-    subject = f"Saw you {signal} that note"
-    html = f"""
-<div style="font-family:Arial,sans-serif;max-width:600px;line-height:1.6;color:#111">
-  <p>Hey {name},</p>
-  <p>Saw you {signal} the last email.</p>
-  <p>Curious what caught your eye. If you want, reply with one sentence and I’ll make the next note more useful.</p>
-  <p>— Rick</p>
-</div>
-""".strip()
-    return subject, html, signal
-
-
-def broadcast_template() -> tuple[str, str]:
-    week = datetime.now().strftime("%B %d")
-    subject = f"The Rick Report — Week of {week}"
-    html = f"""
-<div style="font-family:Arial,sans-serif;max-width:640px;line-height:1.7;color:#111">
-  <p>Hey,</p>
-  <p>This week’s Rick Report is ready.</p>
-  <p>Real numbers, real shipping, and whatever tiny chaos paid the bills.</p>
   <p>— Rick</p>
 </div>
 """.strip()
@@ -335,26 +471,35 @@ def main() -> int:
 
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(days=1)
-    today_weekday = now_utc.isoweekday()
+    channel_paused, pause_reason = email_channel_paused()
 
     lines: list[str] = []
-    lines.append(f"/subscribers endpoint: {request_json(SUBSCRIBERS_URL)[0]}")
+    if channel_paused:
+        lines.append(f"Email channel paused: {pause_reason}")
     status, body = request_json(SUBSCRIBERS_URL)
+    lines.append(f"/subscribers endpoint: {status}")
     lines.append(f"/subscribers body: {body.get('message') or body.get('raw') or body}")
 
     contacts = get_all_contacts()
     active_contacts = [c for c in contacts if not c.unsubscribed]
     external_contacts = [c for c in active_contacts if is_real_external(c.email)]
     welcome_sent = load_email_set(WELCOME_SENT)
-    warm_sent = load_email_set(WARM_SENT)
+    suppression_set = load_suppression_set()
 
     new_contacts = [c for c in external_contacts if c.created_at >= cutoff and c.email.lower() not in welcome_sent]
+    if len(new_contacts) > 5:
+        lines.append(f"Welcome cap active: {len(new_contacts)} eligible, sending first 5")
+        new_contacts = new_contacts[:5]
     lines.append(f"Audience contacts: {len(contacts)}")
     lines.append(f"Active external contacts: {len(external_contacts)}")
     lines.append(f"New since yesterday UTC cutoff ({cutoff.isoformat()}): {len(new_contacts)}")
 
     welcomes_sent_now = []
     for contact in new_contacts:
+        ok_to_send, validation_reason = pre_send_check(contact.email, "welcome", suppression_set)
+        if not ok_to_send:
+            lines.append(f"Welcome skipped by outbound validation: {contact.email} — {validation_reason}")
+            continue
         _suppressed, _supp_reason = _comm_suppressed(contact.email)
         if _suppressed:
             lines.append(f"Welcome suppressed (comm_history): {contact.email} — {_supp_reason}")
@@ -363,7 +508,7 @@ def main() -> int:
         if args.dry_run:
             ok, detail = True, "dry-run"
         else:
-            ok, detail = send_email(contact.email, subject, html=html)
+            ok, detail = send_email(contact.email, subject, html=html, ignore_channel_pause=True)
         if ok:
             welcomes_sent_now.append((contact.email, detail))
             lines.append(f"Welcome sent: {contact.email} -> {detail}")
@@ -375,66 +520,8 @@ def main() -> int:
 
     lines.append(f"Welcome emails sent: {len(welcomes_sent_now)}")
 
-    emails = get_all_emails(max_pages=20)
-    latest_warm: dict[str, EmailEvent] = {}
-    external_set = {c.email.lower() for c in external_contacts}
-    for event in emails:
-        email = event.to_email.lower().strip()
-        if email not in external_set:
-            continue
-        if event.last_event not in {"opened", "clicked"}:
-            continue
-        if email in latest_warm:
-            continue
-        latest_warm[email] = event
-
-    warm_candidates = [email for email, event in latest_warm.items() if email not in warm_sent]
-    lines.append(f"Warm contacts found: {len(latest_warm)}")
-
-    warm_sent_now = []
-    for email in warm_candidates:
-        _suppressed, _supp_reason = _comm_suppressed(email)
-        if _suppressed:
-            lines.append(f"Warm suppressed (comm_history): {email} — {_supp_reason}")
-            continue
-        event = latest_warm[email]
-        subject, html, signal = warm_template(email, event)
-        if args.dry_run:
-            ok, detail = True, "dry-run"
-        else:
-            ok, detail = send_email(email, subject, html=html)
-        if ok:
-            warm_sent_now.append((email, signal, detail))
-            lines.append(f"Warm follow-up sent: {email} ({signal}) -> {detail}")
-            if not args.dry_run:
-                append_email_record(WARM_SENT, f"{email}|{now_utc.date().isoformat()}|warm-followup-{signal}|{detail}")
-                time.sleep(0.35)
-        else:
-            lines.append(f"Warm follow-up failed: {email} -> {detail}")
-
-    lines.append(f"Warm follow-ups sent now: {len(warm_sent_now)}")
-
-    if today_weekday == 7:
-        subject, html = broadcast_template()
-        broadcast_targets = [c for c in external_contacts if c.email.lower() not in warm_sent]
-        lines.append(f"Sunday detected, broadcast target count: {len(broadcast_targets)}")
-        if args.dry_run:
-            lines.append(f"Broadcast draft ready: {subject}")
-        else:
-            sent = 0
-            suppressed_count = 0
-            for contact in broadcast_targets:
-                _suppressed, _supp_reason = _comm_suppressed(contact.email)
-                if _suppressed:
-                    suppressed_count += 1
-                    continue
-                ok, detail = send_email(contact.email, subject, html=html)
-                if ok:
-                    sent += 1
-                    append_email_record(NEWSLETTER_LOG, f"## {now_utc.date().isoformat()} — {subject}\n- {contact.email} | {detail}")
-            lines.append(f"Broadcast sent to active external audience: {sent} (suppressed by comm_history: {suppressed_count})")
-    else:
-        lines.append("Sunday broadcast: skipped (not Sunday)")
+    lines.append("Warm follow-ups: disabled for this daily job")
+    lines.append("Weekly broadcast: disabled for this daily job")
 
     # Comm-history digest: top 5 recipients by touch count last 7d
     lines.extend(_comm_digest_lines(days_back=7))
@@ -448,4 +535,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            message = "Newsletter engine already running; skipped overlapping invocation"
+            log_run([message])
+            print(message)
+            raise SystemExit(0)
+        raise SystemExit(main())

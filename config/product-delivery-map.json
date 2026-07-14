@@ -1,0 +1,15 @@
+{
+  "_comment": "Per-product fulfillment map for scripts/stripe-poll.py (2026-07-13). Keyed by Stripe product ID. A checkout for a product NOT listed here is loudly logged and skipped — never silently dropped, never fulfilled with the wrong product's welcome email. Keep in sync with RICK_PRODUCT_IDS + PORTFOLIO_PRODUCT_IDS in runtime/revenue_signals.py (RICK_REAL_PRODUCT_IDS is now their union, ops-watch scope only — LinguaLive here is portfolio fulfillment for Khrystyna, NOT Rick MRR).",
+  "products": {
+    "prod_UAnyfcxSShF33a": {
+      "name": "Rick Pro (meetrick.ai)",
+      "delivery_kind": "welcome_email",
+      "delivery_url": "https://meetrick.ai"
+    },
+    "prod_TV7oz6jtR1ejfd": {
+      "name": "LinguaLive Subscription",
+      "delivery_kind": "welcome_email",
+      "delivery_url": "https://www.lingualive.ai"
+    }
+  }
+}

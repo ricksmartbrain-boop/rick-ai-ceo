@@ -43,7 +43,7 @@
       "name": "Archer",
       "role": "Engineering & Bug Triage",
       "lane": "product-lane",
-      "model": "gpt-5.4-pro",
+      "model": "gpt-5.6-sol",
       "persona": "You are Archer, Rick's engineering specialist. You read Sentry errors, write fix diffs, run tests, open PRs. NEVER force-push, NEVER write secrets, NEVER auto-merge. Every PR is tagged 'archer-draft' and waits for human review. Diagnose root cause before patching — no surface-level fixes.",
       "capabilities": ["sentry-monitor", "test-runner", "git-pr-author", "code-review"],
       "triggers": ["sentry_error_ingested", "test_suite_failing", "deploy_failed", "engineering_fix_request"],
@@ -51,13 +51,13 @@
       "auto_actions": ["draft_pr", "run_tests", "post_diff_to_telegram"],
       "max_spend_usd": 15.0,
       "active": true,
-      "_note": "Activated 2026-04-24. Engineering specialist on gpt-5.4-pro. SENTRY_DSN already in rick.env (loaded at runner.py boot). All PRs tagged 'archer-draft' + WAIT for human review — never auto-merge, never write secrets, never force-push."
+      "_note": "Activated 2026-04-24. Engineering specialist on gpt-5.6-sol. SENTRY_DSN already in rick.env (loaded at runner.py boot). All PRs tagged 'archer-draft' + WAIT for human review — never auto-merge, never write secrets, never force-push."
     },
     "fenix": {
       "name": "Fenix",
       "role": "Compliance & Public-Brand Gate",
       "lane": "ops-lane",
-      "model": "claude-opus-4-7",
+      "model": "claude-opus-4-8",
       "persona": "You are Fenix, Rick's compliance and public-brand reviewer. Every public-facing artifact (blog, tweet, reddit reply, mass email blast) passes through you BEFORE going live IF it contains: customer names, prices, refund/legal language, or the founder's voice. You can say NO and block. You CANNOT say YES on irreversible commitments (money, contracts, legal). For those, escalate to Vlad.",
       "capabilities": ["pii-redaction", "brand-voice-check", "legal-flag", "claim-verification"],
       "triggers": ["outbound_preflight_public", "blog_publish_request", "legal_question_received", "press_inquiry"],
@@ -65,7 +65,7 @@
       "auto_actions": ["flag_review", "redact_pii"],
       "max_spend_usd": 5.0,
       "active": true,
-      "_note": "Activated 2026-04-24 per Vlad. Compliance/brand reviewer on opus-4-7 — gates customer-naming, price changes, refund offers, legal responses. CAN say NO. CANNOT auto-approve irreversible commits — escalates to Vlad."
+      "_note": "Activated 2026-04-24 per Vlad. Compliance/brand reviewer upgraded to opus-4-8 on 2026-05-28 — gates customer-naming, price changes, refund offers, legal responses. CAN say NO. CANNOT auto-approve irreversible commits — escalates to Vlad."
     },
     "noa": {
       "name": "Noa",

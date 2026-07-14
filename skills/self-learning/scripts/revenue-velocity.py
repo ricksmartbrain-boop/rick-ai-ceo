@@ -17,7 +17,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
@@ -39,6 +39,23 @@ LAUNCH_DATE = date(2026, 3, 13)  # meetrick.ai live date
 # RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts (recon-first).
 USE_RECON_PRIMARY = os.getenv("RICK_USE_RECONCILIATION_AS_PRIMARY", "0").strip() in ("1", "true", "True", "yes", "on")
 LIVE = True  # legacy flag kept for backward-compat (no-op now)
+
+# 2026-07-13: product-ID allowlist. The heuristic filter only catches the
+# Folderly $269s while they stay 100%-comped; the allowlist is structural.
+# Attribution-truth v2: current_mrr = RICK_PRODUCT_IDS only (meetrick);
+# LinguaLive is Khrystyna's — tracked separately as portfolio_mrr, NEVER summed.
+try:
+    sys.path.insert(0, str(WORKSPACE))
+    from runtime.revenue_signals import RICK_PRODUCT_IDS, PORTFOLIO_PRODUCT_IDS
+except Exception:
+    # Inline fallback — this script avoids hard cross-imports (see _is_phantom
+    # note). Keep in sync with runtime/revenue_signals.py.
+    RICK_PRODUCT_IDS = frozenset({
+        "prod_UAnyfcxSShF33a", "prod_UAbJqha8GV2lDC", "prod_URTpF3D8hAHUmX",
+        "prod_URTpx3MtWC0WYB", "prod_URTptzJL9gfGAT", "prod_U8mgNHBNVO9Zsy",
+        "prod_U8mgdTxX1zzryq",
+    })
+    PORTFOLIO_PRODUCT_IDS = frozenset({"prod_TV7oz6jtR1ejfd"})
 
 
 def _is_phantom(sub: dict, now_ts: int) -> tuple[bool, str]:
@@ -105,8 +122,10 @@ def _stripe_key() -> str:
     return ""
 
 
-def _stripe_mrr_filtered() -> float | None:
-    """Live Stripe MRR with phantom filter. Returns None on fetch failure."""
+def _stripe_mrr_filtered() -> tuple[float, float] | None:
+    """Live Stripe MRR with phantom filter. Returns (rick_mrr, portfolio_mrr)
+    or None on fetch failure. rick_mrr = RICK_PRODUCT_IDS (meetrick) only;
+    portfolio_mrr = PORTFOLIO_PRODUCT_IDS (LinguaLive — not Rick's). Never sum."""
     api_key = _stripe_key()
     if not api_key:
         return None
@@ -119,7 +138,8 @@ def _stripe_mrr_filtered() -> float | None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         now_ts = int(_time.time())
-        mrr = 0.0
+        rick_mrr = 0.0
+        portfolio_mrr = 0.0
         included = 0
         filtered = 0
         for sub in data.get("data", []):
@@ -129,28 +149,81 @@ def _stripe_mrr_filtered() -> float | None:
                 print(f"[revenue-velocity] FILTERED sub={sub_id} reason={reason}", file=sys.stderr)
                 filtered += 1
                 continue
+            sub_products = {
+                (item.get("price") or {}).get("product")
+                for item in sub.get("items", {}).get("data", [])
+            }
+            if not (sub_products & (RICK_PRODUCT_IDS | PORTFOLIO_PRODUCT_IDS)):
+                print(f"[revenue-velocity] FILTERED sub={sub_id} reason=product not in RICK/PORTFOLIO allowlists", file=sys.stderr)
+                filtered += 1
+                continue
             included += 1
             for item in sub.get("items", {}).get("data", []):
                 price = item.get("price", {})
+                product = price.get("product")
                 amt = price.get("unit_amount", 0) or 0
                 interval = price.get("recurring", {}).get("interval", "")
+                item_mrr = 0.0
                 if interval == "month":
-                    mrr += amt / 100
+                    item_mrr = amt / 100
                 elif interval == "year":
-                    mrr += amt / 100 / 12
-        print(f"[revenue-velocity] Stripe MRR=${mrr:.2f} (included {included}, filtered {filtered})", file=sys.stderr)
-        return mrr
+                    item_mrr = amt / 100 / 12
+                if product in RICK_PRODUCT_IDS:
+                    rick_mrr += item_mrr
+                elif product in PORTFOLIO_PRODUCT_IDS:
+                    portfolio_mrr += item_mrr
+        print(f"[revenue-velocity] Stripe Rick MRR=${rick_mrr:.2f} | portfolio (LinguaLive, not Rick's)=${portfolio_mrr:.2f} (included {included}, filtered {filtered})", file=sys.stderr)
+        return rick_mrr, portfolio_mrr
     except Exception as exc:
         print(f"[revenue-velocity] Stripe fetch failed: {exc}", file=sys.stderr)
         return None
 
 
-def get_stripe_mrr() -> float:
-    """Return current MRR.
+def _consistency_check(live_mrr: float | None) -> None:
+    """Cross-source truth check (2026-07-12): if live Stripe and a fresh
+    (<24h old) reconciliation file disagree by >10%, append one line to
+    operations/log-anomalies.md. Silent no-op when either source is
+    missing, zero, or the reconciliation file is stale."""
+    if live_mrr is None or live_mrr <= 0:
+        return
+    candidates = sorted(REVENUE_DIR.glob("reconciliation-*.md"), reverse=True)
+    if not candidates:
+        return
+    recon_path = candidates[0]
+    try:
+        age_s = datetime.now().timestamp() - recon_path.stat().st_mtime
+    except OSError:
+        return
+    if age_s > 24 * 3600:
+        return
+    recon_mrr = _mrr_from_reconciliation()
+    if recon_mrr is None or recon_mrr <= 0:
+        return
+    if abs(live_mrr - recon_mrr) / max(live_mrr, recon_mrr) > 0.10:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"- {ts} [revenue-split-brain] live Stripe MRR ${live_mrr:.2f} vs "
+            f"{recon_path.name} ${recon_mrr:.2f} disagree >10% within 24h — "
+            f"reconcile revenue sources (revenue-velocity consistency check)\n"
+        )
+        anomalies = DATA_ROOT / "operations" / "log-anomalies.md"
+        try:
+            anomalies.parent.mkdir(parents=True, exist_ok=True)
+            with anomalies.open("a", encoding="utf-8") as f:
+                f.write(line)
+            print(f"[revenue-velocity] ANOMALY logged: live ${live_mrr:.2f} vs recon ${recon_mrr:.2f}", file=sys.stderr)
+        except OSError as exc:
+            print(f"[revenue-velocity] anomaly log write failed: {exc}", file=sys.stderr)
+
+
+def get_stripe_mrr() -> tuple[float, float]:
+    """Return (rick_mrr, portfolio_mrr). rick_mrr = meetrick products only;
+    portfolio_mrr = LinguaLive ops (Khrystyna's, NOT Rick's revenue).
 
     Order of trust (2026-04-24):
       1. Live Stripe (filtered for phantoms via _is_phantom)
-      2. Reconciliation file (Stripe outage / all-filtered fallback)
+      2. Reconciliation file (Stripe outage / all-filtered fallback; Rick-only,
+         portfolio falls back to 0.0)
       3. 0.0 (final fallback)
 
     RICK_USE_RECONCILIATION_AS_PRIMARY=1 inverts (recon-first).
@@ -158,18 +231,20 @@ def get_stripe_mrr() -> float:
     if USE_RECON_PRIMARY:
         real = _mrr_from_reconciliation()
         if real is not None:
-            return real
-        live_mrr = _stripe_mrr_filtered()
-        return live_mrr if live_mrr is not None else 0.0
+            return real, 0.0
+        live = _stripe_mrr_filtered()
+        return live if live is not None else (0.0, 0.0)
 
     # Default: Stripe primary
-    live_mrr = _stripe_mrr_filtered()
-    if live_mrr is not None and live_mrr > 0:
-        return live_mrr
+    live = _stripe_mrr_filtered()
+    rick_live = live[0] if live is not None else None
+    _consistency_check(rick_live)
+    if rick_live is not None and rick_live > 0:
+        return live
     real = _mrr_from_reconciliation()
     if real is not None:
-        return real
-    return 0.0
+        return real, (live[1] if live is not None else 0.0)
+    return (0.0, live[1] if live is not None else 0.0)
 
 def load_velocity_log() -> dict:
     if VELOCITY_LOG.exists():
@@ -278,7 +353,7 @@ def check_milestone_gates(mrr: float, vel: dict) -> None:
         trigger_escalation(f"Day {day}, $0 revenue — strategy check needed", "TWEAK", vel)
 
 def main() -> None:
-    mrr = get_stripe_mrr()
+    mrr, portfolio_mrr = get_stripe_mrr()
     vel = load_velocity_log()
 
     entries = vel.get("entries", [])
@@ -311,11 +386,12 @@ def main() -> None:
     delta_7d = (entries_7d[-1]["mrr"] - entries_7d[0]["mrr"]) if len(entries_7d) >= 2 else 0
     delta_30d = (entries_30d[-1]["mrr"] - entries_30d[0]["mrr"]) if len(entries_30d) >= 2 else 0
 
-    vel["current_mrr"] = mrr
+    vel["current_mrr"] = mrr  # Rick-only (meetrick products) — attribution-truth v2
+    vel["portfolio_mrr"] = portfolio_mrr  # LinguaLive ops (Khrystyna's) — NOT Rick's, never sum
     vel["delta_7d"] = delta_7d
     vel["delta_30d"] = delta_30d
 
-    print(f"[revenue-velocity] MRR=${mrr:.0f} | Δ7d=${delta_7d:+.0f} | Δ30d=${delta_30d:+.0f} | flat_days={vel.get('consecutive_flat_days',0)}")
+    print(f"[revenue-velocity] Rick MRR=${mrr:.0f} | portfolio=${portfolio_mrr:.0f} (not Rick's) | Δ7d=${delta_7d:+.0f} | Δ30d=${delta_30d:+.0f} | flat_days={vel.get('consecutive_flat_days',0)}")
 
     check_milestone_gates(mrr, vel)
     save_velocity_log(vel)
@@ -323,7 +399,7 @@ def main() -> None:
     # Write to daily note
     daily = DATA_ROOT / f"memory/{today_str}.md"
     if daily.exists():
-        line = f"\n- **Revenue velocity**: MRR=${mrr:.0f} | Δ7d=${delta_7d:+.0f} | flat_days={vel.get('consecutive_flat_days',0)}\n"
+        line = f"\n- **Revenue velocity**: Rick MRR=${mrr:.0f} (meetrick only) | portfolio=${portfolio_mrr:.0f} (LinguaLive, not Rick's) | Δ7d=${delta_7d:+.0f} | flat_days={vel.get('consecutive_flat_days',0)}\n"
         with open(daily, "a") as f:
             f.write(line)
 

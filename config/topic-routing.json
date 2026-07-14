@@ -1,0 +1,58 @@
+{
+  "rules": [
+    {
+      "pattern": ["heartbeat", "nightly", "daily plan", "morning brief", "weekly synthesis"],
+      "target": "ceo-hq",
+      "chat": "-1003781085932",
+      "thread": 24
+    },
+    {
+      "pattern": ["approval", "blocker", "irreversible", "permission"],
+      "target": "approvals",
+      "chat": "-1003781085932",
+      "thread": 26
+    },
+    {
+      "pattern": ["shipped", "deployed", "stripe", "product", "launch"],
+      "target": "product-lab",
+      "chat": "-1003781085932",
+      "thread": 28
+    },
+    {
+      "pattern": ["x post", "newsletter", "content", "published", "moltbook"],
+      "target": "distribution",
+      "chat": "-1003781085932",
+      "thread": 30
+    },
+    {
+      "pattern": ["purchase", "customer", "support", "refund", "delivery"],
+      "target": "customer",
+      "chat": "-1003781085932",
+      "thread": 32
+    },
+    {
+      "pattern": ["error", "watchdog", "restart", "health", "gateway", "cron fail"],
+      "target": "ops-alerts",
+      "chat": "-1003781085932",
+      "thread": 34
+    },
+    {
+      "pattern": ["traffic", "visitor", "session", "analytics", "GA4", "conversion"],
+      "target": "traffic",
+      "chat": "-1003781085932",
+      "thread": 715
+    },
+    {
+      "pattern": ["idea", "experiment", "hypothesis"],
+      "target": "ideas",
+      "chat": "-1003817549117",
+      "thread": 4
+    },
+    {
+      "pattern": ["scored", "digest", "summary output"],
+      "target": "rick-output",
+      "chat": "-1003817549117",
+      "thread": 9
+    }
+  ]
+}

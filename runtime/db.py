@@ -29,7 +29,7 @@ def connect() -> sqlite3.Connection:
     # Set restrictive umask before creating the DB file to avoid permission race
     old_umask = os.umask(0o077)
     try:
-        connection = sqlite3.connect(str(db_path))
+        connection = sqlite3.connect(str(db_path), timeout=30.0)
     finally:
         os.umask(old_umask)
     # Ensure DB file permissions are owner-only
@@ -47,7 +47,7 @@ def connect() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA busy_timeout = 30000")
     return connection
 
 
@@ -75,11 +75,22 @@ def migrate_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "workflows", "telegram_target", "TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "workflows", "openclaw_session_key", "TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "jobs", "lane", "TEXT NOT NULL DEFAULT 'ceo-lane'")
-    connection.execute(
-        "UPDATE workflows SET finished_at=updated_at"
+    # Check-before-write: an unconditional UPDATE here made every connection
+    # init a writer, which fails with "database is locked" (SQLITE_BUSY_SNAPSHOT,
+    # not covered by busy_timeout) when a parallel session holds the write lock —
+    # observed 4x on 2026-07-13 killing daemon heartbeats.
+    needs_finished_backfill = connection.execute(
+        "SELECT 1 FROM workflows"
         " WHERE finished_at IS NULL"
         " AND status IN ('done','published','fulfilled','denied','failed','cancelled')"
-    )
+        " LIMIT 1"
+    ).fetchone()
+    if needs_finished_backfill:
+        connection.execute(
+            "UPDATE workflows SET finished_at=updated_at"
+            " WHERE finished_at IS NULL"
+            " AND status IN ('done','published','fulfilled','denied','failed','cancelled')"
+        )
 
     # Ensure newer tables exist (safe to re-run due to IF NOT EXISTS)
     for table_check in [

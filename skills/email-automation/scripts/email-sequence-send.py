@@ -27,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 from functools import lru_cache
@@ -41,6 +42,7 @@ SENT_DIR = DATA_ROOT / "mailbox" / "sent"
 LOG_FILE = DATA_ROOT / "operations" / "email-sequence-send.jsonl"
 SUPPRESSION_FILE = DATA_ROOT / "mailbox" / "suppression.txt"
 WARMUP_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "sender-warmup-schedule.py"
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 DEFAULT_FROM = os.getenv("RICK_EMAIL_FROM") or os.getenv("MEETRICK_FROM_EMAIL") or "Rick <hello@meetrick.ai>"
@@ -65,17 +67,21 @@ def load_json(path: Path) -> dict:
 
 
 def load_suppressions() -> set[str]:
-    if not SUPPRESSION_FILE.exists():
-        return set()
-    try:
-        lines = SUPPRESSION_FILE.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return set()
+    # Merged suppression (2026-07-13): mailbox/suppression.txt + control/
+    # dnc-list.txt. Entries may be addresses or '@domain'. Inline comments
+    # after the address ('addr  # reason ts') are stripped.
     result: set[str] = set()
-    for line in lines:
-        trimmed = line.strip()
-        if trimmed and not trimmed.startswith("#"):
-            result.add(trimmed.lower())
+    for path in (SUPPRESSION_FILE, DATA_ROOT / "control" / "dnc-list.txt"):
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            trimmed = line.split("#", 1)[0].strip()
+            if trimmed:
+                result.add(trimmed.lower())
     return result
 
 
@@ -167,6 +173,7 @@ def send_via_resend(*, to: str, subject: str, html: str, text: str, from_addr: s
         data=data,
         headers={
             "Content-Type": "application/json",
+            "User-Agent": "meetrick-rick/1.0",
             "Authorization": f"Bearer {api_key}",
         },
         method="POST",
@@ -193,6 +200,27 @@ def append_log(events: list[dict]) -> None:
         for event in events:
             row = {"timestamp": now().isoformat(timespec="seconds"), **event}
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def email_channel_block_reason() -> str | None:
+    """Return a block reason when the shared email kill switch is not open."""
+    try:
+        root = str(WORKSPACE_ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from runtime.db import connect
+        from runtime.kill_switches import ChannelPaused, assert_channel_active
+
+        conn = connect()
+        try:
+            assert_channel_active(conn, "email")
+            return None
+        except ChannelPaused as exc:
+            return exc.reason
+        finally:
+            conn.close()
+    except Exception as exc:
+        return f"gate_unavailable: {type(exc).__name__}: {exc}"
 
 
 @lru_cache(maxsize=1)
@@ -258,7 +286,8 @@ def deliver_draft(
     normalized_to = to_email.lower()
     sent_target = SENT_DIR / sequence_name / md_path.name
 
-    if normalized_to in suppressions:
+    to_domain = "@" + normalized_to.rsplit("@", 1)[-1] if "@" in normalized_to else ""
+    if normalized_to in suppressions or (to_domain and to_domain in suppressions):
         if not dry_run:
             ensure_parent(sent_target)
             md_path.rename(sent_target)
@@ -334,6 +363,30 @@ def deliver_draft(
             "status": "missing-resend-api-key",
         }
 
+    # Unified fail-closed per-recipient gate (2026-07-13). Step 1 of a
+    # sequence is a cold first touch → 7-day frequency cap applies; later
+    # steps are scheduled follow-ups and skip only the cap.
+    try:
+        root = str(WORKSPACE_ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from runtime.kill_switches import is_send_allowed
+
+        allowed, gate_reason = is_send_allowed(to_email, cold=step_num in (None, 1))
+    except Exception as exc:
+        allowed, gate_reason = False, f"gate_unavailable:{type(exc).__name__}:{exc}"
+    if not allowed:
+        print(f"SEND_BLOCKED reason={gate_reason} to={to_email}", file=sys.stderr)
+        return {
+            "file": str(md_path),
+            "sequence": sequence_name,
+            "to": to_email,
+            "subject": subject,
+            "step": step_num,
+            "status": "send-blocked",
+            "reason": gate_reason,
+        }
+
     ok, info = send_via_resend(
         to=to_email,
         subject=subject,
@@ -403,6 +456,25 @@ def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None, a
 def command_send(dry_run: bool) -> int:
     suppressions = load_suppressions()
     api_key = os.getenv("RESEND_API_KEY")
+    if not dry_run:
+        block_reason = email_channel_block_reason()
+        if block_reason:
+            events = [{"sequence": "all", "status": "channel-paused", "reason": block_reason}]
+            append_log(events)
+            print(
+                json.dumps(
+                    {
+                        "events": events,
+                        "count": len(events),
+                        "sent": 0,
+                        "attempt_limit": 0,
+                        "failed": 0,
+                        "dry_run": dry_run,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
     warmup = _warmup_module()
     attempt_limit = None if dry_run else max(0, int(warmup.get_today_cap()) - int(warmup.sends_today()))
     events = walk_outbox(dry_run=dry_run, suppressions=suppressions, api_key=api_key, attempt_limit=attempt_limit)

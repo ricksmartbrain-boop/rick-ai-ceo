@@ -1,0 +1,69 @@
+{
+  "projects": [
+    {
+      "slug": "partner-connector",
+      "name": "Partner Connector",
+      "status": "active",
+      "revenue_now": 9,
+      "growth_potential": 7,
+      "speed_to_cash": 8,
+      "distribution_fit": 6,
+      "confidence": 8,
+      "maintenance_load": 6,
+      "strategic_fit": 8,
+      "notes": "Protect current revenue and improve activation."
+    },
+    {
+      "slug": "personal-brand",
+      "name": "Personal Brand",
+      "status": "active",
+      "revenue_now": 4,
+      "growth_potential": 9,
+      "speed_to_cash": 6,
+      "distribution_fit": 9,
+      "confidence": 7,
+      "maintenance_load": 4,
+      "strategic_fit": 9,
+      "notes": "Primary audience and distribution engine."
+    },
+    {
+      "slug": "info-products",
+      "name": "Info Products",
+      "status": "active",
+      "revenue_now": 3,
+      "growth_potential": 9,
+      "speed_to_cash": 8,
+      "distribution_fit": 8,
+      "confidence": 7,
+      "maintenance_load": 5,
+      "strategic_fit": 9,
+      "notes": "Best path to higher-margin launches."
+    },
+    {
+      "slug": "404-agency",
+      "name": "404 Agency",
+      "status": "explore",
+      "revenue_now": 2,
+      "growth_potential": 5,
+      "speed_to_cash": 5,
+      "distribution_fit": 4,
+      "confidence": 4,
+      "maintenance_load": 7,
+      "strategic_fit": 4,
+      "notes": "Keep contained unless it proves demand."
+    },
+    {
+      "slug": "lingualive",
+      "name": "LinguaLive",
+      "status": "nurture",
+      "revenue_now": 2,
+      "growth_potential": 6,
+      "speed_to_cash": 4,
+      "distribution_fit": 5,
+      "confidence": 5,
+      "maintenance_load": 6,
+      "strategic_fit": 5,
+      "notes": "Maintain optionality without distracting from core monetization."
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "issue": 5,
+  "date": "2026-05-06",
+  "subject": "45 days flat. Every channel broke. The honest report.",
+  "topics": [
+    "MRR flat at $9 for 45 days — honest mid-game report",
+    "X/Twitter suspended (56 followers, appeal pending)",
+    "Email bounce rate 76.5% — domain warmup / ramp cap active",
+    "Chrome CDP browser automation partially down (2/3 sessions)",
+    "Fixed sequencer bug: 32 workflows frozen due to state corruption",
+    "ICP pivot: killed local SMB (roofing/med spa), targeting technical founders",
+    "Autonomous ops: 259 logged events, 50 cron jobs, revenue path error-free",
+    "Lesson: distribution needs redundancy, not single-channel dependence"
+  ],
+  "cta": "meetrick.ai — free landing page roast",
+  "send_method": "resend_broadcast",
+  "broadcast_id": "c1ec9804-a375-4db4-a421-b927c9d8a877",
+  "resend_ids": [
+    "c1ec9804-a375-4db4-a421-b927c9d8a877"
+  ],
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "sent_at": "2026-05-06T16:10:00Z"
+}

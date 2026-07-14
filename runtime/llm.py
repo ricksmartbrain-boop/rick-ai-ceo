@@ -78,12 +78,12 @@ def cleanup_job_tracking(job_id: str) -> None:
 ROUTES = {
     "strategy": {
         "env": "RICK_MODEL_OPENAI_STRATEGIC",
-        "default": "gpt-5.4",
+        "default": "gpt-5.6-sol",
         "provider": "openai",
     },
     "coding": {
         "env": "RICK_MODEL_OPENAI_CODING",
-        "default": "gpt-5.3-codex",
+        "default": "gpt-5.6-sol",
         "provider": "openai",
     },
     "writing": {
@@ -93,7 +93,7 @@ ROUTES = {
     },
     "review": {
         "env": "RICK_MODEL_ANTHROPIC_STRATEGIC",
-        "default": "claude-opus-4-7",
+        "default": "claude-opus-4-8",
         "provider": "anthropic",
     },
     "analysis": {
@@ -152,53 +152,56 @@ ROUTE_REASONING_EFFORT: dict[str, str] = {
     "coding": "high",
 }
 STRATEGY_PANEL_DEFAULTS = (
-    ("openai", "RICK_MODEL_OPENAI_STRATEGIC_PRO", "gpt-5.4"),
-    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-7"),
+    ("openai", "RICK_MODEL_OPENAI_STRATEGIC_PRO", "gpt-5.6-sol"),
+    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-8"),
     ("google", "RICK_MODEL_GOOGLE_WORKHORSE", "gemini-3.1-pro-preview"),
 )
 ROUTE_FALLBACK_DEFAULTS = {
     "coding": (
+        ("openai", "gpt-5.6-terra"),
         ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
         ("openai", "gpt-5.3-codex"),
-        ("anthropic", "claude-opus-4-7"),
+        ("anthropic", "claude-opus-4-8"),
     ),
     "writing": (
-        ("openai", "gpt-5.4"),
+        ("openai", "gpt-5.6-terra"),
         ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-opus-4-7"),
+        ("anthropic", "claude-opus-4-8"),
     ),
     "review": (
         # 2026-04-27: Anthropic billing-skip caught dropping review
-        # (opus-4-7) → gpt-5.4-mini, violating smart-models invariant.
-        # Added gpt-5.4 (full) as the next-best after Google so opus
-        # failures don't degrade to the cheap mini.
+        # (opus-4-8) → gpt-5.4-mini, violating smart-models invariant.
+        # GPT-5.6 Sol/Terra keep review work on smart OpenAI models when
+        # Anthropic fails, without degrading to a cheap mini-class model.
         ("google", "gemini-3.1-pro-preview"),
-        ("openai", "gpt-5.4"),
-        ("openai", "gpt-5.4-mini"),
+        ("openai", "gpt-5.6-sol"),
+        ("openai", "gpt-5.6-terra"),
     ),
     "analysis": (
-        ("openai", "gpt-5.4"),
+        ("openai", "gpt-5.6-terra"),
         ("anthropic", "claude-sonnet-4-6"),
     ),
     "heartbeat": (
         ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
+        ("openai", "gpt-5.6-luna"),
     ),
     "research": (
+        ("openai", "gpt-5.6-terra"),
         ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
     ),
     "strategy": (
         # When Anthropic is down (billing-skip 2026-04-27) the chain used
-        # to fall to Google then break. Added gpt-5.4 (full, not mini) as
-        # second fallback so strategic reasoning doesn't degrade silently.
+        # to fall to Google then break. GPT-5.6 Terra keeps strategic
+        # reasoning from degrading silently after non-OpenAI failures.
         ("anthropic", "claude-sonnet-4-6"),
         ("google", "gemini-3.1-pro-preview"),
-        ("openai", "gpt-5.4"),
+        ("openai", "gpt-5.6-terra"),
     ),
 }
-STRATEGY_SYNTHESIS_DEFAULT = ("openai", "RICK_STRATEGY_PANEL_SYNTHESIS_MODEL", "openai:gpt-5.4")
+STRATEGY_SYNTHESIS_DEFAULT = ("openai", "RICK_STRATEGY_PANEL_SYNTHESIS_MODEL", "openai:gpt-5.6-sol")
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 ROOT_DIR = Path(__file__).resolve().parents[1]
 USAGE_FILE = Path(
@@ -1226,17 +1229,21 @@ def daily_spend_usd() -> float:
 
 
 def _get_daily_cap() -> float:
-    """Parse daily LLM spend cap from env. Returns 0 to disable."""
+    """Parse daily LLM spend cap from env. Returns 0 to disable.
+
+    Fail-safe default matches the configured rick.env value ($15): a consumer
+    launched without sourcing rick.env used to silently inherit a $500 cap.
+    """
     try:
-        return float(os.getenv("RICK_LLM_DAILY_CAP_USD", "500"))
+        return float(os.getenv("RICK_LLM_DAILY_CAP_USD", "15"))
     except (TypeError, ValueError):
-        return 500.0
+        return 15.0
 
 
 def check_daily_budget(route: str) -> tuple[bool, float]:
     """Return (allowed, current_spend). Heartbeat is always allowed.
 
-    Cap is controlled by RICK_LLM_DAILY_CAP_USD (default: 50, 0 = unlimited).
+    Cap is controlled by RICK_LLM_DAILY_CAP_USD (default: 15, 0 = unlimited).
     """
     spent = daily_spend_usd()
     if route == "heartbeat":

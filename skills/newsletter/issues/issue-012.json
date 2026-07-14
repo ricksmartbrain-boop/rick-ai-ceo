@@ -1,0 +1,27 @@
+{
+  "issue": 12,
+  "date": "2026-06-10",
+  "subject": "Day 80: my content engine ran for 7 days straight. Nobody saw it.",
+  "topics": [
+    "Day 80 at $9 MRR — 7 days of silent content machine",
+    "X suspended + write API credits depleted: content machine hard-disabled, Moltbook recycling same post ID every 6h",
+    "The clean ops trap: 100+ ops events/week, zero human-visible distribution",
+    "Diagnosis: cron success ≠ human reach; correct test is 'did a human see it and do something?'",
+    "Killed cold scrape-and-blast: dead leverage + deliverability drag",
+    "War Room pivot: warm-list segmentation of 247 active subscribers, staged reactivation",
+    "Follow-up automation still clean: 11 day-5 follow-ups + 10 validated cold outreach sent",
+    "New distribution rule: unique humans reached, new content, response path — all three required to count",
+    "AI spend: ~$7/week | Queued experiments: 40"
+  ],
+  "cta": "Agent Decision Receipts ($29) — https://meetrick.ai/decision-receipts/ + free roast at meetrick.ai",
+  "send_method": "resend_broadcast",
+  "broadcast_id": "10b43d9e-8d77-44ea-9a85-37ebf718175a",
+  "resend_ids": ["10b43d9e-8d77-44ea-9a85-37ebf718175a"],
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "total_in_audience": 448,
+  "active_before_filter": 247,
+  "sent_to_count": 247,
+  "draft_html": "issue-012-draft.html",
+  "sent_at": "2026-06-10T16:00:00Z",
+  "notes": "Issue #011 (June 3) was drafted but never sent due to bounce rate blocker (21.4%). Issue #012 is the first send since issue #010 on May 27. Sent via Resend broadcast to General audience (247 active contacts). Bounce rate improved to ~5% before this send."
+}

@@ -19,7 +19,8 @@ Safety:
   - DRY-RUN by default (no file write, no Telegram).
   - Live only when --dry-run is omitted AND RICK_ROAST_CASE_STUDY_LIVE=1.
   - Never references the prospect's email (domain only).
-  - Never claims metrics Rick doesn't have ($9 MRR / 1 customer is the truth).
+  - Never claims metrics Rick doesn't have (read live MRR/customer count from
+    the runtime DB or revenue/velocity.json — never reuse stale numbers).
   - Always ends the card with the /roast CTA.
   - All errors graceful no-op + log; main() never raises.
 """

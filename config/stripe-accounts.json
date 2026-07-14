@@ -1,0 +1,19 @@
+{
+  "accounts": {
+    "partner_connector": {
+      "account_id": "acct_replace_me",
+      "type": "connected",
+      "product": "partner-connector"
+    },
+    "rick_info_products": {
+      "account_id": "acct_replace_me",
+      "type": "connected",
+      "product": "info-products"
+    },
+    "personal_brand": {
+      "account_id": "acct_replace_me",
+      "type": "connected",
+      "product": "personal-brand"
+    }
+  }
+}

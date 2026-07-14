@@ -1,0 +1,56 @@
+---
+name: executive-orchestrator
+description: Central executive brain for Rick. Use when running heartbeat, nightly, weekly, scorecard, or model-routing flows so priorities stay portfolio-aware and economically grounded.
+---
+
+# Executive Orchestrator
+
+This skill is the synthesis layer that `rick-v4` still only partially covered.
+
+It owns:
+- model routing resolution
+- executive heartbeat, nightly, and weekly briefs
+- portfolio scorecard ranking
+- shipping-discipline checks
+- top-action recommendation generation
+
+## Commands
+
+### Doctor
+
+```bash
+bash scripts/rick-doctor.sh
+```
+
+### Model Router
+
+```bash
+python3 scripts/model-router.py --task strategy
+python3 scripts/model-router.py --task coding --format json
+python3 scripts/model-router.py --list
+```
+
+### Executive Loops
+
+```bash
+python3 scripts/rick-exec.py heartbeat --write
+python3 scripts/rick-exec.py nightly --write
+python3 scripts/rick-exec.py weekly --write
+python3 scripts/rick-exec.py score
+```
+
+## Inputs
+
+- `RICK_DATA_ROOT`
+- `RICK_PORTFOLIO_SCORECARDS_FILE`
+- model alias env vars
+- latest daily note
+- latest revenue snapshot
+- control-plane state
+
+## Outputs
+
+- executive briefings in `$RICK_DATA_ROOT/control/briefings/`
+- updated tomorrow plan suggestions
+- ranked project score table
+- action recommendations grounded in shipping, revenue, and portfolio pressure

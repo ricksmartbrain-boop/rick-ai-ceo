@@ -24,6 +24,10 @@ from typing import Optional
 MEETRICK_URL_RE = re.compile(r"https?://meetrick\.ai[^\s)>\]}\"'`]*")
 
 # Default UTM lane per channel when caller doesn't specify one.
+#
+# X (Twitter) traffic splits across four sub-sources — see X_SUBSOURCES below.
+# `funnel-attribution.py --x-share` aggregates all `utm_source` values starting
+# with `x_` (or the bare `x`) into a single weekly X-traffic share number.
 DEFAULT_LANE_BY_CHANNEL = {
     "email": "outbound",
     "linkedin": "outbound",
@@ -34,8 +38,16 @@ DEFAULT_LANE_BY_CHANNEL = {
     "threads": "distribution",
     "instagram": "distribution",
     "x": "distribution",
+    "x_thread": "distribution",   # operator-pasted X thread (one-to-many broadcast)
+    "x_reply": "distribution",    # operator-pasted X reply on someone else's post
+    "x_dm": "outbound",           # operator-sent X DM (one-to-one)
+    "x_bio": "lifecycle",         # static link in X profile bio
     "newsletter": "lifecycle",
 }
+
+# All UTM source values that count as "X traffic" for the funnel-attribution
+# X-share number. Keep this in sync with DEFAULT_LANE_BY_CHANNEL keys above.
+X_SUBSOURCES = ("x", "x_thread", "x_reply", "x_dm", "x_bio")
 
 
 def _lane_for(channel: str, lane: Optional[str]) -> str:

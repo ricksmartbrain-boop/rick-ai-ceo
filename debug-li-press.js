@@ -1,0 +1,22 @@
+const { chromium } = require('/opt/homebrew/lib/node_modules/playwright');
+(async()=>{
+ const browser=await chromium.connectOverCDP('http://127.0.0.1:9225');
+ const p=browser.contexts()[0].pages()[0];
+ await p.goto('https://www.linkedin.com/feed/',{waitUntil:'domcontentloaded',timeout:30000});
+ await p.waitForTimeout(4000);
+ const btn = p.locator('[role="button"]').filter({ hasText: 'Start a post' }).first();
+ const box = await btn.boundingBox();
+ if (box) await p.mouse.click(box.x+box.width/2, box.y+box.height/2);
+ await p.waitForTimeout(3000);
+ const composer = p.locator('[role="dialog"]').filter({ hasText: 'What do you want to talk about?' }).first();
+ const editor = composer.locator('div.ql-editor').first();
+ await editor.click({timeout:10000});
+ await editor.pressSequentially('hello world');
+ await p.waitForTimeout(1000);
+ console.log('textContent', await editor.textContent().catch(e=>'ERR:'+e.message));
+ const post = composer.getByRole('button', {name:/^Post$/}).first();
+ console.log('post visible', await post.isVisible().catch(()=>false));
+ console.log('post aria disabled', await post.getAttribute('aria-disabled').catch(()=>null));
+ console.log('post disabled prop', await post.evaluate(el => el.disabled).catch(e=>'ERR'));
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

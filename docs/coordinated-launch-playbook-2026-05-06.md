@@ -127,7 +127,7 @@ If 5 fails → launch can still proceed, but log the data gap and patch within 4
 - No new crons / LaunchAgents / autonomy theater.
 - No payment surface changes.
 - No website redesign — `/this-week` and `/pilot` are the surfaces, as-is.
-- Smart-models invariant: opus-4-7 for orchestration; sonnet-4-6 for drafting. No downgrades.
+- Smart-models invariant: opus-4-8 for orchestration; sonnet-4-6 for drafting. No downgrades.
 - X DMs and posts stay manual for the entire 72h window. No companion agent.
 - Cold-email channel stays paused.
 

@@ -1,0 +1,15 @@
+import { chromium } from 'playwright';
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+const ctx = browser.contexts()[0] || await browser.newContext();
+const page = ctx.pages()[0] || await ctx.newPage();
+await page.goto('https://www.instagram.com/accounts/login/', {waitUntil:'domcontentloaded', timeout:30000}).catch(()=>{});
+await page.waitForTimeout(3000);
+console.log('URL', page.url());
+console.log('TITLE', await page.title().catch(()=>''));
+const body = await page.locator('body').innerText({timeout:5000}).catch(()=> '');
+console.log('BODY', body.slice(0,1200));
+const inputs = await page.locator('input').evaluateAll(els => els.map(e => ({name:e.getAttribute('name'), type:e.getAttribute('type'), aria:e.getAttribute('aria-label'), placeholder:e.getAttribute('placeholder')}))).catch(e => []);
+console.log('INPUTS', JSON.stringify(inputs, null, 2));
+const buttons = await page.locator('button').evaluateAll(els => els.map(e => ({text:(e.textContent||'').trim().slice(0,80), type:e.getAttribute('type'), aria:e.getAttribute('aria-label')}))).catch(e => []);
+console.log('BUTTONS', JSON.stringify(buttons, null, 2));
+await browser.close();

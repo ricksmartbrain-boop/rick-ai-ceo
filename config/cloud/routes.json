@@ -1,0 +1,41 @@
+{
+    "telegram": {
+        "model": "claude-sonnet-4-6",
+        "priority": 99,
+        "thinking": "off"
+    },
+    "model-routes": {
+        "telegram": {
+            "channel": {
+                "model": "claude-sonnet-4-6"
+            }
+        }
+    },
+  "war_room": {
+    "model": "claude-opus-4-8"
+  },
+  "product_launch": {
+    "model": "claude-opus-4-8"
+    },
+    "coding": {
+        "model": "gpt-5.6-sol"
+    },
+    "research": {
+        "model": "gpt-5.6-terra"
+    },
+  "strategy": {
+    "model": "claude-opus-4-8"
+  },
+  "review": {
+    "model": "claude-opus-4-8"
+    },
+    "heartbeat": {
+        "model": "gpt-5.6-luna"
+    },
+    "ops": {
+        "model": "claude-sonnet-4-6"
+    },
+    "writing": {
+        "model": "claude-sonnet-4-6"
+    }
+}

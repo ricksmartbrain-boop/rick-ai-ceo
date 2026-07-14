@@ -1,0 +1,52 @@
+{
+  "topics": [
+    {
+      "key": "ceo-hq",
+      "title": "CEO HQ",
+      "purpose": "ceo-hq",
+      "lane": "ceo-lane",
+      "emoji": "🧠",
+      "seed_text": "Rick CEO HQ is live. Use this topic for high-level status, decisions, and founder control."
+    },
+    {
+      "key": "approvals",
+      "title": "Approvals",
+      "purpose": "approvals",
+      "lane": "ceo-lane",
+      "emoji": "✅",
+      "seed_text": "Rick approvals live here. Review founder approvals and resume blocked workflows from this topic."
+    },
+    {
+      "key": "product-lab",
+      "title": "Product Lab",
+      "purpose": "product-lab",
+      "lane": "product-lane",
+      "emoji": "🚀",
+      "seed_text": "Rick product work starts here. Queue new launches here to auto-create workflow topics."
+    },
+    {
+      "key": "distribution",
+      "title": "Distribution",
+      "purpose": "distribution",
+      "lane": "distribution-lane",
+      "emoji": "📣",
+      "seed_text": "Rick distribution updates land here when no workflow topic is bound."
+    },
+    {
+      "key": "customer",
+      "title": "Customer",
+      "purpose": "customer",
+      "lane": "customer-lane",
+      "emoji": "🤝",
+      "seed_text": "Rick customer fulfillment, lifecycle, and support work lives here when no workflow topic is bound."
+    },
+    {
+      "key": "ops-alerts",
+      "title": "Ops Alerts",
+      "purpose": "ops-alerts",
+      "lane": "ops-lane",
+      "emoji": "🛠",
+      "seed_text": "Rick heartbeat, watchdog, and incident alerts land here unless a workflow topic is more specific."
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "rick-v6",
+  "private": true,
+  "version": "6.0.0",
+  "packageManager": "pnpm@10.6.5",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "bootstrap": "bash scripts/bootstrap.sh",
+    "doctor": "bash scripts/doctor.sh",
+    "preflight": "bash scripts/preflight-openclaw.sh",
+    "health": "bash scripts/health-check.sh --verbose",
+    "cron:install": "bash scripts/install-crons.sh",
+    "install:workspace": "bash scripts/install-openclaw-workspace.sh --target \"$HOME/clawd\" --force",
+    "heartbeat": "bash scripts/run-heartbeat.sh",
+    "nightly": "bash scripts/run-nightly.sh",
+    "weekly": "bash scripts/run-weekly.sh",
+    "daemon": "bash scripts/run-daemon.sh",
+    "telegram:bridge": "bash scripts/run-telegram-bridge.sh",
+    "worker": "bash scripts/run-worker.sh",
+    "score": "bash scripts/run-score.sh",
+    "runtime:init": "python3 runtime/runner.py init",
+    "runtime:status": "python3 runtime/runner.py status",
+    "runtime:work": "python3 runtime/runner.py work --limit 3",
+    "runtime:heartbeat": "python3 runtime/runner.py heartbeat --work-limit 2",
+    "queue:info-product": "python3 runtime/runner.py queue-info-product --idea \"Working Title\" --price-usd 29 --product-type guide",
+    "queue:fulfillment": "python3 runtime/runner.py record-purchase --workflow-id wf_example --email buyer@example.com --delivery-url https://deliver.rick.ai/example",
+    "telegram:command": "python3 runtime/runner.py telegram --text \"/status\"",
+    "ledger:summary": "python3 skills/execution-ledger/scripts/execution-ledger.py summary --write",
+    "token:report": "python3 skills/token-economics/scripts/token-usage.py report --write",
+    "email:dispatch": "python3 skills/email-automation/scripts/email-sequence-dispatch.py",
+    "email:triage": "bash skills/email-automation/scripts/email-triage.sh --summary",
+    "route:list": "python3 skills/executive-orchestrator/scripts/model-router.py --list",
+    "route:list:json": "python3 skills/executive-orchestrator/scripts/model-router.py --list --format json",
+    "route:strategy": "python3 skills/executive-orchestrator/scripts/model-router.py --task strategy"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.34.0",
+    "playwright": "^1.59.0"
+  }
+}

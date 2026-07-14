@@ -635,6 +635,16 @@ def _linkedin_dm_body(ctx: dict) -> str:
 
 def _fire_voice_call(lead_name: str, lead_email: str, phone: str, *, dry_run: bool = False) -> dict:
     """Fire an outbound ElevenLabs call. Returns status dict."""
+    # Voice master gate (2026-07-13): daemon-driven Day-3 calls must not dial
+    # while the TCPA layer is incomplete.
+    if os.getenv("RICK_VOICE_LIVE", "0").strip() != "1":
+        return {"status": "skipped", "reason": "RICK_VOICE_LIVE!=1"}
+    try:
+        from runtime.kill_switches import is_suppressed_address
+        if lead_email and is_suppressed_address(lead_email):
+            return {"status": "skipped", "reason": f"suppressed: {lead_email}"}
+    except Exception as exc:  # fail closed — no gate, no dial
+        return {"status": "skipped", "reason": f"suppression gate unavailable: {type(exc).__name__}"}
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not api_key:
         return {"status": "skipped", "reason": "no ELEVENLABS_API_KEY"}

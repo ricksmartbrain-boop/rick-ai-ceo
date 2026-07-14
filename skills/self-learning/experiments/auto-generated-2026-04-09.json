@@ -1,0 +1,25 @@
+{
+  "date": "2026-04-09",
+  "goal_mrr": 100000,
+  "current_mrr": 547,
+  "experiments": [
+    {
+      "name": "warm-reply-fast-follow",
+      "hypothesis": "Replying within 15 minutes to warm X mentions increases inbound clicks vs same-day replies",
+      "metric": "profile clicks and DMs within 24h",
+      "next_step": "Do 5 warm replies to buyer-relevant mentions today"
+    },
+    {
+      "name": "proof-first-offer-thread",
+      "hypothesis": "A proof-first thread with a concrete money number converts better than abstract capability posts",
+      "metric": "clickthrough to /roast or meetrick.ai",
+      "next_step": "Post 1 proof-led thread with a direct CTA"
+    },
+    {
+      "name": "founding-member-dm-loop",
+      "hypothesis": "Direct warm DMs to recent engagers will beat public posting for first paid conversions",
+      "metric": "positive replies and booked calls",
+      "next_step": "DM top 10 recent engagers with the founding-member offer"
+    }
+  ]
+}

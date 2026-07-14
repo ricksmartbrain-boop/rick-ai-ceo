@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-04-11T22:00:00Z",
+  "source": "self-push-engine",
+  "mrr": 547,
+  "goal_mrr": 100000,
+  "what_is_working": [
+    "counterintuitive framing",
+    "proof-first posts with numbers",
+    "warm replies and concrete founder pain scenes"
+  ],
+  "experiments": [
+    {
+      "id": "exp_2026-04-11_1_proof_hook_vs_generic",
+      "category": "content_hook",
+      "hypothesis": "A proof-first hook with a real revenue number will outperform a generic AI capability hook.",
+      "variant_a": "Generic AI builder post",
+      "variant_b": "Proof-first post with one revenue number and one concrete operator scene",
+      "metric": "replies within 24h",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-18",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-11_2_specific_offer_vs_philosophy",
+      "category": "cta_positioning",
+      "hypothesis": "A specific buyer outcome CTA will convert better than abstract AI philosophy framing.",
+      "variant_a": "Abstract philosophy-led CTA",
+      "variant_b": "Specific outcome-led CTA tied to a founder pain point",
+      "metric": "clicks or replies that express buying intent",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-18",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-11_3_warm_followup_speed",
+      "category": "lead_followup",
+      "hypothesis": "Following up on warm leads within 24h will outperform waiting 48h+.",
+      "variant_a": "Follow up after 48h+",
+      "variant_b": "Follow up within 24h with a context-specific note",
+      "metric": "reply rate and booked calls",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-25",
+      "status": "queued"
+    }
+  ]
+}

@@ -9,7 +9,7 @@ NEVER auto-sends. Drafts require Vlad review. auto_send=false always.
 
 Smart-models invariant (PERMANENT):
   HIGH_INTENT (sales_inquiry, scheduling_request, pricing_question)
-    → route "review" → claude-opus-4-7
+    → route "review" → claude-opus-4-8
   WARM (objection_with_counter, question, referral_request, support_request)
     → route "writing" → claude-sonnet-4-6
 
@@ -302,12 +302,12 @@ def generate_draft(row: dict, label: str, dry_run: bool) -> dict:
 
     # Smart-models invariant: NEVER downgrade.
     # Always use route "writing" for the correct email-persona system prompt.
-    # For HIGH_INTENT, temporarily force the writing-route model to opus-4-7
+    # For HIGH_INTENT, temporarily force the writing-route model to opus-4-8
     # via env override so we get opus intelligence without the red-team reviewer
     # system prompt that lives on the "review" route.
     route = "writing"
     is_high_intent = label in HIGH_INTENT_LABELS
-    model_hint = "claude-opus-4-7" if is_high_intent else "claude-sonnet-4-6"
+    model_hint = "claude-opus-4-8" if is_high_intent else "claude-sonnet-4-6"
 
     if dry_run:
         return {
@@ -323,13 +323,13 @@ def generate_draft(row: dict, label: str, dry_run: bool) -> dict:
 
     # ── LLM call ────────────────────────────────────────────────────────────
     # For HIGH_INTENT: temporarily override the writing-route model env var to
-    # claude-opus-4-7. We restore it in the finally block — thread-safe for
+    # claude-opus-4-8. We restore it in the finally block — thread-safe for
     # this subprocess-isolated call (the router spawns us as a child process).
     _env_key = "RICK_MODEL_ANTHROPIC_WORKHORSE"
     _old_val = os.environ.get(_env_key)
     try:
         if is_high_intent:
-            os.environ[_env_key] = "claude-opus-4-7"
+            os.environ[_env_key] = "claude-opus-4-8"
         result = generate_text(route, prompt, fallback="")
         draft_text = (result.content if hasattr(result, "content") else str(result) or "").strip()
     except Exception as exc:

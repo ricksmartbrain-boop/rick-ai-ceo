@@ -42,7 +42,7 @@ Example output shape:
 
 ```text
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Rick quickstart demo — Anthropic / claude-opus-4-7                           │
+│ Rick quickstart demo — Anthropic / claude-opus-4-8                           │
 │ Fixture: Can you show me Rick before I install him?                          │
 │ Side effects: none · elapsed: 43.2s                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯

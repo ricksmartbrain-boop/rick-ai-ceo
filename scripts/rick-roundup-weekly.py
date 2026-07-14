@@ -433,6 +433,7 @@ def resend_post(url: str, api_key: str, payload: dict | None) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "User-Agent": "meetrick-rick/1.0",
     }
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -453,7 +454,7 @@ def send_broadcast(
         RESEND_BROADCASTS,
         api_key,
         {
-            "audienceId": audience_id,
+            "audience_id": audience_id,
             "from": from_addr,
             "subject": subject,
             "html": html,

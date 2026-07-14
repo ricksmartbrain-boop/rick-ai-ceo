@@ -20,6 +20,13 @@ Hard constraints:
   - auto_resume is always False — manual flip required
   - does NOT cancel workflows, only pauses the email channel send gate
 
+2026-07-14 hardening (false 100%-on-1-send pause):
+  - below MIN_SENDS_* sends in a window: may alert, never auto-pauses
+  - denominator uses Resend's own processed-send count for the window (from
+    the resend-bounce-poll poll.done sentinel) when fresh — bounces are polled
+    from ALL Resend traffic, while email-sends.jsonl misses bypass send paths,
+    so the ledger alone undercounts the denominator
+
 LaunchAgent: ai.rick.bounce-rate-guardian.plist  (StartInterval: 3600)
 """
 from __future__ import annotations
@@ -48,6 +55,20 @@ WINDOW_24H = 24
 THROTTLE_PCT_24H = 5.0   # >5% over 24h → 6h pause
 ALERT_PCT_24H = 10.0
 PAUSE_HOURS_24H = 6      # shorter pause when triggered by 24h window
+
+# Minimum sends in the window before a rate is meaningful. Percentages on
+# tiny denominators are noise: bounces are counted by when the POLL records
+# them, not when the original send happened, so after downtime a stale bounce
+# lands in a near-empty window (2026-06-13 and twice on 2026-07-14: 1 send /
+# 1 unrelated bounce = "100%" → hourly re-pause, blocking a paying customer's
+# access email). Below the floor: log + alert on any bounce, never auto-pause.
+MIN_SENDS_1H = int(os.getenv("RICK_BOUNCE_GUARDIAN_MIN_SENDS_1H", "5"))
+MIN_SENDS_24H = int(os.getenv("RICK_BOUNCE_GUARDIAN_MIN_SENDS_24H", "10"))
+
+# Resend-side send counts (poll.done sentinel) older than this are ignored —
+# the poll runs every 5 min, so a stale sentinel means the poll is dead and
+# its window counts no longer describe the current window.
+RESEND_COUNTS_MAX_AGE_HOURS = 1
 
 
 def now_iso() -> str:
@@ -174,27 +195,73 @@ def _notify_operator(message: str, kind: str) -> None:
         pass
 
 
-def _compute_window(window_hours: int) -> tuple[int, int, float]:
-    """Return (sends_count, bounces_count, bounce_rate_pct) for the given window."""
+def _latest_resend_counts() -> tuple[int | None, int | None]:
+    """Return the freshest (resend_sends_1h, resend_sends_24h) sentinel counts.
+
+    resend-bounce-poll.py records in its poll.done sentinel how many emails
+    Resend itself processed per window. (None, None) when no fresh sentinel
+    carries them (older poll version, dead poll, or its list fetch failed).
+    """
+    best_dt: datetime | None = None
+    best: tuple[int | None, int | None] = (None, None)
+    for row in _iter_jsonl(BOUNCES_FILE):
+        if row.get("event") != "poll.done" or not isinstance(row.get("resend_sends_24h"), int):
+            continue
+        dt = _parse_ts(row.get("ts"))
+        if dt is None:
+            continue
+        if best_dt is None or dt > best_dt:
+            best_dt = dt
+            best = (row.get("resend_sends_1h"), row.get("resend_sends_24h"))
+    if best_dt is None:
+        return (None, None)
+    if datetime.now(timezone.utc) - best_dt > timedelta(hours=RESEND_COUNTS_MAX_AGE_HOURS):
+        return (None, None)
+    return best
+
+
+def _compute_window(window_hours: int, resend_sends: int | None = None) -> tuple[int, int, float, int]:
+    """Return (sends_count, bounces_count, bounce_rate_pct, ledger_sends).
+
+    Matched universes: bounces are polled from ALL Resend traffic, but the
+    email-sends.jsonl ledger misses bypass send paths (raw-curl crons; the
+    outbox drain until 2026-07-14) — a lone stale bounce over a near-empty
+    ledger window read as "100%". When Resend's own processed-send count for
+    the window is available, the denominator is max(ledger, resend): resend is
+    the universe bounces come from; ledger can briefly exceed it for mail sent
+    since the last poll tick.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     sends = _window_rows(SENDS_FILE, cutoff)
     bounces = [r for r in _window_rows(BOUNCES_FILE, cutoff) if r.get("event") == "bounced"]
-    sends_count = sum(1 for r in sends if r.get("status") == "sent")
+    ledger_sends = sum(1 for r in sends if r.get("status") == "sent")
+    sends_count = ledger_sends
+    if isinstance(resend_sends, int) and resend_sends > sends_count:
+        sends_count = resend_sends
     bounces_count = len(bounces)
     rate = (100.0 * bounces_count / sends_count) if sends_count else 0.0
-    return sends_count, bounces_count, rate
+    return sends_count, bounces_count, rate, ledger_sends
 
 
 def main() -> int:
+    resend_1h, resend_24h = _latest_resend_counts()
+
     # --- 1h window ---
-    sends_1h, bounces_1h, rate_1h = _compute_window(WINDOW_1H)
+    sends_1h, bounces_1h, rate_1h, ledger_sends_1h = _compute_window(WINDOW_1H, resend_1h)
     cutoff_1h = datetime.now(timezone.utc) - timedelta(hours=WINDOW_1H)
     sends_1h_rows = _window_rows(SENDS_FILE, cutoff_1h)
     source_pipeline = _latest_source_pipeline([r for r in sends_1h_rows if r.get("status") == "sent"])
 
-    throttle_1h = rate_1h > THROTTLE_PCT_1H
+    throttle_1h = rate_1h > THROTTLE_PCT_1H and sends_1h >= MIN_SENDS_1H
     alert_1h = rate_1h > ALERT_PCT_1H
     paused_channel = ""
+
+    if rate_1h > THROTTLE_PCT_1H and sends_1h < MIN_SENDS_1H:
+        _append_jsonl(GUARDIAN_LOG, {
+            "ts": now_iso(), "action": "throttle-skipped-low-volume",
+            "trigger_window": "1h", "sends": sends_1h, "bounces": bounces_1h,
+            "bounce_rate_pct": round(rate_1h, 2), "min_sends": MIN_SENDS_1H,
+        })
 
     if throttle_1h:
         record = {
@@ -215,17 +282,32 @@ def main() -> int:
         paused_channel = _pause_email_channel_db(record["reason"], hours=24)
 
     if alert_1h:
+        # Only claim "manual resume required" when this run actually paused the
+        # channel — the 2026-07-14 heartbeat containment re-paused an
+        # operator-resumed channel purely off that phrase in a no-pause alert.
+        tail_1h = (
+            "Channel paused — manual resume required."
+            if paused_channel
+            else "No auto-pause this run; channel state unchanged."
+        )
         _notify_operator(
             f"🚨 Bounce guardian (1h): {rate_1h:.1f}% bounce rate "
             f"({bounces_1h}/{sends_1h}) on {source_pipeline}. "
-            f"Auto-throttle={'yes' if throttle_1h else 'no'}. Manual resume required.",
+            f"Auto-throttle={'yes' if throttle_1h else 'no'}. {tail_1h}",
             kind=f"bounce_rate_guardian_1h_{source_pipeline}",
         )
 
     # --- 24h window (NEW) ---
-    sends_24h, bounces_24h, rate_24h = _compute_window(WINDOW_24H)
-    throttle_24h = (not throttle_1h) and (rate_24h > THROTTLE_PCT_24H)
+    sends_24h, bounces_24h, rate_24h, ledger_sends_24h = _compute_window(WINDOW_24H, resend_24h)
+    throttle_24h = (not throttle_1h) and (rate_24h > THROTTLE_PCT_24H) and sends_24h >= MIN_SENDS_24H
     alert_24h = rate_24h > ALERT_PCT_24H
+
+    if (not throttle_1h) and rate_24h > THROTTLE_PCT_24H and sends_24h < MIN_SENDS_24H:
+        _append_jsonl(GUARDIAN_LOG, {
+            "ts": now_iso(), "action": "throttle-skipped-low-volume",
+            "trigger_window": "24h", "sends": sends_24h, "bounces": bounces_24h,
+            "bounce_rate_pct": round(rate_24h, 2), "min_sends": MIN_SENDS_24H,
+        })
 
     if throttle_24h:
         from datetime import datetime as _dt
@@ -252,10 +334,15 @@ def main() -> int:
             paused_channel = _pause_email_channel_db(record_24h["reason"], hours=PAUSE_HOURS_24H)
 
     if alert_24h and not alert_1h:
+        tail_24h = (
+            "Channel paused — manual resume required."
+            if paused_channel
+            else "No auto-pause this run; channel state unchanged."
+        )
         _notify_operator(
             f"🚨 Bounce guardian (24h): {rate_24h:.1f}% bounce rate "
             f"({bounces_24h}/{sends_24h}) over last 24h on {source_pipeline}. "
-            f"Auto-throttle={'yes' if throttle_24h else 'no'}. Manual resume required.",
+            f"Auto-throttle={'yes' if throttle_24h else 'no'}. {tail_24h}",
             kind=f"bounce_rate_guardian_24h_{source_pipeline}",
         )
 
@@ -277,6 +364,12 @@ def main() -> int:
         # shared
         "source_pipeline": source_pipeline,
         "paused_channel": paused_channel,
+        # denominator audit trail: what each universe reported (resend_* is
+        # null when no fresh poll sentinel carried counts)
+        "ledger_sends_1h": ledger_sends_1h,
+        "resend_sends_1h": resend_1h,
+        "ledger_sends_24h": ledger_sends_24h,
+        "resend_sends_24h": resend_24h,
     }
     _append_jsonl(GUARDIAN_LOG, summary)
 

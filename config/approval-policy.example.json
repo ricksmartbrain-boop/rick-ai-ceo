@@ -1,0 +1,15 @@
+{
+  "spend_threshold_usd": 500,
+  "always_ask": [
+    "legal",
+    "compliance",
+    "irreversible-brand",
+    "token-launch",
+    "production-architecture"
+  ],
+  "act_then_notify": [
+    "reversible-content",
+    "reversible-site-change",
+    "routine-ops-fix"
+  ]
+}

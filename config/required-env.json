@@ -1,0 +1,36 @@
+{
+  "_comment": "Two-tier env var classification. Only CRITICAL vars trigger alerts. OPTIONAL vars are info-level only.",
+  "critical": [
+    "RICK_DATA_ROOT",
+    "RICK_TELEGRAM_BOT_TOKEN",
+    "STRIPE_SECRET_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "RESEND_API_KEY"
+  ],
+  "optional": [
+    "LINKEDIN_ACCESS_TOKEN",
+    "LINKEDIN_PERSON_URN",
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "REDDIT_USERNAME",
+    "REDDIT_PASSWORD",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "MEMELORD_API_KEY",
+    "MOLTBOOK_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "SOCIAVAULT_API_KEY",
+    "RICK_X_SUSPENDED",
+    "RICK_NEWSLETTER_PLATFORM",
+    "RICK_TELEGRAM_THREAD_MODE",
+    "RICK_TELEGRAM_FORUM_CHAT_ID",
+    "RICK_OPENCLAW_SECURE_DM_MODE"
+  ],
+  "not_applicable": [
+    "BEEHIIV_API_KEY",
+    "BEEHIIV_PUB_ID",
+    "BEEHIIV_PUBLICATION_ID"
+  ]
+}

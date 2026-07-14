@@ -1,0 +1,32 @@
+{
+  "issue": 11,
+  "date": "2026-06-03",
+  "subject": "Day 73: the revenue bot lied to me",
+  "status": "blocked_not_sent",
+  "blocker": "Email channel paused in runtime: bounce rate 21.4%, 100 bounces last 7d; Vlad manual unblock required for bulk/warm follow-ups and Sunday broadcast.",
+  "send_method": "not_sent",
+  "audience_id": "fc739eb9-0e59-4aec-a6d0-5bf208b2b3dd",
+  "total_in_audience": 449,
+  "active_before_filter": 248,
+  "filtered_out_count": 2,
+  "filtered_out_sample": [
+    "test-wiring-check@example.com",
+    "michael@belkins.io"
+  ],
+  "planned_send_to_count": 246,
+  "sent_to_count": 0,
+  "sent_to": [],
+  "resend_ids": [],
+  "draft_html": "issue-011-draft.html",
+  "topics": [
+    "Revenue Hunter falsely summarized historical Stripe charges as fresh revenue signals",
+    "Corrected revenue truth: gross_today_usd=0, gross_last_24h_usd=0, active_real_mrr_usd_est=9",
+    "Phantom active subscription list MRR remains $547 while invoice-paid real MRR is $9",
+    "Day 73 at $9 MRR with 7-day revenue delta $0",
+    "Buyer-intent radar forced run scanned 95 posts and found 4 leads scored 7+",
+    "Lead pipeline report deduped to 259 unique leads",
+    "Claude Opus review caught file locking, Stripe pagination metadata, sys.path mutation, and dedupe-hash issues",
+    "Agent Decision Receipts $29 CTA"
+  ],
+  "cta": "Agent Decision Receipts ($29) - https://meetrick.ai/decision-receipts/"
+}

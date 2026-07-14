@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# email-triage.sh — Scan, classify, and act on inbox emails using himalaya + Claude.
+
+RICK_DATA_ROOT="${RICK_DATA_ROOT:-$HOME/rick-vault}"
+CATEGORIES="SALES_INQUIRY SUPPORT PARTNERSHIP NEWSLETTER_REPLY SPAM_MARKETING PERSONAL BILLING"
+ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+FORTRESS_SCRIPT="$ROOT_DIR/skills/email-automation/scripts/email-fortress.py"
+
+usage() {
+  cat <<EOF
+Usage: email-triage.sh [OPTIONS]
+
+Scan, classify, and manage inbox emails.
+
+Options:
+  --scan                              Scan unread emails and classify into categories
+  --categories                        List classification categories and response rules
+  --respond <id> --template <name>    Send templated response to email
+  --flag <id> --priority <level>      Flag email for founder review (high|medium|low)
+  --summary                           Daily inbox summary (counts by category)
+  -h, --help                          Show this help
+
+Dependencies:
+  himalaya     Email CLI (https://github.com/pimalaya/himalaya)
+  python3      For fortress classification
+
+Examples:
+  email-triage.sh --scan
+  email-triage.sh --respond 12345 --template sales-acknowledge
+  email-triage.sh --flag 12345 --priority high
+  email-triage.sh --summary
+EOF
+  exit 0
+}
+
+check_himalaya() {
+  if ! command -v himalaya &>/dev/null; then
+    echo "Error: himalaya CLI is required. Install from https://github.com/pimalaya/himalaya" >&2
+    exit 1
+  fi
+}
+
+cmd_scan() {
+  # 2026-07-13 single-consumer inbox: this used to scan UNSEEN via himalaya and
+  # read bodies with `himalaya read` — which flips the destructive \Seen flag,
+  # racing runtime.inbound.imap_watcher (the ONLY IMAP consumer). It now reads
+  # the triage JSONL imap-watcher writes and never touches IMAP.
+  mkdir -p "$RICK_DATA_ROOT/mailbox/triage"
+  local src="$RICK_DATA_ROOT/mailbox/triage/inbound-$(date +%Y-%m-%d).jsonl"
+  local triage_log="$RICK_DATA_ROOT/mailbox/triage/$(date +%Y-%m-%d).jsonl"
+
+  echo "Scanning today's inbound triage rows (source: $src)..."
+  echo ""
+
+  if [[ ! -s "$src" ]]; then
+    echo "No inbound triage rows today."
+    return
+  fi
+
+  echo "Classifying emails..."
+  echo ""
+
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    local id from subject body
+    id=$(echo "$line" | jq -r '.id // ""' 2>/dev/null || echo "")
+    from=$(echo "$line" | jq -r '.from // "Unknown"' 2>/dev/null || echo "Unknown")
+    subject=$(echo "$line" | jq -r '.subject // "Unknown"' 2>/dev/null || echo "Unknown")
+    body=$(echo "$line" | jq -r '(.body // "")[0:2000]' 2>/dev/null || echo "")
+
+    local triage_json
+    if [[ -f "$FORTRESS_SCRIPT" ]]; then
+      triage_json=$(python3 "$FORTRESS_SCRIPT" classify --from "$from" --subject "$subject" --body "$body" 2>/dev/null || echo '{}')
+    else
+      triage_json='{}'
+    fi
+
+    local category risk action founder_review
+    category=$(echo "$triage_json" | jq -r '.category // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+    risk=$(echo "$triage_json" | jq -r '.risk_level // "unknown"' 2>/dev/null || echo "unknown")
+    action=$(echo "$triage_json" | jq -r '.action // "manual-review"' 2>/dev/null || echo "manual-review")
+    founder_review=$(echo "$triage_json" | jq -r '.needs_founder_review // false' 2>/dev/null || echo "false")
+
+    # NOTE: no himalaya flagging here anymore — IMAP is imap-watcher's alone.
+    if [[ "$founder_review" == "true" ]]; then
+      echo "  (founder review requested — surfaced in triage log)"
+    fi
+
+    echo "[$category][$risk] $subject"
+    echo "  From: $from"
+    echo "  ID: $id"
+    echo "  Action: $action"
+    echo "  ---"
+
+    echo "$triage_json" | jq -c --arg id "$id" --arg from "$from" --arg subject "$subject" --arg scanned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {message_id:$id, from:$from, subject:$subject, scanned_at:$scanned_at}' >> "$triage_log" 2>/dev/null || true
+  done < <(head -20 "$src")
+}
+
+cmd_categories() {
+  cat <<EOF
+Email Classification Categories
+================================
+
+SALES_INQUIRY
+  Response time: 4 hours
+  Action: Auto-acknowledge, flag to founder
+  Template: sales-acknowledge
+
+SUPPORT
+  Response time: 24 hours
+  Action: Auto-acknowledge, route to team
+  Template: support-acknowledge
+
+PARTNERSHIP
+  Response time: 48 hours
+  Action: Flag to founder with summary
+  Template: partnership-acknowledge
+
+NEWSLETTER_REPLY
+  Response time: Best effort
+  Action: Log for content ideas
+  Template: newsletter-thanks
+
+SPAM_MARKETING
+  Response time: Never
+  Action: Archive silently
+  Template: (none)
+
+PERSONAL
+  Response time: Immediate
+  Action: Flag to founder, never auto-respond
+  Template: (none — founder responds personally)
+
+BILLING
+  Response time: 4 hours
+  Action: Auto-acknowledge, flag to founder
+  Template: billing-acknowledge
+EOF
+}
+
+cmd_respond() {
+  local email_id="$1"
+  local template_name="$2"
+
+  check_himalaya
+
+  # --- Dedup guard: skip if already replied ---
+  local state_file="$RICK_DATA_ROOT/brain/state.json"
+  if [[ -f "$state_file" ]]; then
+    local already_replied
+    already_replied=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$state_file'))
+    ids = d.get('channels', {}).get('email', {}).get('replied_ids', [])
+    print('yes' if '$email_id' in ids else 'no')
+except Exception:
+    print('no')
+" 2>/dev/null || echo "no")
+    if [[ "$already_replied" == "yes" ]]; then
+      echo "SKIP: email $email_id already replied. Dedup guard triggered."
+      return 0
+    fi
+  fi
+
+  local templates_dir="$RICK_DATA_ROOT/mailbox/templates"
+
+  local template_file="${templates_dir}/${template_name}.md"
+
+  if [[ ! -f "$template_file" ]]; then
+    echo "Error: Template not found: $template_file" >&2
+    echo "Available templates:" >&2
+    if [[ -d "$templates_dir" ]]; then
+      ls "$templates_dir"/*.md 2>/dev/null | xargs -I{} basename {} .md || echo "  (none)"
+    else
+      echo "  Templates directory not found: $templates_dir" >&2
+      echo "  Create it with template markdown files." >&2
+    fi
+    exit 1
+  fi
+
+  local body
+  body=$(cat "$template_file")
+
+  # Get original email subject for reply
+  local subject
+  subject=$(himalaya read "$email_id" --header "Subject" 2>/dev/null | head -1 || echo "")
+
+  if [[ -z "$subject" ]]; then
+    echo "Error: Could not read email $email_id" >&2
+    exit 1
+  fi
+
+  echo "Sending response to email $email_id using template '$template_name'..."
+  himalaya reply "$email_id" <<< "$body"
+
+  # Record replied ID to prevent duplicates
+  if [[ -f "$state_file" ]]; then
+    python3 -c "
+import json
+state_file = '$state_file'
+email_id = '$email_id'
+try:
+    d = json.load(open(state_file))
+    d.setdefault('channels', {}).setdefault('email', {}).setdefault('replied_ids', [])
+    if email_id not in d['channels']['email']['replied_ids']:
+        d['channels']['email']['replied_ids'].append(email_id)
+    json.dump(d, open(state_file, 'w'), indent=2)
+    print('Recorded', email_id, 'in replied_ids')
+except Exception as e:
+    print('Warning: could not update replied_ids:', e)
+" 2>/dev/null
+  fi
+
+  echo "Response sent."
+}
+
+cmd_flag() {
+  local email_id="$1"
+  local priority="$2"
+
+  check_himalaya
+
+  # Validate priority
+  case "$priority" in
+    high|medium|low) ;;
+    *)
+      echo "Error: --priority must be one of: high, medium, low" >&2
+      exit 1
+      ;;
+  esac
+
+  # Flag the email in the mailbox
+  himalaya flag add "$email_id" --flag Flagged 2>/dev/null || true
+
+  # Get email details for the flag note
+  local subject
+  subject=$(himalaya read "$email_id" --header "Subject" 2>/dev/null | head -1 || echo "Unknown")
+
+  local from
+  from=$(himalaya read "$email_id" --header "From" 2>/dev/null | head -1 || echo "Unknown")
+
+  echo "Flagged email for founder review"
+  echo "  Priority: $priority"
+  echo "  Subject: $subject"
+  echo "  From: $from"
+  echo "  ID: $email_id"
+}
+
+cmd_summary() {
+  check_himalaya
+
+  echo "Daily Inbox Summary"
+  echo "==================="
+  echo "Date: $(date +%Y-%m-%d)"
+  echo ""
+
+  # Count total unread
+  local unread
+  unread=$(himalaya list --folder INBOX --query "NOT SEEN" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+
+  echo "Unread emails: $unread"
+  echo ""
+
+  # Count flagged
+  local flagged
+  flagged=$(himalaya list --folder INBOX --query "FLAGGED" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+
+  echo "Flagged: $flagged"
+  echo ""
+
+  # List today's emails
+  local today
+  today=$(date +%d-%b-%Y)
+
+  echo "Today's emails:"
+  himalaya list --folder INBOX --query "SINCE $today" 2>/dev/null || echo "  (none or unable to fetch)"
+}
+
+# Parse arguments
+ACTION=""
+EMAIL_ID=""
+TEMPLATE=""
+PRIORITY=""
+
+if [[ $# -eq 0 ]]; then
+  usage
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scan)
+      ACTION="scan"
+      shift
+      ;;
+    --categories)
+      ACTION="categories"
+      shift
+      ;;
+    --respond)
+      ACTION="respond"
+      EMAIL_ID="$2"
+      shift 2
+      ;;
+    --template)
+      TEMPLATE="$2"
+      shift 2
+      ;;
+    --flag)
+      ACTION="flag"
+      EMAIL_ID="$2"
+      shift 2
+      ;;
+    --priority)
+      PRIORITY="$2"
+      shift 2
+      ;;
+    --summary)
+      ACTION="summary"
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
+
+case "$ACTION" in
+  scan)
+    cmd_scan
+    ;;
+  categories)
+    cmd_categories
+    ;;
+  respond)
+    if [[ -z "$TEMPLATE" ]]; then
+      echo "Error: --template is required with --respond" >&2
+      exit 1
+    fi
+    cmd_respond "$EMAIL_ID" "$TEMPLATE"
+    ;;
+  flag)
+    if [[ -z "$PRIORITY" ]]; then
+      echo "Error: --priority is required with --flag" >&2
+      exit 1
+    fi
+    cmd_flag "$EMAIL_ID" "$PRIORITY"
+    ;;
+  summary)
+    cmd_summary
+    ;;
+  *)
+    echo "Error: No action specified." >&2
+    usage
+    ;;
+esac

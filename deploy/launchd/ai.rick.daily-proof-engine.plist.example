@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.rick.daily-proof-engine</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>python3</string>
+    <string>__RICK_WORKSPACE__/scripts/daily-proof-engine.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__RICK_WORKSPACE__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__RICK_DATA_ROOT__/logs/daily-proof-engine.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RICK_DATA_ROOT__/logs/daily-proof-engine.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RICK_ENV_FILE</key>
+    <string>__RICK_WORKSPACE__/config/rick.env</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

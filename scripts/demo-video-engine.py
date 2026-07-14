@@ -8,7 +8,7 @@ Outputs:
 - ElevenLabs narration audio
 - MP4 slideshow, if ffmpeg is available
 
-Dry-run mode still composes the narration with opus-4-7 (route='review') so
+Dry-run mode still composes the narration with opus-4-8 (route='review') so
 we can inspect the voiceover without spending image/audio/video budget.
 """
 
@@ -48,7 +48,7 @@ ENV_FILES = [
 OPENAI_IMAGE_MODEL = "gpt-image-2"
 OPENAI_IMAGE_SIZE = "1536x1024"
 OPENAI_IMAGE_QUALITY = "high"
-OPENROUTER_MODEL = os.getenv("RICK_DEMO_VIDEO_MODEL", "anthropic/claude-opus-4.7")
+OPENROUTER_MODEL = os.getenv("RICK_DEMO_VIDEO_MODEL", "anthropic/claude-opus-4.8")
 OPENROUTER_MAX_TOKENS = int(os.getenv("RICK_DEMO_VIDEO_MAX_TOKENS", "320"))
 VOICE_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 DEFAULT_VOICE_SETTINGS = {
@@ -256,7 +256,8 @@ def _anthropic_chat_completion(prompt: str) -> str:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
-    model = "claude-sonnet-4-5" if "opus" in OPENROUTER_MODEL else "claude-haiku-3-5"
+    # Smart-models invariant: fleet-standard sonnet, never mini/haiku.
+    model = "claude-sonnet-4-6"
     payload = {
         "model": model,
         "system": "You write concise founder-voice demo narration.",
@@ -283,11 +284,53 @@ def _anthropic_chat_completion(prompt: str) -> str:
     return text
 
 
+def _openai_chat_completion(prompt: str) -> str:
+    """Last-resort fallback: OpenAI direct (the non-Anthropic provider the
+    fleet already runs on when Anthropic credits are depleted). gpt-5.5 —
+    never mini/nano."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    payload = {
+        "model": "gpt-5.5",
+        "messages": [
+            {"role": "system", "content": "You write concise founder-voice demo narration."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_completion_tokens": OPENROUTER_MAX_TOKENS,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    choices = data.get("choices") or []
+    message = ((choices[0] or {}).get("message") or {}).get("content") or ""
+    text = " ".join(str(message).split()).strip().strip('"').strip("'")
+    if not text:
+        raise RuntimeError("OpenAI narration response was empty")
+    return text
+
+
 def _openrouter_chat_completion(prompt: str) -> str:
     # Try Anthropic direct first if OpenRouter creds absent or busted
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not openrouter_key:
-        return _anthropic_chat_completion(prompt)
+        try:
+            return _anthropic_chat_completion(prompt)
+        except Exception as anth_err:
+            try:
+                return _openai_chat_completion(prompt)
+            except Exception as openai_err:
+                raise RuntimeError(
+                    f"Anthropic fallback failed: {anth_err}; "
+                    f"OpenAI fallback also failed: {openai_err}"
+                )
     last_error: str | None = None
     for token_budget in (OPENROUTER_MAX_TOKENS, 192, 128):
         payload = {
@@ -332,12 +375,17 @@ def _openrouter_chat_completion(prompt: str) -> str:
                 break
             if token_budget == 128:
                 break
-    # Fallback to Anthropic direct
+    # Fallback to Anthropic direct, then OpenAI direct (credits-depleted path)
     try:
         return _anthropic_chat_completion(prompt)
     except Exception as anth_err:
-        raise RuntimeError(f"OpenRouter failed ({last_error}); Anthropic fallback also failed: {anth_err}")
-    raise RuntimeError(last_error or "OpenRouter narration generation failed")
+        try:
+            return _openai_chat_completion(prompt)
+        except Exception as openai_err:
+            raise RuntimeError(
+                f"OpenRouter failed ({last_error}); Anthropic fallback failed: "
+                f"{anth_err}; OpenAI fallback also failed: {openai_err}"
+            )
 
 
 def compose_narration(summary: LogSummary, dry_run: bool) -> str:
@@ -590,7 +638,15 @@ def main() -> int:
     print(f"[1/5] summarizing wins for {date_str}", flush=True)
     summary = summarize_wins(now)
     print("[2/5] composing narration", flush=True)
-    narration = compose_narration(summary, dry_run=True)
+    try:
+        narration = compose_narration(summary, dry_run=True)
+    except Exception as exc:
+        # All LLM providers failed (e.g. Anthropic credits depleted AND
+        # OpenRouter/OpenAI unreachable). Skip this week's video gracefully
+        # instead of crashing the launchd job.
+        print(f"SKIP: narration generation failed on every provider: {exc}", flush=True)
+        print("SKIP: no demo video this week — will retry on next scheduled run", flush=True)
+        return 0
     image_prompts = build_image_prompts(summary)
 
     narration_path = work_dir / f"{date_str}-rick-demo.narration.txt"

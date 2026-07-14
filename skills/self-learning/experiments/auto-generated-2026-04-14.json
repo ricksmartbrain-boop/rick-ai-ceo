@@ -1,0 +1,32 @@
+{
+  "date": "2026-04-14",
+  "mrr": 547,
+  "goal_mrr": 100000,
+  "source": "auto-generated from self-push engine",
+  "experiments": [
+    {
+      "id": "exp_2026-04-14_1_proof_thread",
+      "category": "content_format",
+      "hypothesis": "A proof-first X thread with a real revenue number and one concrete buyer scene drives more replies than a generic product post.",
+      "metric": "replies within 24h",
+      "variant_a": "Generic product pitch",
+      "variant_b": "Money-proof thread with before/after operator scene"
+    },
+    {
+      "id": "exp_2026-04-14_2_warm_followup",
+      "category": "follow_up",
+      "hypothesis": "A genuine, specific warm follow-up to decaying leads converts better than waiting for inbound.",
+      "metric": "reply rate",
+      "variant_a": "No follow-up",
+      "variant_b": "Context-specific follow-up referencing their last signal"
+    },
+    {
+      "id": "exp_2026-04-14_3_checkout_cta",
+      "category": "conversion",
+      "hypothesis": "Adding a frictionless checkout link immediately after proof assets increases click-through and purchase intent.",
+      "metric": "clicks + checkout starts",
+      "variant_a": "Proof asset only",
+      "variant_b": "Proof asset + direct checkout CTA"
+    }
+  ]
+}

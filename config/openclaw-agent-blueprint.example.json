@@ -1,0 +1,142 @@
+{
+  "active_now": [
+    "rick"
+  ],
+  "main_agent": {
+    "id": "rick",
+    "status": "active",
+    "purpose": "Primary CEO agent owning workflow topics, founder control, and final launch authority.",
+    "allowed_tools": [
+      "exec",
+      "sessions_send",
+      "sessions_spawn",
+      "system_event",
+      "telegram_founder_control",
+      "vault_memory",
+      "runtime_db"
+    ],
+    "sandbox_posture": "broad, with host-risk actions still gated by approval policy",
+    "allowed_channels": [
+      "founder-control telegram topics",
+      "workflow telegram topics",
+      "openclaw system events"
+    ],
+    "workflow_ownership": [
+      "strategy",
+      "approvals",
+      "launch readiness",
+      "publish orchestration"
+    ]
+  },
+  "future_agents": [
+    {
+      "id": "rick-ceo",
+      "status": "prepared",
+      "purpose": "High-level strategy, approvals, portfolio allocation, and founder-facing decisions.",
+      "allowed_tools": [
+        "sessions_send",
+        "sessions_spawn",
+        "system_event",
+        "vault_memory",
+        "runtime_db"
+      ],
+      "sandbox_posture": "broad read access, restricted write/exec outside approved flows",
+      "allowed_channels": [
+        "ceo-hq",
+        "approvals",
+        "workflow topics"
+      ],
+      "workflow_ownership": [
+        "strategy",
+        "approvals",
+        "portfolio"
+      ]
+    },
+    {
+      "id": "rick-builder",
+      "status": "prepared",
+      "purpose": "Code, products, websites, and build/fix work inside controlled sessions.",
+      "allowed_tools": [
+        "exec",
+        "sessions_send",
+        "system_event",
+        "vault_memory",
+        "runtime_db"
+      ],
+      "sandbox_posture": "repo/task scoped, host writes limited to approved workspaces",
+      "allowed_channels": [
+        "workflow topics",
+        "product-lab"
+      ],
+      "workflow_ownership": [
+        "product build",
+        "debugging",
+        "deploy preparation"
+      ]
+    },
+    {
+      "id": "rick-distribution",
+      "status": "prepared",
+      "purpose": "Newsletter, social, website copy, and launch distribution execution.",
+      "allowed_tools": [
+        "sessions_send",
+        "system_event",
+        "vault_memory",
+        "runtime_db"
+      ],
+      "sandbox_posture": "API-first channel writes only",
+      "allowed_channels": [
+        "distribution",
+        "workflow topics"
+      ],
+      "workflow_ownership": [
+        "newsletter",
+        "social launch",
+        "content repurposing"
+      ]
+    },
+    {
+      "id": "rick-customer-ops",
+      "status": "prepared",
+      "purpose": "Customer memory, support, fulfillment, and lifecycle operations once secure DM mode is enabled.",
+      "allowed_tools": [
+        "sessions_send",
+        "system_event",
+        "vault_memory",
+        "runtime_db",
+        "email_fortress"
+      ],
+      "sandbox_posture": "customer-data scoped, secure DM only when explicitly enabled",
+      "allowed_channels": [
+        "customer",
+        "workflow topics",
+        "secure support DMs"
+      ],
+      "workflow_ownership": [
+        "post-purchase fulfillment",
+        "support",
+        "customer intelligence"
+      ]
+    }
+  ],
+  "handoff_rules": [
+    {
+      "from": "rick",
+      "to": "rick-builder",
+      "tool": "sessions_spawn",
+      "when": "hard coding, debugging, or multi-file build work is needed"
+    },
+    {
+      "from": "rick",
+      "to": "rick-distribution",
+      "tool": "sessions_send",
+      "when": "launch distribution assets are ready for execution"
+    },
+    {
+      "from": "rick",
+      "to": "rick-customer-ops",
+      "tool": "sessions_send",
+      "when": "customer memory, fulfillment, or support tasks need isolated handling"
+    }
+  ]
+}

@@ -70,6 +70,76 @@ fi
 
 HTML_BODY=$(cat "$BODY_FILE")
 
+# ── Dedup gate: abort if subject or issue already sent ─────────────────────────
+# Prevents triple-sends by checking newsletter-ledger.jsonl before touching
+# a single subscriber. Exit code 3 = already sent (distinct from auth/other errors).
+_dedup_check() {
+  local subject="$1"
+  local meta_file="$2"
+  local ledger="${RICK_DATA_ROOT:-$HOME/rick-vault}/operations/newsletter-ledger.jsonl"
+  if [[ ! -f "$ledger" ]]; then return 0; fi
+
+  # Subject-level dedup
+  if [[ -n "$subject" ]]; then
+    local match
+    match=$(python3 - "$ledger" "$subject" <<'PY'
+import json, sys
+ledger, subject = sys.argv[1], sys.argv[2].strip().lower()
+for line in open(ledger):
+    line = line.strip()
+    if not line: continue
+    try:
+        row = json.loads(line)
+        sent = row.get('sent_at','').strip()
+        row_subj = (row.get('subject') or '').strip().lower()
+        if sent and row_subj == subject:
+            print(f"DUPLICATE: issue={row.get('issue')} sent_at={sent}")
+            sys.exit(1)
+    except: pass
+PY
+    )
+    if [[ $? -ne 0 ]]; then
+      echo "ERROR: DEDUP GATE — Subject '${subject}' already appears in newsletter ledger with sent_at set." >&2
+      echo "  $match" >&2
+      echo "  This send is blocked to prevent a repeat delivery to subscribers." >&2
+      echo "  If this is intentional (different issue), change the subject line." >&2
+      exit 3
+    fi
+  fi
+
+  # Issue-number dedup (only when --meta provided)
+  if [[ -n "$meta_file" && -f "$meta_file" ]]; then
+    local issue_num
+    issue_num=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('issue',''))" "$meta_file" 2>/dev/null || echo '')
+    if [[ -n "$issue_num" && "$issue_num" != "0" ]]; then
+      local issue_match
+      issue_match=$(python3 - "$ledger" "$issue_num" <<'PY'
+import json, sys
+ledger, num = sys.argv[1], sys.argv[2]
+for line in open(ledger):
+    line = line.strip()
+    if not line: continue
+    try:
+        row = json.loads(line)
+        sent = row.get('sent_at','').strip()
+        if sent and str(row.get('issue','')) == num:
+            print(f"DUPLICATE: issue={num} sent_at={sent}")
+            sys.exit(1)
+    except: pass
+PY
+      )
+      if [[ $? -ne 0 ]]; then
+        echo "ERROR: DEDUP GATE — Issue #${issue_num} already has sent_at in ledger." >&2
+        echo "  $issue_match" >&2
+        echo "  This send is blocked. Use a new issue number for a fresh newsletter." >&2
+        exit 3
+      fi
+    fi
+  fi
+}
+
+_dedup_check "$SUBJECT" "$META_FILE"
+
 # ── Load subscribers ───────────────────────────────────────────────────────────
 if command -v jq &>/dev/null; then
   SUBSCRIBERS=$(jq -r '.[] | select(.status=="active") | .email' "$SUBSCRIBERS_FILE" 2>/dev/null || echo "")

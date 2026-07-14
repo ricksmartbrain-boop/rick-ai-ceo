@@ -11,7 +11,7 @@ Detection sources (layered):
   (d) mailbox/triage/inbound-*.jsonl
 
 Escalation logic:
-  - replied                    → P0 alert (Telegram + notify) + opus-4-7 auto-draft (NO auto-send)
+  - replied                    → P0 alert (Telegram + notify) + opus-4-8 auto-draft (NO auto-send)
   - opened + clicked (warm++)  → P1 warm alert + pre-stage draft for Vlad review
   - opened only                → warm-signal log entry (no alert)
 
@@ -19,7 +19,7 @@ De-escalation:
   - Per-wf: after 72h from last_touch_at → automatically drops back to standard reply-watcher
   - Global: if no wfs remain in critical window → script exits cleanly, LaunchAgent keeps polling
 
-Smart-models invariant: opus-4-7 ONLY for auto-draft. No cheap models.
+Smart-models invariant: opus-4-8 ONLY for auto-draft. No cheap models.
 Kill-switch: RICK_CRITICAL_WINDOW_LIVE=1
 
 State:   ~/rick-vault/control/critical-window-state.json
@@ -66,8 +66,8 @@ TRIAGE_DIR = DATA_ROOT / "mailbox" / "triage"
 CRITICAL_WINDOW_HOURS  = 72
 # Reply scan cutoff: look back 7 days for replies
 REPLY_SCAN_HOURS       = 7 * 24
-# Smart-models invariant: opus-4-7 only for drafts
-DRAFT_MODEL_ANTHROPIC  = "claude-opus-4-7"
+# Smart-models invariant: opus-4-8 only for drafts
+DRAFT_MODEL_ANTHROPIC  = "claude-opus-4-8"
 DRAFT_MODEL_OPENAI     = "gpt-4o"   # hard fallback if Anthropic down
 
 # ---------------------------------------------------------------------------
@@ -401,7 +401,7 @@ def _load_triage_files(cutoff_iso: str) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# 3. Auto-drafter — opus-4-7 ONLY (smart-models invariant)
+# 3. Auto-drafter — opus-4-8 ONLY (smart-models invariant)
 # ---------------------------------------------------------------------------
 
 def _generate_draft(wf: dict, reply_body: str, reply_label: str,
@@ -456,7 +456,7 @@ If label is 'not_interested'/'unsubscribe': graceful 1-sentence close.
 If label is 'sales_inquiry': move toward a 15-min call.
 If label is 'question': answer directly + CTA."""
 
-    # Try Anthropic opus-4-7 first (smart-models invariant)
+    # Try Anthropic opus-4-8 first (smart-models invariant)
     if anthropic_key:
         try:
             import urllib.request
@@ -476,7 +476,7 @@ If label is 'question': answer directly + CTA."""
             body = result["content"][0]["text"].strip()
             tokens = result.get("usage", {}).get("input_tokens", 0)
             if verbose:
-                print(f"  [draft] opus-4-7 generated ({tokens} input tokens)")
+                print(f"  [draft] opus-4-8 generated ({tokens} input tokens)")
             return {"draft_body": body, "model": DRAFT_MODEL_ANTHROPIC, "prompt_tokens": tokens}
         except Exception as exc:
             if verbose:
@@ -752,7 +752,8 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
                 print("critical-window-monitor: 0 wfs in critical window — nothing to do")
             _log({"ts": _now_iso(), "event": "no_critical_wfs"})
             _probe_flag_health(0, 0, 0)
-            return {"wf_count": 0, "new_replies": 0, "new_opens": 0, "new_clicks": 0}
+            return {"wf_count": 0, "new_replies": 0, "new_opens": 0, "new_clicks": 0,
+                    "total_opens_72h": 0, "total_replies_72h": 0}
 
         if verbose:
             print(f"Critical window: {len(wfs)} wfs")
@@ -810,7 +811,7 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"\n  🚨 REPLY: {em} ({wf['company']}) label={reply_info.get('label','?')}")
 
-                # Draft (opus-4-7 — smart-models invariant)
+                # Draft (opus-4-8 — smart-models invariant)
                 draft = _generate_draft(wf, reply_info.get("body",""), reply_info.get("label",""),
                                         trigger="reply", dry_run=dry_run, verbose=verbose)
                 draft_path = ""

@@ -1,0 +1,31 @@
+{
+  "date": "2026-04-12",
+  "mrr": 547,
+  "goal_mrr": 100000,
+  "experiments": [
+    {
+      "id": "exp_2026-04-12_1",
+      "name": "Proof-first LinkedIn post",
+      "hypothesis": "A post opening with real revenue math will drive more warm replies than a generic founder update.",
+      "metric": "warm replies within 24h",
+      "setup": "Post: '$280 AI ops -> $547 MRR. Here's what it actually returns right now.'",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-12_2",
+      "name": "Paul direct conversion follow-up",
+      "hypothesis": "A specific 48h live offer will convert better than a vague check-in.",
+      "metric": "reply rate + booked call rate",
+      "setup": "Send a direct email or DM with a concrete offer and simple next step.",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-12_3",
+      "name": "Guarantee-based entry offer",
+      "hypothesis": "A $299 entry offer with a clear refund promise lowers friction more than the current general offer.",
+      "metric": "landing page conversion rate",
+      "setup": "Draft a one-page offer around a fast outcome and a low-risk guarantee.",
+      "status": "queued"
+    }
+  ]
+}

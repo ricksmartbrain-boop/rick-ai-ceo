@@ -93,7 +93,8 @@ def _inside_quiet_hours(cfg: dict[str, Any]) -> bool:
     qh = cfg.get("quiet_hours") or {}
     if "start" not in qh or "end" not in qh:
         return False
-    now_h = _now().hour
+    # Quiet hours are configured in local time in config/channel-limits.json.
+    now_h = datetime.now().astimezone().hour
     start = int(qh["start"])
     end = int(qh["end"])
     if start == end:
@@ -160,6 +161,8 @@ def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
         if last_send_at:
             try:
                 last = datetime.fromisoformat(last_send_at)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
                 if (_now() - last).total_seconds() >= 60:
                     conn.execute(
                         "UPDATE channel_state SET sends_this_minute=0, updated_at=? WHERE channel=?",
@@ -324,6 +327,173 @@ def force_resume(conn: sqlite3.Connection, channel: str) -> None:
         (_now().isoformat(timespec="seconds"), channel),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Unified per-recipient send gate (2026-07-13)
+#
+# Every email send path must call is_send_allowed(to) before sending and log
+# 'SEND_BLOCKED reason=<reason> to=<addr>' when it returns (False, reason).
+# The channel-level gate (assert_channel_active) stays separate: it needs a
+# DB connection and covers pause/caps; this gate is per-recipient and
+# dependency-free so even the leanest cron sender can import it.
+# ---------------------------------------------------------------------------
+
+RICK_ENV_FILE = Path.home() / "clawd" / "config" / "rick.env"
+SUPPRESSION_FILES = (
+    DATA_ROOT / "mailbox" / "suppression.txt",
+    DATA_ROOT / "control" / "dnc-list.txt",
+)
+# Send logs the existing senders already write — used for the frequency cap.
+SEND_LOG_FILES = (
+    DATA_ROOT / "operations" / "email-sends.jsonl",
+    DATA_ROOT / "operations" / "email-sequence-send.jsonl",
+    DATA_ROOT / "logs" / "pipeline.jsonl",
+    DATA_ROOT / "runtime" / "nurture" / "sent.log",
+)
+FREQUENCY_CAP_DAYS = 7
+
+
+def _env_flag(name: str, default: str = "") -> str:
+    """RICK_* flag lookup: process env first, then ~/clawd/config/rick.env.
+
+    The rick.env fallback exists because several cron/launchd entry points do
+    not source the env file (the 2026-04-23 env-export bug class). Inline
+    '# comments' after the value are stripped — flag values only, never use
+    this helper for secrets.
+    """
+    val = os.getenv(name)
+    if val is not None and val.strip() != "":
+        return val.strip()
+    try:
+        if RICK_ENV_FILE.exists():
+            for raw in RICK_ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if line.startswith(f"{name}="):
+                    return line.split("=", 1)[1].split("#", 1)[0].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
+def load_merged_suppression() -> set[str]:
+    """Union of mailbox/suppression.txt + control/dnc-list.txt, lowercased.
+
+    Entries may be full addresses or domain-level ('@folderly.com').
+    Raises OSError if an existing list can't be read — callers inside
+    is_send_allowed treat that as fail-closed.
+    """
+    merged: set[str] = set()
+    for path in SUPPRESSION_FILES:
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            entry = raw.split("#", 1)[0].strip().lower()
+            if entry:
+                merged.add(entry)
+    return merged
+
+
+def is_suppressed_address(email: str, merged: set[str] | None = None) -> bool:
+    """True when the address (or its @domain) is on either suppression list."""
+    target = (email or "").strip().lower()
+    if not target:
+        return True
+    entries = load_merged_suppression() if merged is None else merged
+    if target in entries:
+        return True
+    domain = target.rsplit("@", 1)[-1] if "@" in target else ""
+    return bool(domain) and f"@{domain}" in entries
+
+
+def last_send_ts(email: str) -> datetime | None:
+    """Most recent logged send to this address across the known send logs."""
+    target = (email or "").strip().lower()
+    if not target:
+        return None
+    latest: datetime | None = None
+
+    def _consider(addr: Any, ts_raw: Any) -> None:
+        nonlocal latest
+        if str(addr or "").strip().lower() != target or not ts_raw:
+            return
+        try:
+            ts = _parse_iso(str(ts_raw))
+        except ValueError:
+            return
+        if latest is None or ts > latest:
+            latest = ts
+
+    for path in SEND_LOG_FILES:
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if path.name == "sent.log":
+            # nurture sent.log: idem_key \t email \t email_num \t iso_ts
+            for line in lines:
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    _consider(parts[1], parts[3])
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(r, dict):
+                continue
+            stage = str(r.get("stage") or "")
+            is_send = (
+                r.get("status") == "sent"
+                or bool(r.get("resend_id"))
+                or stage == "contacted"
+                or stage.endswith("_sent")
+            )
+            if is_send:
+                _consider(r.get("to") or r.get("email"), r.get("ts") or r.get("timestamp"))
+    return latest
+
+
+def is_send_allowed(email: str, *, cold: bool = True) -> tuple[bool, str]:
+    """Unified fail-closed per-recipient send gate. Returns (allowed, reason).
+
+    Checks, in order:
+      1. RICK_OUTBOUND_ENABLED master kill (blocked when '0')
+      2. RICK_EMAIL_SEND_LIVE live flag (blocked unless '1')
+      3. merged suppression list (case-insensitive, '@domain' entries match)
+      4. frequency cap: no *cold* send when any logged send to the address
+         exists within the last FREQUENCY_CAP_DAYS days (sequence/follow-up
+         senders pass cold=False — their own scheduling controls cadence)
+
+    Any internal error fails CLOSED. Callers must log
+    'SEND_BLOCKED reason=<reason> to=<email>' when blocked.
+    """
+    try:
+        target = (email or "").strip().lower()
+        if not target or "@" not in target:
+            return False, f"invalid_recipient:{target!r}"
+        if _env_flag("RICK_OUTBOUND_ENABLED", "1") == "0":
+            return False, "master_kill:RICK_OUTBOUND_ENABLED=0"
+        if _env_flag("RICK_EMAIL_SEND_LIVE", "0") != "1":
+            return False, "not_live:RICK_EMAIL_SEND_LIVE!=1"
+        merged = load_merged_suppression()
+        if target in merged:
+            return False, f"suppressed:{target}"
+        domain = target.rsplit("@", 1)[-1]
+        if f"@{domain}" in merged:
+            return False, f"suppressed_domain:@{domain}"
+        if cold:
+            last = last_send_ts(target)
+            if last is not None and (_now() - last) < timedelta(days=FREQUENCY_CAP_DAYS):
+                return False, f"frequency_cap_{FREQUENCY_CAP_DAYS}d:last_send={last.isoformat()}"
+        return True, "ok"
+    except Exception as exc:  # fail CLOSED — a broken gate must never allow a send
+        return False, f"gate_error:{type(exc).__name__}:{exc}"
 
 
 def channel_snapshot(conn: sqlite3.Connection) -> list[dict[str, Any]]:

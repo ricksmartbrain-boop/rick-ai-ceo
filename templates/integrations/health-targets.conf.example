@@ -1,0 +1,9 @@
+# Health check targets for scripts/health-check.sh
+# Format:
+#   url|<name>|<url>|<contains-optional>
+#   process|<name>|<pgrep-pattern>|<min-uptime-seconds-optional>
+
+url|primary-site|https://rick.example.com|Rick
+url|checkout-health|https://rick.example.com/api/health|ok
+process|rick-daemon|runtime/runner.py heartbeat|60
+process|rick-telegram|runtime/runner.py telegram-bridge|60

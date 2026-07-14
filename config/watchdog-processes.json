@@ -1,0 +1,34 @@
+{
+  "processes": [
+    {
+      "name": "Rick Daemon",
+      "enabled": true,
+      "kind": "process",
+      "match": "run-daemon.sh",
+      "restart_cmd": "bash \"$RICK_OPENCLAW_HOME/scripts/run-daemon.sh\"",
+      "cooldown_seconds": 180,
+      "max_restarts_per_day": 24,
+      "notes": "Always-on runtime loop."
+    },
+    {
+      "name": "Rick Telegram Bridge",
+      "enabled": false,
+      "kind": "process",
+      "match": "runtime/runner.py telegram-bridge",
+      "restart_cmd": "bash \"$RICK_OPENCLAW_HOME/scripts/run-telegram-bridge.sh\"",
+      "cooldown_seconds": 180,
+      "max_restarts_per_day": 24,
+      "notes": "DISABLED — replaced by OpenClaw built-in Telegram channel. Do not re-enable."
+    },
+    {
+      "name": "Example Ralph Session",
+      "enabled": false,
+      "kind": "tmux",
+      "session_name": "pc-build",
+      "restart_cmd": "cd \"$RICK_PARTNER_CONNECTOR_REPO\" && ralphy --codex --prd PRD.md",
+      "cooldown_seconds": 300,
+      "max_restarts_per_day": 8,
+      "notes": "Example long-running coding session."
+    }
+  ]
+}

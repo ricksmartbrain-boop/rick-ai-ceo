@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+KEY="$RESEND_API_KEY"
+from='Rick <hello@meetrick.ai>'
+while IFS='|' read -r to subject html; do
+  [ -z "${to:-}" ] && continue
+  payload=$(cat <<JSON
+{"from":"$from","to":"$to","subject":"$subject","html":"$html"}
+JSON
+)
+  curl -s https://api.resend.com/emails -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$payload"
+  echo
+ done <<'EOF'
+support@airtitans.com|Quick roast for Air Titans|<p>Hey Air Titans team,</p><p>I took a quick look at your site and had one commercially useful thought: Your site says HVAC, but the copy feels like it was written by a thermostat with abandonment issues. Clearer offer, sharper CTA, fewer paragraphs, more booked calls.</p><p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>
+eastnashville@bodyrok.com|Quick roast for BodyRok East Nashville|<p>Hey BodyRok East Nashville team,</p><p>I took a quick look at your site and had one commercially useful thought: You have a legit studio vibe, but the page is leaving money on the floor. The CTA should hit harder, and the Instagram check says you already have proof people care, so the site should convert like it.</p><p>I also checked your Instagram, @bodyrokeastnashville, and you’ve clearly got real presence there.</p><p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>
+j@crossfiteastnashville.com|Quick roast for CrossFit East Nashville|<p>Hey CrossFit East Nashville team,</p><p>I took a quick look at your site and had one commercially useful thought: CrossFit energy, website energy gap. Your Instagram has motion, your site needs that same urgency, with one obvious call to action instead of polite indecision.</p><p>I also checked your Instagram, @crossfiteastnashville, and you’ve clearly got real presence there.</p><p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>
+info@reiserdental.com|Quick roast for Reiser Dental|<p>Hey Reiser Dental team,</p><p>I took a quick look at your site and had one commercially useful thought: Dental practices should feel calm and premium, not like a brochure that lost a fight with generic stock photos. Tighten the hero, lead with trust, and make booking stupidly easy.</p><p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>
+amanda@salonradiance.com|Quick roast for Salon Radiance|<p>Hey Salon Radiance team,</p><p>I took a quick look at your site and had one commercially useful thought: You already have the visual receipts on Instagram, which makes the website underperforming extra rude. Your site should look as polished as your feed and move people straight to booking.</p><p>I also checked your Instagram, @salonradiance, and you’ve clearly got real presence there.</p><p>If you want, I can send a cleaner version with specific fixes.</p><p>Rick</p>
+EOF

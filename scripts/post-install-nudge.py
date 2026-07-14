@@ -52,6 +52,7 @@ from pathlib import Path
 # --- Paths & config ---
 HOME = Path.home()
 ENV_FILE = HOME / "clawd" / "config" / "rick.env"
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_FILE = HOME / "rick-vault" / "email-sequences" / "post-install" / "day2.md"
 SENT_LOG = HOME / "rick-vault" / "data" / "post-install-nudge-sent.jsonl"
 OP_LOG = HOME / "rick-vault" / "operations" / "post-install-nudges.jsonl"
@@ -136,11 +137,32 @@ def load_email_map():
 def load_suppression():
     if not SUPPRESSION_FILE.exists():
         return set()
-    return {
-        line.strip().lower()
-        for line in SUPPRESSION_FILE.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    }
+    suppressed = set()
+    for raw in SUPPRESSION_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        email = raw.split("#", 1)[0].strip().lower()
+        if email:
+            suppressed.add(email)
+    return suppressed
+
+
+def email_channel_block_reason():
+    try:
+        root = str(WORKSPACE_ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from runtime.db import connect
+        from runtime.kill_switches import ChannelPaused, assert_channel_active
+
+        conn = connect()
+        try:
+            assert_channel_active(conn, "email")
+            return None
+        except ChannelPaused as exc:
+            return exc.reason
+        finally:
+            conn.close()
+    except Exception as exc:
+        return f"gate_unavailable: {type(exc).__name__}: {exc}"
 
 
 def load_sent_callsigns():
@@ -226,6 +248,9 @@ def humanise_age(hours):
 
 # --- Resend ---
 def send_via_resend(api_key, to_email, subject, html, plain):
+    block_reason = email_channel_block_reason()
+    if block_reason:
+        return False, None, f"channel_paused: {block_reason}"
     payload = {
         "from": FROM_ADDRESS,
         "to": [to_email],

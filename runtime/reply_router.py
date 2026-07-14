@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess  # 2026-07-13 fix: _maybe_auto_draft used subprocess without a module-level import (NameError swallowed as 'drafter-exception' — auto-draft never worked)
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -124,7 +126,7 @@ import re  # noqa: E402  — used by _maybe_queue_sms_draft
 
 # ── Auto-draft integration (Phase G additive layer) ──────────────────────────
 # Labels that get an auto-drafted reply in addition to their existing dispatch.
-# HIGH_INTENT → opus-4-7 (route="review").  WARM → sonnet-4-6 (route="writing").
+# HIGH_INTENT → opus-4-8 (route="review").  WARM → sonnet-4-6 (route="writing").
 # Smart-models invariant: never downgrade these routes inside the drafter.
 _AUTO_DRAFT_HIGH_INTENT: frozenset[str] = frozenset({
     "sales_inquiry", "scheduling_request", "pricing_question",
@@ -183,22 +185,124 @@ def _maybe_auto_draft(row: dict, label: str, dry_run: bool) -> dict | None:
         return {"action": "drafter-exception", "error": str(exc)[:200]}
 
 
-def dispatch_sales_inquiry(conn, row: dict, dry_run: bool) -> dict:
-    email = row.get("from", "").strip()
-    body = (row.get("body") or "")[:500]
-    sms_extra = _maybe_queue_sms_draft(row, "sales_inquiry", dry_run)
+# ── Owner-approval gate (2026-07-13 inbound-capture repair) ──────────────────
+# Audit found Rick committing IN WRITING to pay an unvetted consultant (125-msg
+# thread, "resend the invoice... I'll take care of it right away") with zero
+# owner escalation. Hard rule: any purchase / payment / negotiation /
+# commitment intent routes to the owner via the approvals table + Telegram.
+# Rick NEVER auto-commits funds or terms.
+COMMITMENT_INTENT_RE = re.compile(
+    r"\b(invoice|wire transfer|bank transfer|payment link|purchase order|"
+    r"contract|agreement|retainer|deposit|installment|down payment|"
+    r"pay (?:you|us|me|upfront)|send (?:the )?payment|sign (?:the |this )?"
+    r"(?:contract|agreement|deal)|we have a deal|i agree to|you agreed)\b",
+    re.IGNORECASE,
+)
+
+# deal_close last step — approving records the owner's YES without re-queueing
+# any automated pipeline step (next_step() returns None for the final step).
+_APPROVAL_STEP = ("close_or_escalate", 5, "strategy")
+
+
+def _create_owner_approval(conn, row: dict, label: str, reason: str, dry_run: bool) -> dict:
+    """Insert workflows + jobs + approvals rows (engine schema/conventions) so
+    the existing /approve flow + daily approval_reminder pick this up.
+    Job stays status='blocked' — the engine only executes 'queued' jobs, so
+    nothing fires until Vlad resolves the approval."""
+    email = (row.get("from") or "").strip()
+    subject = (row.get("subject") or "")[:120]
     if dry_run:
-        return {"action": "would-queue-deal_close", "email": email,
-                **({"sms": sms_extra} if sms_extra else {})}
+        return {"action": "would-create-approval", "label": label, "email": email}
+    now = now_iso()
+    wf_id = f"wf_{uuid.uuid4().hex[:12]}"
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    apr_id = f"apr_{uuid.uuid4().hex[:12]}"
+    title = f"Owner approval: {label} from {email}"
+    step_name, step_index, route = _APPROVAL_STEP
     try:
-        wf_id = queue_deal_close_workflow(
-            conn, email=email, name=row.get("from_name", ""),
-            source="reply", message=body,
+        conn.execute(
+            "INSERT INTO workflows (id, kind, title, slug, project, status, stage, priority, "
+            "owner, lane, telegram_target, openclaw_session_key, context_json, created_at, updated_at) "
+            "VALUES (?, 'deal_close', ?, ?, 'deals', 'blocked', 'awaiting-approval', 15, "
+            "'rick', 'customer-lane', '', '', ?, ?, ?)",
+            (wf_id, title, re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60],
+             json.dumps({"trigger_payload": {
+                 "email": email, "name": row.get("from_name", ""),
+                 "source": "reply-owner-approval", "label": label,
+                 "message": (row.get("body") or "")[:500],
+                 "thread_id": row.get("thread_id") or "",
+             }}), now, now),
         )
-        return {"action": "queued", "workflow_id": wf_id, "email": email,
-                **({"sms": sms_extra} if sms_extra else {})}
-    except Exception as exc:
-        return {"action": "error", "error": str(exc)[:200], "email": email}
+        conn.execute(
+            "INSERT INTO jobs (id, workflow_id, step_name, step_index, status, title, route, "
+            "lane, payload_json, blocked_reason, approval_id, created_at, updated_at, run_after) "
+            "VALUES (?, ?, ?, ?, 'blocked', ?, ?, 'customer-lane', ?, ?, ?, ?, ?, ?)",
+            (job_id, wf_id, step_name, step_index, title, route,
+             json.dumps({"email": email, "label": label}),
+             reason, apr_id, now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO approvals (id, workflow_id, job_id, status, area, request_text, "
+            "impact_text, policy_basis, requested_by, created_at) "
+            "VALUES (?, ?, ?, 'open', 'sales', ?, ?, ?, 'rick', ?)",
+            (apr_id, wf_id, job_id,
+             f"{reason} — inbound from {email} ({subject!r})",
+             "Purchase/payment/commitment intent detected. Rick will not commit funds or terms without you.",
+             "Owner-only commitments rule (2026-07-13 inbound-capture repair)",
+             now),
+        )
+        conn.commit()
+        return {"action": "approval-created", "approval_id": apr_id,
+                "workflow_id": wf_id, "label": label, "email": email}
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "approval-error", "error": str(exc)[:200], "email": email}
+
+
+# Vendor-critical automated mail must reach Vlad, never be silently archived —
+# the Jun 28 'Stripe webhook disabled' notice was swallowed by heartbeat
+# sessions replying HEARTBEAT_OK (potemkin-killswitch pattern on inbound).
+CRITICAL_VENDOR_DOMAINS = (
+    "stripe.com", "anthropic.com", "resend.com", "railway.app",
+    "revenuecat.com", "openai.com",
+)
+CRITICAL_VENDOR_KEYWORDS = (
+    "disabled", "failed", "failing", "expiring", "expires", "expired",
+    "suspended", "deactivated", "past due", "action required", "payment failed",
+    "delinquent", "limit reached", "revoked",
+)
+
+
+def dispatch_automated_notification(conn, row: dict, dry_run: bool) -> dict:
+    """Platform/bot mail: archive silently — UNLESS it's a critical vendor
+    notice (Stripe/Anthropic/Resend/...) with an alarming keyword, which
+    escalates to Vlad instead of minting a phantom prospect."""
+    email = (row.get("from") or "").strip().lower()
+    domain = email.rpartition("@")[2]
+    blob = ((row.get("subject") or "") + " " + (row.get("body") or "")[:1000]).lower()
+    is_critical_vendor = any(domain == d or domain.endswith("." + d) for d in CRITICAL_VENDOR_DOMAINS)
+    if is_critical_vendor and any(k in blob for k in CRITICAL_VENDOR_KEYWORDS):
+        return _alert_vlad("vendor_critical", conn, row, dry_run, area="ops", urgent=True)
+    if dry_run:
+        return {"action": "would-skip-automated", "email": email}
+    return {"action": "automated-archived", "email": email}
+
+
+def dispatch_sales_inquiry(conn, row: dict, dry_run: bool) -> dict:
+    # 2026-07-13 — purchase intent goes to the OWNER, not an autonomous
+    # deal_close pipeline. The old auto-queue path minted phantom leads
+    # (Resend's welcome drip became wf_940f1b0cbf57) and let the engine
+    # negotiate terms unsupervised. Approval row + urgent ping instead;
+    # queue_deal_close_workflow stays importable for the manual /hunt path.
+    email = row.get("from", "").strip()
+    sms_extra = _maybe_queue_sms_draft(row, "sales_inquiry", dry_run)
+    approval = _create_owner_approval(
+        conn, row, "sales_inquiry",
+        "Approve reply/next step for inbound sales inquiry", dry_run,
+    )
+    alert = _alert_vlad("sales_inquiry", conn, row, dry_run, area="sales", urgent=True)
+    return {"action": approval.get("action", "error"), "email": email,
+            "approval": approval, "alert": alert.get("action"),
+            **({"sms": sms_extra} if sms_extra else {})}
 
 
 def dispatch_objection(conn, row: dict, dry_run: bool) -> dict:
@@ -370,11 +474,21 @@ def dispatch_question(conn, row, dry_run):
 
 
 def dispatch_pricing_question(conn, row, dry_run):
-    return _alert_vlad("pricing_question", conn, row, dry_run, area="sales", urgent=True)
+    # Purchase intent → owner approval too (2026-07-13 rule): pricing = terms.
+    out = _alert_vlad("pricing_question", conn, row, dry_run, area="sales", urgent=True)
+    out["approval"] = _create_owner_approval(
+        conn, row, "pricing_question",
+        "Approve pricing answer for inbound prospect", dry_run)
+    return out
 
 
 def dispatch_scheduling_request(conn, row, dry_run):
-    return _alert_vlad("scheduling_request", conn, row, dry_run, area="sales", urgent=True)
+    # Commitment intent → owner approval too (2026-07-13 rule).
+    out = _alert_vlad("scheduling_request", conn, row, dry_run, area="sales", urgent=True)
+    out["approval"] = _create_owner_approval(
+        conn, row, "scheduling_request",
+        "Approve call booking for inbound prospect", dry_run)
+    return out
 
 
 def dispatch_referral_request(conn, row, dry_run):
@@ -392,6 +506,7 @@ DISPATCHERS = {
     "pricing_question": dispatch_pricing_question,
     "scheduling_request": dispatch_scheduling_request,
     "referral_request": dispatch_referral_request,
+    "automated_notification": dispatch_automated_notification,
 }
 
 
@@ -432,7 +547,19 @@ def process_file(conn, path: Path, dry_run: bool, batch_cap: int) -> dict:
             continue
         if routed >= batch_cap:
             break
-        result = DISPATCHERS[label](conn, row, dry_run)
+        # 2026-07-13 — commitment override: whatever the label, mail asking
+        # Rick to pay / sign / commit goes to the owner, never a dispatcher
+        # that could auto-engage (see COMMITMENT_INTENT_RE note above).
+        if label != "automated_notification" and COMMITMENT_INTENT_RE.search(
+                ((row.get("subject") or "") + " " + (row.get("body") or ""))[:3000]):
+            result = _create_owner_approval(
+                conn, row, label,
+                f"Commitment/payment language in inbound ({label}) — owner decision required",
+                dry_run)
+            if not dry_run:
+                _alert_vlad(f"commitment_gate:{label}", conn, row, dry_run, area="sales", urgent=True)
+        else:
+            result = DISPATCHERS[label](conn, row, dry_run)
         row["router_ran_at"] = now_iso()
         row["router_result"] = result
         summary_by_action[result.get("action", "unknown")] = summary_by_action.get(result.get("action", "unknown"), 0) + 1

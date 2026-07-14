@@ -1,0 +1,15 @@
+ phil_launch_checklist
+- [ ] Generate gallery images (1270x760px)
+- [ ] Fix PH login (BLOCKER)
+- [ ] Verify product page assets
+- [ ] Pre-queue X thread
+- [ ] Pre-queue email blast
+- [ ] Pre-queue LinkedIn post
+- [ ] Launch day PH login
+- [ ] Post maker comment (CDP Chrome)
+- [ ] Check PH ranking
+- [ ] Monitor comments
+- [ ] Fire distribution channels
+- [ ] Engage with top comments
+- [ ] Midday maker update
+- [ ] Thank commenters

@@ -3,7 +3,9 @@
 morning-intelligence.py — Rick's daily signal aggregator
 Runs at 6:00 AM. Replaces empty heartbeats with a real signal briefing.
 Reads: Stripe, GA4, X signal tracker, email, experiments
-Writes: ~/rick-vault/learning/patterns/morning-brief-YYYY-MM-DD.md
+Writes: ~/rick-vault/learning/briefs/morning-brief-YYYY-MM-DD.md
+(2026-07-12: moved out of learning/patterns/ — run-heartbeat.sh auto-promotes
+that dir into MEMORY.md, and briefs are reports, not distilled patterns.)
 Sends: Telegram CEO HQ topic
 """
 
@@ -30,6 +32,20 @@ YESTERDAY = (date.today() - timedelta(days=1)).isoformat()
 USE_RECON_PRIMARY = os.getenv("RICK_USE_RECONCILIATION_AS_PRIMARY", "0").strip() in ("1", "true", "True", "yes", "on")
 # Legacy flag kept for backward-compat (no-op now — Stripe always tried)
 LIVE = True
+
+# 2026-07-13 attribution-truth v2: mrr = RICK_PRODUCT_IDS (meetrick) only;
+# LinguaLive (Khrystyna's) is portfolio_mrr — reported separately, never summed.
+try:
+    sys.path.insert(0, str(WORKSPACE))
+    from runtime.revenue_signals import RICK_PRODUCT_IDS, PORTFOLIO_PRODUCT_IDS
+except Exception:
+    # Inline fallback — keep in sync with runtime/revenue_signals.py.
+    RICK_PRODUCT_IDS = frozenset({
+        "prod_UAnyfcxSShF33a", "prod_UAbJqha8GV2lDC", "prod_URTpF3D8hAHUmX",
+        "prod_URTpx3MtWC0WYB", "prod_URTptzJL9gfGAT", "prod_U8mgNHBNVO9Zsy",
+        "prod_U8mgdTxX1zzryq",
+    })
+    PORTFOLIO_PRODUCT_IDS = frozenset({"prod_TV7oz6jtR1ejfd"})
 
 
 def _is_phantom(sub: dict, now_ts: int) -> tuple[bool, str]:
@@ -146,7 +162,17 @@ def get_stripe_snapshot() -> dict:
         # 2026-04-24: filter Credits Booster phantoms (100%-discount + zero-paid).
         # Pre-fix: $9 + $269 + $269 = $547 phantom. Post-fix: $9 real.
         now_ts = int(time.time())
-        real_subs = []
+
+        def _sub_products(sub: dict) -> set:
+            prods = {(it.get("price") or {}).get("product")
+                     for it in (sub.get("items") or {}).get("data", [])}
+            plan_prod = (sub.get("plan") or {}).get("product")
+            if plan_prod:
+                prods.add(plan_prod)
+            return prods
+
+        rick_subs = []
+        portfolio_subs = []
         for sub in subs:
             is_phantom, reason = _is_phantom(sub, now_ts)
             sub_id = sub.get("id", "?")
@@ -155,22 +181,37 @@ def get_stripe_snapshot() -> dict:
             if is_phantom:
                 print(f"[morning-intelligence] FILTERED sub={sub_id} cust={cust} amount=${amount:.2f} reason={reason}", file=sys.stderr)
                 continue
-            real_subs.append(sub)
-            print(f"[morning-intelligence] INCLUDED sub={sub_id} cust={cust} amount=${amount:.2f}", file=sys.stderr)
-        mrr_cents = sum(int(s.get("plan", {}).get("amount", 0) or 0) * int(s.get("quantity", 1) or 1) for s in real_subs)
-        mrr = mrr_cents / 100.0
-        customer_ids = set(s.get("customer") for s in real_subs)
+            prods = _sub_products(sub)
+            if prods & RICK_PRODUCT_IDS:
+                rick_subs.append(sub)
+                print(f"[morning-intelligence] INCLUDED (Rick) sub={sub_id} cust={cust} amount=${amount:.2f}", file=sys.stderr)
+            elif prods & PORTFOLIO_PRODUCT_IDS:
+                portfolio_subs.append(sub)
+                print(f"[morning-intelligence] PORTFOLIO (LinguaLive, not Rick's) sub={sub_id} cust={cust} amount=${amount:.2f}", file=sys.stderr)
+            else:
+                print(f"[morning-intelligence] FILTERED sub={sub_id} cust={cust} amount=${amount:.2f} reason=product not in RICK/PORTFOLIO allowlists", file=sys.stderr)
+
+        def _mrr_of(sub_list: list) -> float:
+            cents = sum(int(s.get("plan", {}).get("amount", 0) or 0) * int(s.get("quantity", 1) or 1) for s in sub_list)
+            return cents / 100.0
+
+        mrr = _mrr_of(rick_subs)  # Rick-only (meetrick products)
+        portfolio_mrr = _mrr_of(portfolio_subs)
+        customer_ids = set(s.get("customer") for s in rick_subs)
         snap_dir = DATA_ROOT / "revenue"
         snap_dir.mkdir(parents=True, exist_ok=True)
         today_snap = snap_dir / f"daily-{TODAY}.json"
         today_snap.write_text(json.dumps({
             "mrr": mrr,
+            "portfolio_mrr": portfolio_mrr,
             "total_customers": len(customer_ids),
+            "portfolio_customers": len(set(s.get("customer") for s in portfolio_subs)),
             "date": TODAY,
             "source": "stripe_filtered",
-            "phantoms_filtered": len(subs) - len(real_subs),
+            "phantoms_filtered": len(subs) - len(rick_subs) - len(portfolio_subs),
+            "attribution": "mrr = Rick (meetrick) only; portfolio_mrr = LinguaLive (Khrystyna's, not Rick's) — never sum",
         }))
-        return {"mrr": mrr, "total_customers": len(customer_ids), "new_today": 0}
+        return {"mrr": mrr, "portfolio_mrr": portfolio_mrr, "total_customers": len(customer_ids), "new_today": 0}
     except Exception as e:
         print(f"[morning-intelligence] ERROR: Stripe API call failed: {e}", file=sys.stderr)
         # 2026-04-24: graceful fallback to reconciliation file if Stripe fetch fails.
@@ -266,7 +307,8 @@ def build_brief(stripe: dict, x: dict, experiments: dict, velocity: dict) -> str
         f"# 🧠 Morning Intelligence — {TODAY}",
         "",
         "## Revenue",
-        "- MRR: " + (f"${stripe['mrr']:,.0f}" if stripe.get('mrr') is not None else "⚠️ FETCH ERROR"),
+        "- Rick MRR (meetrick products): " + (f"${stripe['mrr']:,.0f}" if stripe.get('mrr') is not None else "⚠️ FETCH ERROR"),
+        f"- Portfolio ops (LinguaLive, not Rick's): ${stripe.get('portfolio_mrr', 0) or 0:,.0f}",
         f"- Customers: {stripe.get('total_customers', 0)}",
         f"- New today: {stripe.get('new_today', 0)}",
         f"- 7d velocity: {velocity.get('trend','unknown')} (Δ${velocity.get('delta_7d_usd',0):+,.0f})",
@@ -338,7 +380,7 @@ def main() -> None:
 
     brief = build_brief(stripe, x, experiments, velocity)
 
-    out_dir = DATA_ROOT / "learning/patterns"
+    out_dir = DATA_ROOT / "learning/briefs"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"morning-brief-{TODAY}.md"
     out_path.write_text(brief)
@@ -360,7 +402,7 @@ def main() -> None:
     active_exp = experiments.get("active", 0)
     tg_msg = (
         f"🧠 **Morning Brief — {TODAY}**\n"
-        f"💰 MRR: {mrr_str} | Velocity: {vel}\n"
+        f"💰 Rick MRR: {mrr_str} (meetrick only; portfolio ${stripe.get('portfolio_mrr', 0) or 0:,.0f} not Rick's) | Velocity: {vel}\n"
         f"🐦 Followers: {followers}\n"
         f"🧪 Active experiments: {active_exp}\n"
     )

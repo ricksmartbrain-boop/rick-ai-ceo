@@ -30,6 +30,7 @@ _SENDS_CANDIDATES = [
 ]
 SENDS_FILE = next((p for p in _SENDS_CANDIDATES if p.exists()), _SENDS_CANDIDATES[0])
 SEQUENCE_SENDS_FILE = OPS / "email-sequence-send.jsonl"
+NEWSLETTER_SENT_DIR = DATA_ROOT / "projects" / "email"
 
 # ---------------------------------------------------------------------------
 # Warmup ramp schedule — day → max sends/day (cold outreach only)
@@ -42,6 +43,11 @@ RAMP: list[tuple[int, int]] = [
     (14, 50),
 ]
 
+# Minimum 7d sends before bounce-rate percentages are authoritative. Below
+# this, one bounce over a couple of sends reads as 50% and used to freeze the
+# channel as a false 'EMERGENCY' (2026-07-13 fix).
+MIN_RATE_DENOMINATOR = 20
+
 def cap_for_day(day_number: int) -> int:
     """Return the send cap for the given 1-based day number."""
     cap = RAMP[0][1]
@@ -52,10 +58,26 @@ def cap_for_day(day_number: int) -> int:
 
 
 def get_today_cap(state: dict | None = None) -> int:
-    """Return today's cap from the warmup state file (Day 1 = 5 if unstarted)."""
+    """Return today's cap from the warmup state file (Day 1 = 5 if unstarted).
+
+    Reputation override (2026-07-13): when 7d rep health is CRITICAL/EMERGENCY
+    (bounce_rate >= 5% over a reliable >= MIN_RATE_DENOMINATOR-send window) or
+    delayed bounces exist with a zero-send denominator, the cap is 0 so the
+    dispatcher and sequence sender actually stop — previously the EMERGENCY
+    status was display-only.
+    """
     state = state if isinstance(state, dict) else _load_state()
     day_num = current_day_number(state)
-    return cap_for_day(day_num) if day_num > 0 else RAMP[0][1]
+    cap = cap_for_day(day_num) if day_num > 0 else RAMP[0][1]
+    try:
+        rep = sender_rep_7d()
+    except Exception:
+        return 0  # rep unknown → fail closed
+    if rep.get("hold_sends"):
+        return 0
+    if rep.get("sends_7d", 0) >= MIN_RATE_DENOMINATOR and rep.get("bounce_rate_pct", 0.0) >= 5.0:
+        return 0
+    return cap
 
 def full_schedule() -> list[dict]:
     """Return per-day rows for the full 14-day plan."""
@@ -161,6 +183,24 @@ def sender_rep_7d() -> dict:
             except (json.JSONDecodeError, ValueError):
                 pass
 
+    # Newsletter/broadcast sends are logged outside operations/email-sends.jsonl.
+    # Include them in sender-reputation denominator so a week with newsletter sends
+    # and no cold sends does not report impossible 1000%+ bounce rates.
+    if NEWSLETTER_SENT_DIR.exists():
+        for path in NEWSLETTER_SENT_DIR.glob("newsletter-issue-*-sent.txt"):
+            try:
+                for line in path.read_text().splitlines():
+                    parts = line.strip().split("|")
+                    if len(parts) < 3:
+                        continue
+                    ts = datetime.fromisoformat(parts[1].replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts >= cutoff:
+                        sends += 1
+            except (OSError, ValueError):
+                pass
+
     if bounces_file.exists():
         for line in bounces_file.read_text().splitlines():
             try:
@@ -180,9 +220,15 @@ def sender_rep_7d() -> dict:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-    bounce_rate = round(bounces / max(sends, 1) * 100, 1)
-    complaint_rate = round(complaints / max(sends, 1) * 100, 1)
-    delivery_rate = round(100 - bounce_rate, 1)
+    rates_reliable = sends > 0
+    if rates_reliable:
+        bounce_rate = round(bounces / sends * 100, 1)
+        complaint_rate = round(complaints / sends * 100, 1)
+        delivery_rate = max(0.0, round(100 - bounce_rate, 1))
+    else:
+        bounce_rate = 0.0
+        complaint_rate = 0.0
+        delivery_rate = 0.0
     return {
         "sends_7d": sends,
         "bounces_7d": bounces,
@@ -190,13 +236,27 @@ def sender_rep_7d() -> dict:
         "bounce_rate_pct": bounce_rate,
         "complaint_rate_pct": complaint_rate,
         "delivery_rate_pct": delivery_rate,
+        "rates_reliable": rates_reliable,
+        # Below MIN_RATE_DENOMINATOR sends the percentages are real but not
+        # authoritative — never escalate to CRITICAL/EMERGENCY off them.
+        "low_volume": 0 < sends < MIN_RATE_DENOMINATOR,
+        "hold_sends": (not rates_reliable) and (bounces > 0 or complaints > 0),
     }
 
 # ---------------------------------------------------------------------------
 # Rep health status
 # ---------------------------------------------------------------------------
 
-def rep_health(bounce_rate: float) -> str:
+def rep_health(bounce_rate: float, *, rates_reliable: bool = True, hold_sends: bool = False, low_volume: bool = False) -> str:
+    if hold_sends:
+        return "⚠️ UNKNOWN — delayed bounces with 0 logged sends; keep sends paused"
+    if not rates_reliable:
+        return "⚪ NO SEND DATA"
+    if low_volume:
+        # < MIN_RATE_DENOMINATOR sends/7d: rate is not authoritative — cap at WARNING
+        if bounce_rate >= 5.0:
+            return f"⚠️ WARNING — bounce_rate={bounce_rate}% on <{MIN_RATE_DENOMINATOR} sends/7d (low denominator, not authoritative)"
+        return "✅ HEALTHY" if bounce_rate < 2.0 else "⚠️ WARNING"
     if bounce_rate < 2.0:
         return "✅ HEALTHY"
     if bounce_rate < 5.0:
@@ -248,23 +308,63 @@ def main() -> None:
     started = _warmup_started_at(state)
 
     if day_num == 0:
-        # Warmup not started yet — compute cap as if Day 1
-        today_cap = RAMP[0][1]
         day_display = "not started (run --init to begin)"
     else:
-        today_cap = cap_for_day(day_num)
         day_display = str(day_num)
+    # Effective cap includes the reputation override (0 during a real emergency)
+    today_cap = get_today_cap(state)
 
     remaining = max(0, today_cap - today_sent)
-    health = rep_health(rep["bounce_rate_pct"])
+    health = rep_health(
+        rep["bounce_rate_pct"],
+        rates_reliable=bool(rep.get("rates_reliable", True)),
+        hold_sends=bool(rep.get("hold_sends", False)),
+        low_volume=bool(rep.get("low_volume", False)),
+    )
 
     if args.check:
+        # Block sends if rep health is EMERGENCY or CRITICAL
+        if rep.get("hold_sends"):
+            print("BLOCKED: delayed bounces/complaints exist but 7d sends denominator is 0 — keep paused until logs are reconciled")
+            sys.exit(1)
+        # Rate-based block only when the 7d denominator is meaningful —
+        # 1 bounce over 2 sends must not read as a 50% emergency.
+        if rep["bounce_rate_pct"] >= 5.0 and rep["sends_7d"] >= MIN_RATE_DENOMINATOR:
+            print(f"BLOCKED: bounce_rate={rep['bounce_rate_pct']}% (threshold 5%, 7d sends={rep['sends_7d']}) — {health}")
+            sys.exit(1)
+        # Block sends if bounce guardian has paused the channel
+        try:
+            import sqlite3, os as _os
+            _db = _os.path.expanduser(str(_os.environ.get("RICK_RUNTIME_DB_FILE", "~/rick-vault/runtime/rick-runtime.db")))
+            _conn = sqlite3.connect(_db)
+            _cur = _conn.cursor()
+            _cur.execute("SELECT status, paused_until FROM channel_state WHERE channel='email'")
+            _row = _cur.fetchone()
+            _conn.close()
+            if _row and _row[0] == 'paused':
+                from datetime import timezone as _tz
+                import datetime as _dt
+                _until = _dt.datetime.fromisoformat(_row[1].replace('Z', '+00:00'))
+                if _dt.datetime.now(_tz.utc) < _until:
+                    print(f"BLOCKED: email channel paused by bounce guardian until {_row[1]}")
+                    sys.exit(1)
+        except Exception:
+            pass
         sys.exit(0 if remaining > 0 else 1)
 
     if args.digest:
+        if rep.get("rates_reliable"):
+            rate_summary = (
+                f"bounce_rate={rep['bounce_rate_pct']}%, "
+                f"delivery_rate={rep['delivery_rate_pct']}%, "
+            )
+        else:
+            rate_summary = (
+                f"rate=unknown (7d sends={rep['sends_7d']}, "
+                f"bounces={rep['bounces_7d']}, complaints={rep['complaints_7d']}), "
+            )
         print(
-            f"📨 Sender rep 7d: bounce_rate={rep['bounce_rate_pct']}%, "
-            f"delivery_rate={rep['delivery_rate_pct']}%, "
+            f"📨 Sender rep 7d: {rate_summary}"
             f"today's ramp cap={today_cap} sends "
             f"({today_sent} sent, {remaining} remaining) | {health}"
         )
@@ -288,8 +388,11 @@ def main() -> None:
         print(f"Today cap:      {today_cap}")
         print(f"Sent today:     {today_sent}")
         print(f"Remaining:      {remaining}")
-        print(f"7d bounce_rate: {rep['bounce_rate_pct']}%")
-        print(f"7d delivery:    {rep['delivery_rate_pct']}%")
+        if rep.get("rates_reliable"):
+            print(f"7d bounce_rate: {rep['bounce_rate_pct']}%")
+            print(f"7d delivery:    {rep['delivery_rate_pct']}%")
+        else:
+            print(f"7d rates:       unknown (sends={rep['sends_7d']}, bounces={rep['bounces_7d']}, complaints={rep['complaints_7d']})")
         print(f"Rep health:     {health}")
         return
 
@@ -300,8 +403,11 @@ def main() -> None:
     print(f"\n  Domain:           meetrick.ai (Resend verified)")
     print(f"  7d sends:         {rep['sends_7d']}")
     print(f"  7d bounces:       {rep['bounces_7d']}")
-    print(f"  7d bounce_rate:   {rep['bounce_rate_pct']}%  {health}")
-    print(f"  7d delivery_rate: {rep['delivery_rate_pct']}%")
+    if rep.get("rates_reliable"):
+        print(f"  7d bounce_rate:   {rep['bounce_rate_pct']}%  {health}")
+        print(f"  7d delivery_rate: {rep['delivery_rate_pct']}%")
+    else:
+        print(f"  7d rates:         unknown (0 logged sends denominator)  {health}")
     print(f"  7d complaints:    {rep['complaints_7d']}")
     print(f"  Suppressed total: see email-bounces.jsonl (poll.done events)")
 
@@ -332,11 +438,13 @@ def main() -> None:
 
     print(f"\n  Secondary domain plan: see ~/.openclaw/workspace/SENDER-WARMUP.md")
     print(f"  Digest preview:")
+    if rep.get("rates_reliable"):
+        digest_rates = f"bounce_rate={rep['bounce_rate_pct']}%, delivery_rate={rep['delivery_rate_pct']}%, "
+    else:
+        digest_rates = f"rate=unknown (7d sends={rep['sends_7d']}, bounces={rep['bounces_7d']}), "
     digest_line = (
-        f"  📨 Sender rep 7d: bounce_rate={rep['bounce_rate_pct']}%, "
-        f"delivery_rate={rep['delivery_rate_pct']}%, "
-        f"today's ramp cap={today_cap} sends "
-        f"({today_sent} sent, {remaining} remaining) | {health}"
+        f"  📨 Sender rep 7d: {digest_rates}"
+        f"today's ramp cap={today_cap} sends ({today_sent} sent, {remaining} remaining) | {health}"
     )
     print(digest_line)
 

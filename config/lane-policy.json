@@ -1,0 +1,28 @@
+{
+  "lanes": {
+    "ceo-lane": {
+      "priority": 10,
+      "max_running": 1
+    },
+    "ops-lane": {
+      "priority": 15,
+      "max_running": 1
+    },
+    "product-lane": {
+      "priority": 20,
+      "max_running": 2
+    },
+    "customer-lane": {
+      "priority": 25,
+      "max_running": 2
+    },
+    "distribution-lane": {
+      "priority": 30,
+      "max_running": 2
+    },
+    "research-lane": {
+      "priority": 35,
+      "max_running": 1
+    }
+  }
+}

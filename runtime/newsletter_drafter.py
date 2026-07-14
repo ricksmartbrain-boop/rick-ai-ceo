@@ -45,6 +45,10 @@ from runtime.utm import stamp_urls_in_text  # noqa: E402
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 RUNTIME_DB = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
+# X-thread sidecar drafts (operator copy-pastes manually — zero automation
+# during the 30-day post-suspension X cooldown). See
+# docs/x-funnel-integration-2026-05-06.md.
+X_DRAFTS_DIR = DATA_ROOT / "projects" / "x-drafts"
 
 
 THEME_PROMPTS = {
@@ -82,10 +86,21 @@ def _gather_recent_signal() -> dict:
         "now_iso": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "mrr_usd": None,
         "active_subs": None,
+        "paying_customers": None,
         "queued_email_jobs": None,
         "cancelled_today": None,
         "open_tasks": None,
     }
+    # Live MRR from the revenue-velocity snapshot (heartbeat refreshes it from
+    # Stripe with phantom-sub filtering). Replaces the hardcoded "$9 MRR /
+    # 43-day flat" prompt block that went 4 months stale (2026-07-13 fix).
+    try:
+        velocity = json.loads((DATA_ROOT / "revenue" / "velocity.json").read_text(encoding="utf-8"))
+        current_mrr = velocity.get("current_mrr")
+        if isinstance(current_mrr, (int, float)):
+            out["mrr_usd"] = round(float(current_mrr), 2)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
     if not RUNTIME_DB.exists():
         return out
     try:
@@ -111,6 +126,11 @@ def _gather_recent_signal() -> dict:
             out["open_tasks"] = c.fetchone()["n"]
         except Exception:
             pass
+        try:
+            c.execute("SELECT COUNT(*) AS n FROM customers WHERE status IN ('active', 'canceling')")
+            out["paying_customers"] = c.fetchone()["n"]
+        except Exception:
+            pass
         conn.close()
     except Exception:
         return out
@@ -128,6 +148,16 @@ def _build_prompt(issue: int, theme: str, history: list[dict], signal: dict) -> 
     history_block = "\n".join(history_block_lines) or "  (none)"
     theme_blurb = THEME_PROMPTS.get(theme, "Cover one specific operating event clearly and honestly.")
 
+    if signal.get("mrr_usd") is not None:
+        customers_bit = signal.get("paying_customers")
+        customers_bit = f"{customers_bit} paying customers" if customers_bit is not None else "customer count unavailable"
+        mrr_line = (
+            f"- MRR: ${signal['mrr_usd']:.2f} ({customers_bit}; live from revenue velocity + "
+            f"runtime DB — never reuse MRR figures from prior issues)"
+        )
+    else:
+        mrr_line = "- MRR: unavailable this run — do NOT cite an MRR figure or customer count"
+
     prompt = f"""You are Rick, an autonomous AI CEO building a real business toward $100K MRR.
 You write a twice-weekly newsletter ("The Rick Report") in a sharp, warm,
 commercially serious voice — concise by default, honest about what's broken.
@@ -144,14 +174,14 @@ PRIOR-ISSUE LEDGER:
 {history_block}
 
 CURRENT OPERATING SIGNAL ({signal['now_iso']}):
-- MRR: $9 (1 real customer, 43-day flat streak as of last check)
+{mrr_line}
 - Email queue snapshot: {signal['queued_email_jobs']} queued, {signal['cancelled_today']} cancelled today
 - Open tasks: {signal['open_tasks']}
-- ICP pivot landed today: bakery/dermo small-biz list abandoned; targeting
-  technical founders + indie hackers next.
-- Cold-email channel paused (24h bounce-rate >5%), manual-resume only.
-- Newsletter cadence locked to Tue 9am PT + Sat 9am PT, twice weekly, with
-  hard memory check before any draft is approved.
+- ICP: technical founders + indie hackers (small-biz lists abandoned May 2026).
+- Channel states change week to week — never assert a channel is live or
+  paused unless it appears in the operating signal above.
+- Newsletter cadence: Saturday 9am PT weekly, with hard memory check before
+  any draft is approved.
 
 CONSTRAINTS:
 - Open with one specific, falsifiable claim or number — not "this week was
@@ -214,6 +244,86 @@ def _parse_cta(body: str) -> str:
             first = re.split(r"(?<=[.!?])\s+", block, maxsplit=1)[0]
             return first.strip()
     return blocks[-1] if blocks else ""
+
+
+def _build_x_thread_from_issue(issue: int, subject: str, body: str, key_numbers: list[str]) -> str:
+    """Distill a newsletter issue into a 4-tweet paste-ready X thread.
+
+    Pure string/regex distillation — NO LLM call. Keeps cost at zero and
+    avoids the smart-models routing question entirely. The thread reads as
+    a "trailer" for the newsletter issue: hook with subject, surface the
+    sharpest number, deliver the contrarian punch line, link to the full
+    issue with utm_source=x_thread for funnel attribution.
+
+    Each tweet ≤ 270 chars (X cap is 280; runway for handle additions).
+    """
+    # Tweet 1: hook from subject. Strip leading punctuation, kill quotes.
+    hook = subject.strip().strip('"').strip("'").rstrip(".")
+    t1 = f"{hook[:240]}\n\n(thread, {{n}}/4)"  # placeholder — replaced below
+
+    # Tweet 2: sharpest number from the body. Prefer dollar figures,
+    # then percentages, then bare ints. Fall back to first <= 240 chars
+    # of the first paragraph.
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    first_para = paragraphs[0] if paragraphs else ""
+    # Find a sentence containing a number
+    sentences = re.split(r"(?<=[.!?])\s+", " ".join(paragraphs[:2]))
+    number_sentence = next(
+        (s for s in sentences if re.search(r"\$\d|\d+%|\d{2,}", s)),
+        first_para,
+    )
+    t2 = re.sub(r"\*\*([^*]+)\*\*", r"\1", number_sentence)[:270]
+
+    # Tweet 3: a bullet payload — pull up to 3 markdown bullets from body
+    bullets = re.findall(r"^\s*[-*]\s+(.+?)\s*$", body, flags=re.M)[:3]
+    if bullets:
+        clean_bullets = [re.sub(r"\*\*([^*]+)\*\*", r"\1", b).strip() for b in bullets]
+        t3 = "Receipts:\n" + "\n".join(f"• {b[:80]}" for b in clean_bullets)
+        t3 = t3[:270]
+    else:
+        # Fall back to last meaningful sentence
+        last = next((s.strip() for s in reversed(sentences) if len(s.strip()) > 30), "")
+        t3 = re.sub(r"\*\*([^*]+)\*\*", r"\1", last)[:270]
+
+    # Tweet 4: CTA back to the newsletter issue with x_thread UTM
+    issue_url = (f"https://meetrick.ai/newsletter/issue-{issue}"
+                 f"?utm_source=x_thread&utm_medium=distribution&utm_campaign=issue-{issue}")
+    t4 = (f"Full issue (the Rick Report, twice-weekly, from an autonomous AI CEO publishing his real numbers):\n"
+          f"{issue_url}\n\nReply to this thread with your product + ICP and "
+          f"I'll roast the positioning.")[:270]
+
+    tweets = [t1.replace("{n}", "1"),
+              t2 + "\n\n(2/4)",
+              t3 + "\n\n(3/4)",
+              t4 + "\n\n(4/4)"]
+    return "\n\n---\n\n".join(tweets)
+
+
+def _write_x_thread_sidecar(issue: int, subject: str, body: str,
+                             key_numbers: list[str], drafted_at: str,
+                             out_meta_path: Path) -> Path | None:
+    """Sibling-file the paste-ready X thread next to the newsletter draft.
+
+    Filename mirrors the meta sidecar: `<basename>-x-thread.txt` so a glob in
+    the same directory pairs them 1:1.
+    """
+    try:
+        thread = _build_x_thread_from_issue(issue, subject, body, key_numbers)
+    except Exception as exc:  # never block draft on thread-distill failure
+        print(f"[warn] x-thread distill failed: {exc}", file=sys.stderr)
+        return None
+    X_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Place in both X_DRAFTS_DIR and as a sibling of the meta file so either
+    # discovery path works. Single canonical write goes to X_DRAFTS_DIR.
+    date_str = drafted_at[:10]
+    path = X_DRAFTS_DIR / f"newsletter-issue-{issue:03d}-{date_str}-x-thread.txt"
+    header = (f"# X-thread draft — Newsletter Issue #{issue} ({date_str})\n"
+              f"# Subject: {subject}\n"
+              f"# Operator-paced: copy-paste manually into X. Tweets separated by `---`.\n"
+              f"# UTM: utm_source=x_thread (funnel-attribution.py #4 picks this up).\n"
+              f"# 30-day post-suspension cooldown ends ~2026-06-05.\n\n")
+    path.write_text(header + thread + "\n", encoding="utf-8")
+    return path
 
 
 def main() -> int:
@@ -295,6 +405,16 @@ def main() -> int:
     print(f"subject:       {subject}")
     print(f"theme:         {args.theme}")
     print(f"model:         {result.provider}/{result.model}")
+
+    # X-thread sidecar — paste-ready trailer of the issue. Operator-paced.
+    # No LLM call here (pure regex distillation) so this stays cost-free and
+    # outside the smart-models routing decision.
+    x_path = _write_x_thread_sidecar(
+        args.issue, subject, body, sorted(extract_key_numbers(body_blob)),
+        meta["drafted_at"], Path(args.out_meta),
+    )
+    if x_path:
+        print(f"x-thread:      {x_path}")
     return 0
 
 

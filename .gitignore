@@ -70,3 +70,21 @@ package-lock.json
 .tmp-moltbook-result.json
 mentions.json
 posts-log.md
+
+# Embedded git repos (separate projects with their own .git — not snapshot content)
+meetrick-site/
+meetrick-api/
+skills/free-ride/jobs/
+
+# Secret-bearing files (2026-07-14 secrets audit)
+config/rick.env.bak*
+.x-agent-browser-state.json
+config/x-browser-state.json
+scripts/instagram_relationship_pass.py
+scripts/instagram_relationship_pass_v2.py
+scripts/attic/lead_blast_apr20.py
+scripts/attic/lead_blast_apr21.py
+scripts/ig-dm-monitor.js
+scripts/post-instagram-playwright.py
+tmp-instagram-attempt-login.mjs
+tmp-instagram-engage.mjs

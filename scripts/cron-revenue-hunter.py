@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Bounded revenue signal probe for the Revenue Hunter cron."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Attribution-truth v2 (2026-07-13): Rick MRR = RICK_PRODUCT_IDS (meetrick)
+# only; PORTFOLIO_PRODUCT_IDS (LinguaLive, Khrystyna's) reported separately,
+# never summed. The shared Stripe account also holds legacy Folderly subs
+# ($538 phantom) and personal invoices.
+from runtime.revenue_signals import PORTFOLIO_PRODUCT_IDS, RICK_PRODUCT_IDS  # noqa: E402
+
+ENV_PATHS = (
+    Path.home() / "clawd" / "config" / "rick.env",
+    Path.home() / ".openclaw" / "workspace" / "config" / "rick.env",
+)
+HOT_WORDS = ("pricing", "interested", "hire", "setup", "buy", "demo")
+
+
+def load_env() -> None:
+    for path in ENV_PATHS:
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def check_email() -> dict:
+    try:
+        proc = subprocess.run(
+            ["himalaya", "envelope", "list", "--output", "json", "not flag seen"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "hot_subjects": []}
+    if proc.returncode != 0:
+        return {"status": "error", "hot_subjects": [], "error": proc.stderr.strip()[:200]}
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        rows = []
+    hot = []
+    for row in rows if isinstance(rows, list) else []:
+        subject = str(row.get("subject") or "")
+        if any(word in subject.lower() for word in HOT_WORDS):
+            hot.append(subject[:160])
+    return {"status": "ok", "unread": len(rows) if isinstance(rows, list) else 0, "hot_subjects": hot[:5]}
+
+
+def check_stripe() -> dict:
+    key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if not key:
+        return {"status": "missing_key", "charges": []}
+    token = base64.b64encode(f"{key}:".encode()).decode()
+
+    def stripe_get(path: str, params: dict | None = None) -> dict:
+        query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        req = urllib.request.Request(
+            f"https://api.stripe.com{path}{query}",
+            headers={"Authorization": f"Basic {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def stripe_list(path: str, params: dict | None = None, *, max_pages: int = 10) -> tuple[list[dict], bool]:
+        base_params = dict(params or {})
+        base_params.setdefault("limit", 100)
+        rows: list[dict] = []
+        starting_after = None
+        truncated = False
+        for _ in range(max_pages):
+            page_params = dict(base_params)
+            if starting_after:
+                page_params["starting_after"] = starting_after
+            page = stripe_get(path, page_params)
+            data = page.get("data", [])
+            rows.extend(data)
+            if not page.get("has_more") or not data:
+                return rows, False
+            starting_after = data[-1].get("id")
+            if not starting_after:
+                return rows, True
+        truncated = True
+        return rows, truncated
+
+    now_utc = datetime.now(timezone.utc)
+    business_tz = ZoneInfo("America/Los_Angeles")
+    today_start_local = datetime.combine(now_utc.astimezone(business_tz).date(), time.min, tzinfo=business_tz)
+    last_24h = int((now_utc - timedelta(hours=24)).timestamp())
+    today_start = int(today_start_local.timestamp())
+    try:
+        latest_data = stripe_get("/v1/charges", {"limit": 5})
+        recent_rows, recent_truncated = stripe_list("/v1/charges", {"created[gte]": last_24h})
+        today_rows, today_truncated = stripe_list("/v1/charges", {"created[gte]": today_start})
+        sub_rows, subs_truncated = stripe_list("/v1/subscriptions", {"status": "active"})
+    except Exception as exc:
+        return {"status": "error", "latest_charges": [], "error": str(exc)[:200]}
+
+    def format_charge(charge: dict) -> dict:
+        amount = charge.get("amount") or 0
+        return {
+            "amount_cents": amount,
+            "amount_usd": round(amount / 100, 2),
+            "currency": charge.get("currency"),
+            "status": charge.get("status"),
+            "receipt_email": charge.get("receipt_email"),
+            "created": charge.get("created"),
+            "paid": charge.get("paid"),
+        }
+
+    latest_charges = [format_charge(c) for c in latest_data.get("data", [])[:5]]
+    recent_charges = [
+        format_charge(c)
+        for c in recent_rows
+        if c.get("paid") and c.get("status") == "succeeded"
+    ]
+    today_charges = [
+        format_charge(c)
+        for c in today_rows
+        if c.get("paid") and c.get("status") == "succeeded"
+    ]
+
+    list_mrr_cents = 0
+    real_mrr_cents = 0
+    portfolio_mrr_cents = 0
+    active_subs = []
+    portfolio_subs = 0
+    non_rick_subs_excluded = 0
+    for sub in sub_rows:
+        item_products = {
+            (item.get("price") or {}).get("product")
+            for item in sub.get("items", {}).get("data", [])
+        }
+        if item_products & PORTFOLIO_PRODUCT_IDS and not (item_products & RICK_PRODUCT_IDS):
+            # LinguaLive (Khrystyna's) — portfolio ops, NOT Rick MRR.
+            portfolio_subs += 1
+            for item in sub.get("items", {}).get("data", []):
+                price = item.get("price", {})
+                interval = (price.get("recurring") or {}).get("interval")
+                unit_amount = price.get("unit_amount") or 0
+                quantity = item.get("quantity") or 1
+                if interval == "month":
+                    portfolio_mrr_cents += unit_amount * quantity
+                elif interval == "year":
+                    portfolio_mrr_cents += round((unit_amount * quantity) / 12)
+            continue
+        if not (item_products & RICK_PRODUCT_IDS):
+            non_rick_subs_excluded += 1
+            continue
+        sub_cents = 0
+        intervals = []
+        for item in sub.get("items", {}).get("data", []):
+            price = item.get("price", {})
+            interval = (price.get("recurring") or {}).get("interval")
+            intervals.append(interval)
+            unit_amount = price.get("unit_amount") or 0
+            quantity = item.get("quantity") or 1
+            if interval == "month":
+                sub_cents += unit_amount * quantity
+            elif interval == "year":
+                sub_cents += round((unit_amount * quantity) / 12)
+        list_mrr_cents += sub_cents
+
+        latest_invoice_paid = None
+        try:
+            invoice_data = stripe_get("/v1/invoices", {"limit": 1, "subscription": sub.get("id")})
+            invoices = invoice_data.get("data", [])
+            if invoices:
+                latest_invoice_paid = invoices[0].get("amount_paid") or 0
+        except Exception:
+            latest_invoice_paid = None
+        if latest_invoice_paid is not None:
+            real_mrr_cents += min(sub_cents, latest_invoice_paid)
+
+        active_subs.append(
+            {
+                "id": sub.get("id"),
+                "status": sub.get("status"),
+                "list_mrr_usd_est": round(sub_cents / 100, 2),
+                "latest_invoice_paid_usd": None
+                if latest_invoice_paid is None
+                else round(latest_invoice_paid / 100, 2),
+                "intervals": intervals,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "active_list_mrr_usd_est": round(list_mrr_cents / 100, 2),
+        "active_real_mrr_usd_est": round(real_mrr_cents / 100, 2),
+        "portfolio_mrr_usd_est": round(portfolio_mrr_cents / 100, 2),
+        "portfolio_subs": portfolio_subs,
+        "non_rick_subs_excluded": non_rick_subs_excluded,
+        "mrr_policy": "Rick MRR = RICK_PRODUCT_IDS (meetrick) only; portfolio_mrr_usd_est = PORTFOLIO_PRODUCT_IDS (LinguaLive, Khrystyna's — NOT Rick's revenue, never sum) (shared Stripe account)",
+        "gross_today_usd": round(sum(c["amount_cents"] for c in today_charges) / 100, 2),
+        "gross_last_24h_usd": round(sum(c["amount_cents"] for c in recent_charges) / 100, 2),
+        "today_charges": today_charges,
+        "last_24h_charges": recent_charges,
+        "latest_charges_context": latest_charges,
+        "active_subscriptions": active_subs,
+        "window_note": "gross_today_usd and gross_last_24h_usd are overlapping windows; do not sum them",
+        "truncated": {
+            "today_charges": today_truncated,
+            "last_24h_charges": recent_truncated,
+            "active_subscriptions": subs_truncated,
+        },
+    }
+
+
+def main() -> int:
+    load_env()
+    result = {
+        "email": check_email(),
+        "stripe": check_stripe(),
+    }
+    hot = bool(result["email"].get("hot_subjects")) or bool(result["stripe"].get("today_charges"))
+    result["summary"] = "revenue_signals_found" if hot else "no_new_revenue_signals"
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

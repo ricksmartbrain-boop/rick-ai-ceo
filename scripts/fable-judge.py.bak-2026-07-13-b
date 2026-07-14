@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+Fable Judge — autonomous standing auditor for Rick.
+
+Fable 5 (claude-fable-5) acts as an independent judge that grades Rick on TWO axes:
+  1. AUTONOMY  — is Rick acting on his own and shipping reversible work without hand-holding?
+  2. RESULTS   — is the activity producing real outcomes (captures, replies, calls, closes, $)?
+
+It pulls hard ground truth (Stripe MRR, recent revenue, cron health, attribution ledger)
+and asks Fable to score, call out theater vs. leverage, and issue concrete corrective orders.
+
+Output: a dated verdict written to ~/rick-vault/control/fable-judge/verdict-YYYY-MM-DD.md
+and a short scorecard returned to stdout for Telegram delivery.
+
+Usage:
+  python3 scripts/fable-judge.py            # full verdict
+  python3 scripts/fable-judge.py --brief    # scorecard only (cheaper context)
+"""
+import os, sys, json, time, glob, subprocess, urllib.request, datetime
+
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+VAULT = os.path.expanduser("~/rick-vault")
+JUDGE_DIR = os.path.join(VAULT, "control", "fable-judge")
+os.makedirs(JUDGE_DIR, exist_ok=True)
+
+BRIEF = "--brief" in sys.argv
+
+# Allowlist of real Rick product IDs — the shared Stripe account also holds
+# legacy Folderly subs ($538 phantom) and personal invoices (2026-07-13 fix).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from runtime.revenue_signals import RICK_REAL_PRODUCT_IDS
+
+PHANTOM_SUB_IDS = {
+    "sub_1MTZsID9G3v6e0OsAEtPWMCU",
+    "sub_1MTZp2D9G3v6e0OsqZusw5VV",
+}
+SHARED_STRIPE_EMAILS = {"chris@dodoche.com"}
+RICK_PRODUCT_HINTS = (
+    "rick",
+    "meetrick",
+    "agent decision",
+    "managed ai ceo",
+    "ai ceo",
+    "deploy",
+    "roast",
+    "receipt",
+)
+
+
+def _price_is_fully_discounted(sub):
+    discount = sub.get("discount") or {}
+    coupon = discount.get("coupon") or {}
+    return coupon.get("percent_off") == 100
+
+
+def _charge_is_rick_revenue(charge):
+    billing = charge.get("billing_details") or {}
+    email = (billing.get("email") or "").strip().lower()
+    if email in SHARED_STRIPE_EMAILS:
+        return False
+    searchable = " ".join(
+        str(x or "")
+        for x in (
+            charge.get("description"),
+            charge.get("statement_descriptor"),
+            charge.get("statement_descriptor_suffix"),
+            charge.get("receipt_url"),
+        )
+    ).lower()
+    if not searchable.strip():
+        return True
+    return any(hint in searchable for hint in RICK_PRODUCT_HINTS)
+
+
+def stripe_truth():
+    key = os.environ.get("STRIPE_SECRET_KEY", "")
+    out = {"mrr": None, "active_subs": None, "rev_7d": None, "rev_30d": None,
+           "charges_7d": None, "last_charge": None, "excluded": [],
+           "policy": "Rick revenue only: MRR counts only RICK_REAL_PRODUCT_IDS subscriptions; also excludes phantom 100%-coupon subscriptions and shared Stripe customer charges.",
+           "error": None}
+    if not key:
+        out["error"] = "no STRIPE_SECRET_KEY"
+        return out
+    try:
+        req = urllib.request.Request(
+            "https://api.stripe.com/v1/charges?limit=100",
+            headers={"Authorization": "Bearer " + key})
+        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        now = time.time()
+        all_charges = [c for c in d.get("data", []) if c.get("status") == "succeeded"]
+        ch = []
+        for charge in all_charges:
+            if _charge_is_rick_revenue(charge):
+                ch.append(charge)
+            else:
+                out["excluded"].append({
+                    "type": "charge",
+                    "id": charge.get("id"),
+                    "reason": "shared Stripe account / non-Rick revenue",
+                })
+        l7 = [c for c in ch if now - c["created"] < 7 * 86400]
+        l30 = [c for c in ch if now - c["created"] < 30 * 86400]
+        out["rev_7d"] = round(sum(c["amount"] for c in l7) / 100, 2)
+        out["rev_30d"] = round(sum(c["amount"] for c in l30) / 100, 2)
+        out["charges_7d"] = len(l7)
+        if ch:
+            lc = ch[0]
+            out["last_charge"] = time.strftime("%Y-%m-%d", time.localtime(lc["created"])) + " $%.2f" % (lc["amount"] / 100)
+        req2 = urllib.request.Request(
+            "https://api.stripe.com/v1/subscriptions?status=active&limit=100",
+            headers={"Authorization": "Bearer " + key})
+        s = json.loads(urllib.request.urlopen(req2, timeout=30).read())
+        subs = s.get("data", [])
+        mrr = 0.0
+        counted_subs = 0
+        for sub in subs:
+            if sub.get("id") in PHANTOM_SUB_IDS or _price_is_fully_discounted(sub):
+                out["excluded"].append({
+                    "type": "subscription",
+                    "id": sub.get("id"),
+                    "reason": "phantom/internal subscription or 100% coupon",
+                })
+                continue
+            sub_products = {(it.get("price") or {}).get("product")
+                            for it in sub.get("items", {}).get("data", [])}
+            if not (sub_products & RICK_REAL_PRODUCT_IDS):
+                out["excluded"].append({
+                    "type": "subscription",
+                    "id": sub.get("id"),
+                    "reason": "product not in RICK_REAL_PRODUCT_IDS (non-Rick product in shared account)",
+                })
+                continue
+            counted_subs += 1
+            for it in sub.get("items", {}).get("data", []):
+                pr = it.get("price", {})
+                amt = (pr.get("unit_amount") or 0) * it.get("quantity", 1) / 100
+                if pr.get("recurring", {}).get("interval") == "year":
+                    amt /= 12
+                mrr += amt
+        out["active_subs"] = counted_subs
+        out["mrr"] = round(mrr, 2)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def cron_truth():
+    try:
+        r = subprocess.run(["openclaw", "cron", "list", "--json"],
+                           capture_output=True, text=True, timeout=60)
+        d = json.loads(r.stdout)
+        jobs = d.get("jobs", [])
+        broken = []
+        for j in jobs:
+            st = j.get("state", {})
+            if st.get("consecutiveErrors", 0) > 0 or st.get("lastRunStatus") == "error":
+                broken.append({"name": j.get("name"),
+                               "errors": st.get("consecutiveErrors", 0),
+                               "lastError": (st.get("lastError") or "")[:120]})
+        return {"total": len(jobs), "broken": broken}
+    except Exception as e:
+        return {"total": None, "broken": [], "error": str(e)[:200]}
+
+
+def attribution_truth():
+    """Pull whatever revenue-attribution ledger exists. Tolerant of missing files."""
+    paths = [
+        os.path.join(VAULT, "logs", "conversions.log"),
+        os.path.join(VAULT, "logs", "pipeline.jsonl"),
+        os.path.join(VAULT, "control", "attribution-ledger.jsonl"),
+    ]
+    snippets = {}
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    lines = f.readlines()
+                snippets[os.path.basename(p)] = "".join(lines[-25:])[:2000]
+            except Exception:
+                pass
+    return snippets
+
+
+def latest_briefing():
+    files = sorted(glob.glob(os.path.join(VAULT, "control", "briefings", "*.md")),
+                   key=os.path.getmtime, reverse=True)
+    if files:
+        try:
+            with open(files[0]) as f:
+                return os.path.basename(files[0]) + ":\n" + f.read()[:1500]
+        except Exception:
+            pass
+    return "(no recent briefing)"
+
+
+def prior_verdict():
+    files = sorted(glob.glob(os.path.join(JUDGE_DIR, "verdict-*.md")),
+                   key=os.path.getmtime, reverse=True)
+    if files:
+        try:
+            with open(files[0]) as f:
+                return os.path.basename(files[0]) + ":\n" + f.read()[:2000]
+        except Exception:
+            pass
+    return "(no prior verdict — this is the first judgment)"
+
+
+def main():
+    if not API_KEY:
+        print("FABLE_JUDGE_ERROR: no ANTHROPIC_API_KEY in env")
+        sys.exit(1)
+
+    stripe = stripe_truth()
+    cron = cron_truth()
+    attrib = attribution_truth()
+    briefing = latest_briefing()
+    prior = prior_verdict()
+    today = datetime.date.today().isoformat()
+
+    targets = (
+        "GROWTH PLAN GATES: Month1 -> $3.5-5.5K MRR; Month2 -> $10K (4 retainers); "
+        "Month3 -> $16-18K. Primary offer: $2,500/mo retainer. $100K = 40 retainers. "
+        "Failure tripwires: <20 roast captures by day21 = channel emergency; "
+        "zero closes by day45 = offer/script teardown."
+    )
+
+    ask = (
+        "You are FABLE JUDGE — the standing independent auditor for an autonomous AI operator "
+        "named Rick (meetrick.ai), pushing to $100K MRR. You grade Rick on TWO axes only:\n\n"
+        "  AUTONOMY (0-10): Is Rick acting on his own initiative, shipping reversible work without "
+        "waiting to be told, fixing his own breakage, and proposing experiments? Or is he idle, "
+        "stalled, waiting, or just running maintenance?\n"
+        "  RESULTS (0-10): Is the activity producing REAL outcomes — roast captures, email replies, "
+        "booked calls, closes, and dollars? Activity without revenue scores LOW no matter how busy.\n\n"
+        "Be ruthless and specific. Reward shipped revenue and self-directed leverage. Punish theater, "
+        "idle monitoring, and busy-but-broke patterns. Compare against the prior verdict to judge "
+        "trajectory (improving / flat / regressing).\n\n"
+        f"=== GROUND TRUTH ({today}) ===\n"
+        f"STRIPE: {json.dumps(stripe)}\n"
+        f"CRON: total={cron.get('total')}, broken={json.dumps(cron.get('broken'))}\n"
+        f"ATTRIBUTION LEDGER (recent): {json.dumps(attrib)[:1500]}\n"
+        f"LATEST BRIEFING: {briefing}\n"
+        f"{targets}\n\n"
+        f"=== PRIOR VERDICT (for trajectory) ===\n{prior}\n\n"
+        "=== DELIVER (markdown) ===\n"
+        "1. SCORECARD: `AUTONOMY: X/10 | RESULTS: Y/10 | TRAJECTORY: up/flat/down` on the first line, "
+        "then 2 sentences justifying each score with a NUMBER from ground truth.\n"
+        "2. WHAT'S WORKING (max 3 bullets, each tied to a real outcome/number).\n"
+        "3. THEATER DETECTED (max 3 bullets: activity producing no measurable result — name it).\n"
+        "4. CORRECTIVE ORDERS (exactly 3, ranked, each a concrete action Rick must take before the next "
+        "judgment, each with the metric it must move). These are ORDERS, not suggestions.\n"
+        "5. ESCALATE-TO-VLAD: anything genuinely blocked on the human (pricing/DNS/approval), or 'none'.\n\n"
+        "Keep it tight. This is an operator's verdict, not an essay. End with one blunt sentence to Rick."
+    )
+
+    if BRIEF:
+        ask += "\n\nBRIEF MODE: output ONLY the scorecard line and the 3 corrective orders. Nothing else."
+
+    payload = {
+        "model": "claude-fable-5",
+        "max_tokens": 3500 if not BRIEF else 1200,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high" if not BRIEF else "medium"},
+        "messages": [{"role": "user", "content": ask}],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=300)
+        data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print("FABLE_JUDGE_HTTP_ERROR", e.code, e.read().decode()[:500])
+        sys.exit(1)
+
+    text = "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+    header = f"# Fable Judge Verdict — {today}\n\nGenerated via claude-fable-5 (adaptive). Axes: Autonomy + Results.\n\n"
+    if not BRIEF:
+        with open(os.path.join(JUDGE_DIR, f"verdict-{today}.md"), "w") as f:
+            f.write(header + text + "\n")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,42 @@
+{
+  "date": "2026-04-15",
+  "source": "self-push-engine",
+  "context": {
+    "mrr": 547,
+    "goal_mrr": 100000,
+    "working_signals": [
+      "counterintuitive content",
+      "money-first proof with short ops breakdown",
+      "warm replies outperform cold openings"
+    ]
+  },
+  "experiments": [
+    {
+      "id": "exp_2026-04-15_1_proof_thread_cta",
+      "category": "content_format",
+      "hypothesis": "A proof-first X thread with a single CTA will drive more profile visits and clicks than a generic operator post.",
+      "variant_a": "Operator-style post with workflow detail only",
+      "variant_b": "Proof-first thread opening with live revenue or buyer outcome, then one CTA",
+      "metric": "profile visits + checkout clicks within 24h",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-15_2_warm_reply_followup",
+      "category": "follow_up",
+      "hypothesis": "A warm, specific follow-up to a recent engaged lead converts better than a broad broadcast reply.",
+      "variant_a": "Generic check-in",
+      "variant_b": "Context-specific follow-up referencing their exact pain and next step",
+      "metric": "reply rate + qualified calls booked",
+      "status": "queued"
+    },
+    {
+      "id": "exp_2026-04-15_3_counterintuitive_hook",
+      "category": "hook",
+      "hypothesis": "Counterintuitive, money-first hooks outperform benefit-first hooks for attracting buyers in the founder audience.",
+      "variant_a": "Benefit-led headline",
+      "variant_b": "Counterintuitive headline with a concrete revenue number first",
+      "metric": "engagement rate and qualified inbound",
+      "status": "queued"
+    }
+  ]
+}

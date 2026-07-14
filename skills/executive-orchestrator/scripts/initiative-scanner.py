@@ -100,12 +100,45 @@ def _queue_initiative(conn, title: str, rationale: str, existing: set[str]) -> b
     """Create an initiative workflow if not duplicate. Returns True if created."""
     if title in existing:
         return False
+
+    # Identity gate: block duplicates and near-duplicates before any DB write.
+    try:
+        from scripts.workflow_identity_resolver import resolve_or_create_workflow as _resolve
+        _identity = _resolve(title=title, kind="initiative", rationale=rationale[:200])
+        if _identity.action == "reuse":
+            print(f"  [identity-gate] REUSE existing uid={_identity.workflow_uid} for: {title[:60]}")
+            existing.add(title)
+            return False
+        if _identity.action == "needs_review":
+            candidate = _identity.candidates[0].canonical_title if _identity.candidates else "unknown"
+            print(f"  [identity-gate] BLOCKED (needs_review) for: {title[:60]} — similar to '{candidate}'")
+            return False
+        _new_uid = _identity.workflow_uid
+    except Exception as e:
+        print(f"  [identity-gate] WARN resolver unavailable ({e}); proceeding without gate")
+        _new_uid = None
+
     slug = title.lower().replace(" ", "-")[:40]
     context = {
         "product_slug": f"initiative-{slug}",
         "rationale": rationale,
     }
     wf_id = create_workflow(conn, "initiative", title, "rick-v6", context, priority=40, lane="ops-lane")
+
+    # Back-fill db_workflow_id into identity registry
+    if _new_uid:
+        try:
+            from scripts.workflow_identity_resolver import _load_registry, _save_registry, _now_iso
+            _records = _load_registry()
+            for _rec in _records:
+                if _rec.workflow_uid == _new_uid and not _rec.db_workflow_id:
+                    _rec.db_workflow_id = wf_id
+                    _rec.last_seen_at = _now_iso()
+                    _save_registry(_records)
+                    break
+        except Exception:
+            pass
+
     # Queue the first step
     steps = WORKFLOW_STEP_MAP.get("initiative", [])
     if steps:

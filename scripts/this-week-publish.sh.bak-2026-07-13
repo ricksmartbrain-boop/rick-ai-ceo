@@ -1,0 +1,14 @@
+#!/bin/sh
+# ai.rick.this-week-publish — Mondays 09:00: regenerate /this-week and push.
+# Pull first and retry-once on rejected push: the receipts auto-publish job
+# also pushes to this repo.
+set -e
+SITE="$HOME/.openclaw/workspace/meetrick-site"
+cd "$SITE"
+git pull --rebase --autostash
+/usr/bin/python3 "$HOME/.openclaw/workspace/scripts/this-week-page.py" --out "$SITE/this-week.html"
+if ! git diff --quiet -- this-week.html; then
+  git add this-week.html
+  git commit -m "this-week: auto-publish $(date +%Y-%m-%d)"
+  git push origin main || { git pull --rebase --autostash && git push origin main; }
+fi

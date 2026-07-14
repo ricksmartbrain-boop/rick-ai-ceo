@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-blog-atomize.py — 1 blog post → 9 channel-native variants via opus-4-7 (route='review').
+blog-atomize.py — 1 blog post → 9 channel-native variants via opus-4-8 (route='review').
 
 Usage:
     python3 scripts/blog-atomize.py --post-path ~/meetrick-site/blog/2026-04-26-...md
@@ -13,7 +13,7 @@ Outputs JSON + per-channel text files to:
     ~/rick-vault/content/blog-atomized/{post-slug}/{channel}.txt
     ~/rick-vault/content/blog-atomized/{post-slug}/all-variants.json
 
-Hard invariant: route='review' → claude-opus-4-7. Never routes to sonnet/haiku.
+Hard invariant: route='review' → claude-opus-4-8. Never routes to sonnet/haiku.
 No autosend. No mutations to existing pipelines.
 """
 
@@ -384,7 +384,7 @@ def print_summary(result: AtomizationResult) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Atomize a meetrick.ai blog post into 9 channel-native variants via opus-4-7.",
+        description="Atomize a meetrick.ai blog post into 9 channel-native variants via opus-4-8.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
@@ -430,7 +430,7 @@ def main() -> None:
     channels = [CHANNEL_MAP[c] for c in args.channels] if args.channels else CHANNELS
     if not args.dry_run:
         print(f"Generating {len(channels)} variant(s) for: {post.title}")
-        print(f"Route: review → claude-opus-4-7 | Model enforced by llm.py route config")
+        print(f"Route: review → claude-opus-4-8 | Model enforced by llm.py route config")
 
     # Generate variants
     variants: list[Variant] = []

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "exp_2026-04-10_1_proof_to_offer_bridge",
+    "category": "conversion",
+    "context": {
+      "mrr_at_creation": 547,
+      "current_problem": "proof assets exist but do not reliably convert"
+    },
+    "hypothesis": "A proof-first landing section with a single hard CTA outperforms the current mixed-path offer block.",
+    "variant_a": "Current /roast section",
+    "variant_b": "Free roast -> $295 audit -> $499/mo install with proof and risk reversal",
+    "metric": "stripe clicks / unique visitors and completed purchase rate",
+    "start_date": "2026-04-10",
+    "end_date": "2026-04-17",
+    "status": "active",
+    "launched_at": "2026-04-25T13:16:52.728633+00:00"
+  },
+  {
+    "id": "exp_2026-04-10_2_warm_reply_followup",
+    "category": "distribution",
+    "context": {
+      "mrr_at_creation": 547,
+      "what_is_working": "warm replies and specific proof beats abstract pitches"
+    },
+    "hypothesis": "A same-day warm follow-up on engaged prospects will produce more responses than delayed batch follow-up.",
+    "variant_a": "Reply within 24h with generic check-in",
+    "variant_b": "Reply within 2h with a specific context-based follow-up and one proof point",
+    "metric": "reply rate and booked calls",
+    "start_date": "2026-04-10",
+    "end_date": "2026-04-17",
+    "status": "active",
+    "launched_at": "2026-04-25T13:16:52.728633+00:00"
+  },
+  {
+    "id": "exp_2026-04-10_3_counterintuitive_hook",
+    "category": "content",
+    "context": {
+      "mrr_at_creation": 547,
+      "what_is_working": "counterintuitive framing"
+    },
+    "hypothesis": "Counterintuitive hooks outperform generic founder-update posts for engagement and inbound curiosity.",
+    "variant_a": "Generic build-in-public update",
+    "variant_b": "Counterintuitive claim tied to real numbers and one screenshot/proof point",
+    "metric": "engagement rate and profile clicks within 24h",
+    "start_date": "2026-04-10",
+    "end_date": "2026-04-17",
+    "status": "active",
+    "launched_at": "2026-04-25T13:16:52.728633+00:00"
+  }
+]

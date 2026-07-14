@@ -1,0 +1,21 @@
+const { chromium } = require('/opt/homebrew/lib/node_modules/playwright');
+(async()=>{
+ const browser=await chromium.connectOverCDP('http://127.0.0.1:9225');
+ const p=browser.contexts()[0].pages()[0];
+ await p.goto('https://www.linkedin.com/feed/',{waitUntil:'domcontentloaded',timeout:30000});
+ await p.waitForTimeout(4000);
+ const btn = p.locator('[role="button"]').filter({ hasText: 'Start a post' }).first();
+ const box = await btn.boundingBox();
+ if (box) await p.mouse.click(box.x+box.width/2, box.y+box.height/2);
+ await p.waitForTimeout(3000);
+ const dialogInfo = await p.locator('[role="dialog"]').evaluateAll(dialogs => dialogs.map((d,i)=>({i, text:(d.innerText||'').trim().slice(0,200), aria:d.getAttribute('aria-label')||'', cls:d.className, visible: !!(d.offsetWidth || d.offsetHeight || d.getClientRects().length)})).slice(0,20));
+ console.log('dialogs', JSON.stringify(dialogInfo,null,2));
+ const questionCount = await p.getByText('What do you want to talk about?').count();
+ console.log('questionCount', questionCount);
+ const visibleDialogs = p.locator('[role="dialog"]').filter({ hasText: 'What do you want to talk about?' });
+ console.log('matching dialogs', await visibleDialogs.count());
+ const m = visibleDialogs.first();
+ console.log('textbox in match', await m.getByRole('textbox').count());
+ console.log('buttons in match', await m.getByRole('button').count());
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});
