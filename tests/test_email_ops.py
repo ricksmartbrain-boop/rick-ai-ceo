@@ -4,10 +4,12 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +108,118 @@ class EmailSequenceDispatchTests(unittest.TestCase):
 
 
 class EmailSendSafetyTests(unittest.TestCase):
+    def reload_kill_switches(self):
+        import importlib
+        import runtime.kill_switches as kill_switches
+
+        return importlib.reload(kill_switches)
+
+    def test_channel_gate_honors_sender_warmup_ledger_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            (data_root / "operations").mkdir(parents=True)
+            (data_root / "control").mkdir(parents=True)
+            limits_file = data_root / "channel-limits.json"
+            limits_file.write_text(
+                json.dumps({"channels": {"email": {"active": True, "daily": 500, "per_minute": 10}}}),
+                encoding="utf-8",
+            )
+            (data_root / "control" / "sender-warmup-state.json").write_text(
+                json.dumps({"warmup_started_at": "2026-05-03T22:54:52+00:00"}),
+                encoding="utf-8",
+            )
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            sends = [
+                {"status": "sent", "to": f"person{i}@example.test", "ts": f"{today}T12:00:{i:02d}Z"}
+                for i in range(20)
+            ]
+            (data_root / "operations" / "email-sends.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in sends) + "\n",
+                encoding="utf-8",
+            )
+            (data_root / "operations" / "email-bounces.jsonl").write_text(
+                json.dumps({"event": "bounced", "ts": f"{today}T13:00:00Z"}) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "RICK_DATA_ROOT": str(data_root),
+                    "RICK_CHANNEL_LIMITS_FILE": str(limits_file),
+                    "RICK_OUTBOUND_ENABLED": "1",
+                },
+                clear=False,
+            ):
+                kill_switches = self.reload_kill_switches()
+                conn = sqlite3.connect(":memory:")
+                conn.row_factory = sqlite3.Row
+                conn.execute(
+                    """
+                    CREATE TABLE channel_state (
+                        channel TEXT PRIMARY KEY,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        sends_today INTEGER NOT NULL DEFAULT 0,
+                        sends_this_minute INTEGER NOT NULL DEFAULT 0,
+                        last_send_at TEXT,
+                        paused_until TEXT,
+                        pause_reason TEXT NOT NULL DEFAULT '',
+                        bounce_count_7d INTEGER NOT NULL DEFAULT 0,
+                        auth_failure_streak INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO channel_state (channel,status,sends_today,sends_this_minute,updated_at) VALUES ('email','active',19,0,?)",
+                    (f"{today}T13:00:00+00:00",),
+                )
+                with self.assertRaisesRegex(kill_switches.ChannelPaused, "sender warmup cap reached"):
+                    kill_switches.assert_channel_active(conn, "email")
+                conn.close()
+            self.reload_kill_switches()
+
+    def test_unified_send_gate_blocks_role_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "RICK_DATA_ROOT": tmp,
+                    "RICK_EMAIL_SEND_LIVE": "1",
+                    "RICK_OUTBOUND_ENABLED": "1",
+                },
+                clear=False,
+            ):
+                kill_switches = self.reload_kill_switches()
+                allowed, reason = kill_switches.is_send_allowed("info@example.com", cold=False)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "role_account:info")
+            self.reload_kill_switches()
+
+    def test_unified_send_gate_blocks_recent_warm_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            (data_root / "operations").mkdir(parents=True)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            (data_root / "operations" / "email-sends.jsonl").write_text(
+                json.dumps({"status": "sent", "to": "founder@example.com", "ts": now}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "RICK_DATA_ROOT": str(data_root),
+                    "RICK_EMAIL_SEND_LIVE": "1",
+                    "RICK_OUTBOUND_ENABLED": "1",
+                },
+                clear=False,
+            ):
+                kill_switches = self.reload_kill_switches()
+                allowed, reason = kill_switches.is_send_allowed("founder@example.com", cold=False)
+                self.assertFalse(allowed)
+                self.assertIn("recent_send_cap_60m", reason)
+            self.reload_kill_switches()
+
     def test_sequence_sender_stops_before_outbox_when_channel_paused(self) -> None:
         module = load_script_module(
             "email_sequence_send_paused",
@@ -240,7 +354,8 @@ class EmailSendSafetyTests(unittest.TestCase):
     def test_manual_draft_sender_blocks_before_resend_when_channel_paused(self) -> None:
         module = load_script_module(
             "send_draft_paused",
-            ROOT_DIR / "scripts" / "send-draft.py",
+            # send-draft.py retired to attic/ in fff4410; gate still verified there.
+            ROOT_DIR / "scripts" / "attic" / "send-draft.py",
         )
         module._email_channel_block_reason = lambda: "bounce guardian pause"
         module._load_suppressions = lambda: set()

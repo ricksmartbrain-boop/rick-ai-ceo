@@ -1,5 +1,5 @@
 # MEMORY.md — Tacit Knowledge (HOT, target <10KB)
-> Last pruned: 2026-07-07 heartbeat. Full pre-prune copy archived in `~/rick-vault/archives/` and appended to `~/rick-vault/memory/MEMORY-COLD.md`.
+> Last pruned: 2026-07-07. Pre-prune copy archived in `~/rick-vault/archives/` and `~/rick-vault/memory/MEMORY-COLD.md`.
 > 2026-07-12: merged durable rules from legacy `~/clawd/MEMORY.md` (archived at `~/rick-vault/archives/MEMORY.legacy-2026-07-12.md`; the clawd path is now a stub).
 > Cold archive: `~/rick-vault/memory/MEMORY-COLD.md` (read on demand).
 > Hot context: `~/rick-vault/memory/hot-context.md` (auto-refreshed).

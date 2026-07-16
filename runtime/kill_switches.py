@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import importlib.util
 from datetime import datetime, timedelta, time, timezone
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,22 @@ def _inside_quiet_hours(cfg: dict[str, Any]) -> bool:
     return start <= now_h < end
 
 
+def _email_warmup_cap_status() -> tuple[int | None, int | None, str]:
+    """Return (today_cap, today_sent, reason) from the sender warmup ledger."""
+    script = ROOT_DIR / "scripts" / "sender-warmup-schedule.py"
+    if not script.exists():
+        return None, None, "warmup_script_missing"
+    try:
+        spec = importlib.util.spec_from_file_location("rick_sender_warmup_gate", script)
+        if spec is None or spec.loader is None:
+            return None, None, "warmup_script_unloadable"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return int(module.get_today_cap()), int(module.sends_today()), "ok"
+    except Exception as exc:
+        return 0, None, f"warmup_gate_error:{type(exc).__name__}:{exc}"
+
+
 def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
     """Raise ChannelPaused if the channel can't send right now."""
     if os.getenv("RICK_OUTBOUND_ENABLED", "1") == "0":
@@ -153,6 +170,17 @@ def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
             row = _ensure_row(conn, channel)
         if int(row["sends_today"] or 0) >= daily_cap:
             raise ChannelPaused(channel, f"daily cap reached ({daily_cap})")
+
+    if channel == "email":
+        warmup_cap, warmup_sent, warmup_reason = _email_warmup_cap_status()
+        if warmup_cap is None:
+            pass
+        elif warmup_cap <= 0:
+            raise ChannelPaused(channel, f"sender warmup cap reached ({warmup_cap}); {warmup_reason}")
+        elif warmup_sent is None:
+            raise ChannelPaused(channel, f"sender warmup cap unavailable; {warmup_reason}")
+        elif warmup_sent >= warmup_cap:
+            raise ChannelPaused(channel, f"sender warmup cap reached ({warmup_cap}); ledger_sent={warmup_sent}")
 
     # Per-minute cap check — we compare against last_send_at minute; if stale, reset.
     per_minute_cap = int(cfg.get("per_minute") or 0)
@@ -352,6 +380,7 @@ SEND_LOG_FILES = (
     DATA_ROOT / "runtime" / "nurture" / "sent.log",
 )
 FREQUENCY_CAP_DAYS = 7
+RECENT_SEND_CAP_MINUTES = 60
 
 
 def _env_flag(name: str, default: str = "") -> str:
@@ -465,8 +494,10 @@ def is_send_allowed(email: str, *, cold: bool = True) -> tuple[bool, str]:
     Checks, in order:
       1. RICK_OUTBOUND_ENABLED master kill (blocked when '0')
       2. RICK_EMAIL_SEND_LIVE live flag (blocked unless '1')
-      3. merged suppression list (case-insensitive, '@domain' entries match)
-      4. frequency cap: no *cold* send when any logged send to the address
+      3. role-account validator (info@/support@/etc.)
+      4. merged suppression list (case-insensitive, '@domain' entries match)
+      5. recent-send cap: no send to the same address inside 60 minutes
+      6. frequency cap: no *cold* send when any logged send to the address
          exists within the last FREQUENCY_CAP_DAYS days (sequence/follow-up
          senders pass cold=False — their own scheduling controls cadence)
 
@@ -481,16 +512,25 @@ def is_send_allowed(email: str, *, cold: bool = True) -> tuple[bool, str]:
             return False, "master_kill:RICK_OUTBOUND_ENABLED=0"
         if _env_flag("RICK_EMAIL_SEND_LIVE", "0") != "1":
             return False, "not_live:RICK_EMAIL_SEND_LIVE!=1"
+        try:
+            from runtime.email_validator import is_role_account
+
+            if is_role_account(target):
+                return False, f"role_account:{target.split('@', 1)[0]}"
+        except Exception as exc:
+            return False, f"validator_error:{type(exc).__name__}:{exc}"
         merged = load_merged_suppression()
         if target in merged:
             return False, f"suppressed:{target}"
         domain = target.rsplit("@", 1)[-1]
         if f"@{domain}" in merged:
             return False, f"suppressed_domain:@{domain}"
+        recent = last_send_ts(target)
+        if recent is not None and (_now() - recent) < timedelta(minutes=RECENT_SEND_CAP_MINUTES):
+            return False, f"recent_send_cap_{RECENT_SEND_CAP_MINUTES}m:last_send={recent.isoformat()}"
         if cold:
-            last = last_send_ts(target)
-            if last is not None and (_now() - last) < timedelta(days=FREQUENCY_CAP_DAYS):
-                return False, f"frequency_cap_{FREQUENCY_CAP_DAYS}d:last_send={last.isoformat()}"
+            if recent is not None and (_now() - recent) < timedelta(days=FREQUENCY_CAP_DAYS):
+                return False, f"frequency_cap_{FREQUENCY_CAP_DAYS}d:last_send={recent.isoformat()}"
         return True, "ok"
     except Exception as exc:  # fail CLOSED — a broken gate must never allow a send
         return False, f"gate_error:{type(exc).__name__}:{exc}"
