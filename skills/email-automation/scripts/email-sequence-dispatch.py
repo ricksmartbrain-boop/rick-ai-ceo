@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 from datetime import datetime, timedelta
@@ -41,12 +42,35 @@ def load_json(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def add_one_month(anchor: datetime) -> datetime:
+    """Same day-of-month one month out, clamped to month length (mirrors a
+    monthly billing anchor; kept in sync with runtime/engine.py
+    next_renewal_date — duplicated so this script stays dependency-free)."""
+    year, month = (anchor.year + 1, 1) if anchor.month == 12 else (anchor.year, anchor.month + 1)
+    day = min(anchor.day, calendar.monthrange(year, month)[1])
+    return anchor.replace(year=year, month=month, day=day)
+
+
+def renewal_date_display(enrollment: dict) -> str:
+    """Value for the {{renewal_date}} token: explicit enrollment.renewal_date
+    if set, else enrolled_at + 1 month (billing-anchor approximation), else a
+    generic phrase — a literal '{{renewal_date}}' must never reach a customer."""
+    renewal = parse_timestamp(str(enrollment.get("renewal_date", "")))
+    if renewal is None:
+        enrolled_at = parse_timestamp(str(enrollment.get("enrolled_at", "")))
+        if enrolled_at is None:
+            return "your next monthly billing date"
+        renewal = add_one_month(enrolled_at)
+    return f"{renewal:%B} {renewal.day}, {renewal.year}"
+
+
 def render_template(raw: str, enrollment: dict) -> str:
     mapping = {
         "{{first_name}}": str(enrollment.get("first_name", "there")),
         "{{delivery_url}}": str(enrollment.get("delivery_url", "")),
         "{{product_name}}": str(enrollment.get("product_name", "")),
         "{{email}}": str(enrollment.get("email", "")),
+        "{{renewal_date}}": renewal_date_display(enrollment),
     }
     rendered = raw
     for token, value in mapping.items():

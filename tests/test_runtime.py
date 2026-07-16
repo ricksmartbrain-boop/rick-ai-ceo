@@ -449,6 +449,72 @@ class RuntimeWorkflowTests(unittest.TestCase):
         sequence_payload = json.loads(sequence_config_path.read_text(encoding="utf-8"))
         self.assertEqual(len(sequence_payload["enrollments"]), 1)
 
+    def test_post_purchase_arc_extends_to_day25_for_subscriptions_only(self) -> None:
+        # Churn brief 2026-07-16: every voluntary cancel happened by day 23
+        # while the sequence went silent after day 7. Subscriptions must get
+        # a day-14 nudge and a day-25 pre-renewal notice; one-time products
+        # must NOT get the renewal step (a "your renewal is coming" email to
+        # a one-time buyer would be false).
+        subscription = {
+            "title": "LinguaLive Subscription",
+            "slug": "lingualive-subscription",
+            "project": "rick-v6",
+            "context_json": "{}",
+        }
+        config_path, _ = self.engine.ensure_post_purchase_sequence(
+            source_workflow=subscription,
+            customer_email="sub@example.com",
+            customer_name="Sub Buyer",
+            delivery_url="https://www.lingualive.ai",
+        )
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(step["step"], step["delay_days"]) for step in payload["steps"]],
+            [(1, 0), (2, 2), (3, 7), (4, 14), (5, 25)],
+        )
+        renewal_template = (config_path.parent / "renewal-5-notice.md").read_text(encoding="utf-8")
+        self.assertIn("{{renewal_date}}", renewal_template)
+        self.assertIn("reply", renewal_template.lower())  # reply-to-cancel courtesy line
+        # Headers must stay plain ASCII: a unicode subject header bounced a
+        # real access email (duck.com 550 non-RFC2047, 2026-07-13).
+        self.assertTrue(renewal_template.isascii())
+        self.assertTrue(renewal_template.startswith("---\nsubject: "))
+
+        enrollment = self.engine.enroll_post_purchase_sequence(
+            sequence_config_path=config_path,
+            email="sub@example.com",
+            customer_name="Sub Buyer",
+            delivery_url="https://www.lingualive.ai",
+            product_name="LinguaLive Subscription",
+            workflow_id="wf_sub_test",
+        )
+        self.assertRegex(enrollment.get("renewal_date", ""), r"^\d{4}-\d{2}-\d{2}$")
+
+        one_time = {
+            "title": "Customer Success Playbook",
+            "slug": "customer-success-playbook",
+            "project": "rick-v6",
+            "context_json": "{}",
+        }
+        config_path_ot, _ = self.engine.ensure_post_purchase_sequence(
+            source_workflow=one_time,
+            customer_email="buyer@example.com",
+            customer_name="Buyer",
+            delivery_url="https://deliver.rick.ai/customer-success-playbook",
+        )
+        payload_ot = json.loads(config_path_ot.read_text(encoding="utf-8"))
+        self.assertEqual(len(payload_ot["steps"]), 4)
+        self.assertFalse((config_path_ot.parent / "renewal-5-notice.md").exists())
+        enrollment_ot = self.engine.enroll_post_purchase_sequence(
+            sequence_config_path=config_path_ot,
+            email="buyer@example.com",
+            customer_name="Buyer",
+            delivery_url="https://deliver.rick.ai/customer-success-playbook",
+            product_name="Customer Success Playbook",
+            workflow_id="wf_ot_test",
+        )
+        self.assertNotIn("renewal_date", enrollment_ot)
+
     def test_email_sequence_dispatch_creates_due_outbox_draft(self) -> None:
         source_workflow_id = self.engine.queue_info_product_workflow(
             self.connection,
@@ -486,6 +552,93 @@ class RuntimeWorkflowTests(unittest.TestCase):
             (self.data_root / "mailbox" / "sequences" / "dispatchable-product-post-purchase" / "sequence.json").read_text(encoding="utf-8")
         )
         self.assertEqual(sequence_payload["enrollments"][0]["current_step"], 1)
+
+    def test_sequence_enroll_empty_slug_fails_loud(self) -> None:
+        # WHY: a hardcoded "" slug named a junk '-post-purchase' sequence dir
+        # and double-enrolled a real customer (justynovo, 2026-07-16). An
+        # empty product name must raise, never mint a '-prefixed' dir.
+        self.insert_workflow(
+            workflow_id="wf_seq_empty_slug",
+            stage="delivery-email-ready",
+            context={
+                "customer_email": "buyer@example.com",
+                "delivery_url": "https://deliver.rick.ai/some-product",
+                "source_workflow_title": "",
+                "product_name": "",
+            },
+        )
+        row = self.connection.execute("SELECT * FROM workflows WHERE id = 'wf_seq_empty_slug'").fetchone()
+        with self.assertRaisesRegex(self.engine.RuntimeErrorBase, "product name is required"):
+            self.engine.handle_sequence_enroll(self.connection, row, None)
+
+        with self.assertRaisesRegex(self.engine.RuntimeErrorBase, "empty slug"):
+            self.engine.ensure_post_purchase_sequence(
+                source_workflow={"title": "Some Product", "slug": "", "id": None, "context_json": "{}"},
+                customer_email="buyer@example.com",
+                customer_name="Buyer",
+                delivery_url="https://deliver.rick.ai/some-product",
+            )
+        self.assertFalse((self.data_root / "mailbox" / "sequences" / "-post-purchase").exists())
+
+    def test_sequence_enroll_second_enrollment_noops_with_log(self) -> None:
+        # WHY: justynovo (2026-07-16) got TWO sequence instances for one
+        # purchase — the second enrollment must no-op with a ledger line and
+        # customer event, not create another dir that double-sends steps.
+        source_workflow_id = self.engine.queue_info_product_workflow(
+            self.connection,
+            idea="Customer Success Playbook",
+            price_usd=59,
+            product_type="guide",
+        )
+        self.engine.queue_post_purchase_workflow(
+            self.connection,
+            source_workflow_id=source_workflow_id,
+            email="buyer@example.com",
+            customer_name="Buyer One",
+            payment_id="pi_123",
+            amount_usd=59.0,
+            delivery_url="https://deliver.rick.ai/customer-success-playbook",
+            source="stripe",
+        )
+        with patch.object(self.engine, "generate_text", side_effect=self.fake_generation), patch.object(
+            self.engine, "notify_operator", return_value=None
+        ):
+            self.engine.work(self.connection, limit=10)
+
+        sequences_dir = self.data_root / "mailbox" / "sequences"
+        self.assertEqual(len(list(sequences_dir.glob("*/sequence.json"))), 1)
+
+        # Second enrollment for the same buyer + product (poll-sourced shape).
+        self.insert_workflow(
+            workflow_id="wf_seq_dup",
+            stage="delivery-email-ready",
+            context={
+                "customer_email": "buyer@example.com",
+                "delivery_url": "https://deliver.rick.ai/customer-success-playbook",
+                "source_workflow_title": "Customer Success Playbook",
+                "product_name": "Customer Success Playbook",
+            },
+        )
+        row = self.connection.execute("SELECT * FROM workflows WHERE id = 'wf_seq_dup'").fetchone()
+        outcome = self.engine.handle_sequence_enroll(self.connection, row, None)
+        self.assertIn("duplicate enrollment skipped", outcome.summary)
+
+        payload = json.loads(
+            (sequences_dir / "customer-success-playbook-post-purchase" / "sequence.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(payload["enrollments"]), 1)
+        self.assertEqual(len(list(sequences_dir.glob("*/sequence.json"))), 1)
+
+        ledger_lines = (self.data_root / "operations" / "execution-ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        dedup_rows = [json.loads(line) for line in ledger_lines if json.loads(line).get("kind") == "sequence-enroll-dedup"]
+        self.assertEqual(len(dedup_rows), 1)
+
+        customer = self.connection.execute("SELECT id FROM customers WHERE email = 'buyer@example.com'").fetchone()
+        event_count = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM customer_events WHERE customer_id = ? AND event_type = 'sequence_enroll_deduped'",
+            (customer["id"],),
+        ).fetchone()["count"]
+        self.assertEqual(event_count, 1)
 
     def test_telegram_requires_allowed_chat(self) -> None:
         response = self.engine.parse_telegram_text(self.connection, "/status", chat_id="999")

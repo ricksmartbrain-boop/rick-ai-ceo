@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
@@ -2747,6 +2748,22 @@ def customer_profile_markdown(
     return "\n".join(lines)
 
 
+def is_subscription_product(title: str) -> bool:
+    """Recurring-billing heuristic. Only subscription products may receive
+    renewal-themed sequence steps — a 'your renewal is coming' email to a
+    one-time buyer would be false."""
+    return "subscription" in title.lower()
+
+
+def next_renewal_date(anchor: datetime) -> str:
+    """Next monthly renewal from the billing anchor: same day-of-month one
+    month out, clamped to month length (Jan 31 -> Feb 28/29), as an ISO date.
+    Approximation until a real Stripe current_period_end feed exists."""
+    year, month = (anchor.year + 1, 1) if anchor.month == 12 else (anchor.year, anchor.month + 1)
+    day = min(anchor.day, calendar.monthrange(year, month)[1])
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
 def ensure_post_purchase_sequence(
     *,
     source_workflow: sqlite3.Row,
@@ -2754,7 +2771,16 @@ def ensure_post_purchase_sequence(
     customer_name: str,
     delivery_url: str,
 ) -> tuple[Path, str]:
-    workflow_slug = source_workflow["slug"]
+    workflow_slug = str(source_workflow["slug"] or "").strip()
+    if not workflow_slug:
+        # An empty slug names the sequence dir literally '-post-purchase'
+        # (observed 2026-07-16: justynovo got a junk duplicate instance from
+        # handle_sequence_enroll's poll-sourced branch). FAIL LOUD at the
+        # dir-name construction so no caller can ever mint one again.
+        raise RuntimeErrorBase(
+            "workflow slug is required for the post-purchase sequence "
+            "(empty slug would create a '-post-purchase' junk dir)"
+        )
     sequence_name = f"{workflow_slug}-post-purchase"
     sequence_dir = DATA_ROOT / "mailbox" / "sequences" / sequence_name
     sequence_dir.mkdir(parents=True, exist_ok=True)
@@ -2795,7 +2821,45 @@ def ensure_post_purchase_sequence(
             "Reply with one sentence. If you’ve had a win, I may ask to quote it as a testimonial.\n\n"
             f"-- {os.getenv('RICK_PUBLIC_AUTHOR', 'Rick')}\n",
         ),
+        # Steps 4-5 (2026-07-16, churn brief): every voluntary cancel to date
+        # happened by day 23 while the sequence went silent after day 7.
+        # These use YAML frontmatter for the subject — the '**Subject:**'
+        # body-line pattern above never reaches the header (the sender falls
+        # back to 'sequence-name — step N', a non-ASCII em-dash header of the
+        # class that bounced Don's access email on duck.com).
+        (
+            "value-4-progress.md",
+            14,
+            f"---\n"
+            f"subject: Two weeks with {source_workflow['title']} - one tip\n"
+            f"---\n"
+            f"# Two-Week Tip\n\n"
+            f"Hi {{{{first_name}}}},\n\n"
+            f"Two weeks in. The highest-leverage move now: go back to the one part of {source_workflow['title']} that helped most and run it again this week. The second pass is where the value compounds.\n\n"
+            f"Link: {{{{delivery_url}}}}\n\n"
+            "Reply if you are stuck on anything and I will point you at the right piece.\n\n"
+            f"-- {os.getenv('RICK_PUBLIC_AUTHOR', 'Rick')}\n",
+        ),
     ]
+    if is_subscription_product(str(source_workflow["title"])):
+        # Pre-renewal touch: honest recap without usage stats (Rick has no
+        # app-usage signal yet) and a reply-to-cancel courtesy line. Never
+        # generated for one-time products.
+        templates.append(
+            (
+                "renewal-5-notice.md",
+                25,
+                f"---\n"
+                f"subject: Your {source_workflow['title']} renewal on {{{{renewal_date}}}}\n"
+                f"---\n"
+                f"# Renewal Notice\n\n"
+                f"Hi {{{{first_name}}}},\n\n"
+                f"Heads-up, no surprises: your {source_workflow['title']} renews on {{{{renewal_date}}}}.\n\n"
+                f"If it is earning its keep, you do not need to do anything -- access continues at {{{{delivery_url}}}}.\n\n"
+                "If not, reply \"cancel\" to this email before then and I will take care of it -- no forms, no hoops.\n\n"
+                f"-- {os.getenv('RICK_PUBLIC_AUTHOR', 'Rick')}\n",
+            )
+        )
 
     steps = []
     for index, (filename, delay_days, default_body) in enumerate(templates, start=1):
@@ -2841,6 +2905,36 @@ def ensure_post_purchase_sequence(
     return sequence_config_path, sequence_name
 
 
+def find_active_sequence_enrollment(email: str, product_name: str) -> tuple[str, dict[str, Any]] | None:
+    """Return (sequence_name, enrollment) if the customer already has an ACTIVE
+    post-purchase enrollment for this product in ANY sequence dir.
+
+    Enrollment must be idempotent per (customer, product): on 2026-07-16
+    justynovo was enrolled twice — once in the real sequence dir and once in a
+    junk '-post-purchase' dir — because nothing checked across dirs before
+    enrolling, and the duplicate step-1 nearly double-sent.
+    """
+    sequences_root = DATA_ROOT / "mailbox" / "sequences"
+    if not sequences_root.exists():
+        return None
+    normalized_email = email.strip().lower()
+    normalized_product = product_name.strip().lower()
+    for config_path in sorted(sequences_root.glob("*/sequence.json")):
+        payload = load_json_document(config_path)
+        enrollments = payload.get("enrollments", [])
+        if not isinstance(enrollments, list):
+            continue
+        for enrollment in enrollments:
+            if not isinstance(enrollment, dict) or enrollment.get("status") != "active":
+                continue
+            if str(enrollment.get("email", "")).strip().lower() != normalized_email:
+                continue
+            if str(enrollment.get("product_name", "")).strip().lower() != normalized_product:
+                continue
+            return str(payload.get("name", config_path.parent.name)), enrollment
+    return None
+
+
 def enroll_post_purchase_sequence(
     *,
     sequence_config_path: Path,
@@ -2873,6 +2967,11 @@ def enroll_post_purchase_sequence(
         "last_sent_at": "",
         "sent_steps": [],
     }
+    if is_subscription_product(product_name):
+        # Billing anchor approximated by enrollment time (fulfillment now
+        # runs same-day). Overwrite with Stripe current_period_end when a
+        # real feed exists. Renders via {{renewal_date}} in step templates.
+        record["renewal_date"] = next_renewal_date(datetime.now())
     enrollments.append(record)
     payload["enrollments"] = enrollments
     sequence_config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -3457,7 +3556,20 @@ def handle_sequence_enroll(connection: sqlite3.Connection, workflow: sqlite3.Row
     if source_workflow_id:
         source_workflow = get_workflow(connection, source_workflow_id)
     else:
-        source_workflow = {"title": context.get("source_workflow_title", ""), "slug": "", "id": None, "context_json": "{}"}
+        # Poll-sourced purchases have no source workflow. The slug must be
+        # derived from the product name exactly like queue_post_purchase_workflow
+        # does — the hardcoded "" slug here named justynovo's sequence dir
+        # literally '-post-purchase' (observed 2026-07-16). A missing name
+        # must FAIL LOUD, same contract as queueing.
+        product_title = str(
+            context.get("product_name") or context.get("source_workflow_title") or ""
+        ).strip()
+        if not product_title:
+            raise RuntimeErrorBase(
+                "product name is required for sequence enrollment "
+                "(empty name would derive a '-post-purchase' junk sequence dir)"
+            )
+        source_workflow = {"title": product_title, "slug": slugify(product_title), "id": None, "context_json": "{}"}
     email = str(context["customer_email"]).strip().lower()
     delivery_url = str(context.get("delivery_url", "")).strip()
     if not email:
@@ -3472,6 +3584,37 @@ def handle_sequence_enroll(connection: sqlite3.Connection, workflow: sqlite3.Row
     if not is_real_public_url(delivery_url):
         raise DependencyBlocked("delivery", f"delivery_url is not a real public URL: {delivery_url or 'missing'}")
 
+    # Idempotency per (customer, product) BEFORE any dir is created: a second
+    # enrollment for the same buyer must no-op (log + event), not mint a
+    # second sequence instance (justynovo double-enrollment, 2026-07-16).
+    product_name = str(context.get("source_workflow_title") or source_workflow["title"] or "").strip()
+    existing = find_active_sequence_enrollment(email, product_name)
+    if existing is not None:
+        existing_sequence_name, existing_enrollment = existing
+        append_execution_ledger(
+            "sequence-enroll-dedup",
+            f"Duplicate sequence enrollment suppressed for {email}",
+            status="skipped",
+            area="email",
+            project=workflow["project"],
+            notes=f"Already active in {existing_sequence_name} for {product_name} since {existing_enrollment.get('enrolled_at', '')}.",
+        )
+        customer_row = connection.execute("SELECT id FROM customers WHERE email = ?", (email,)).fetchone()
+        if customer_row is not None:
+            record_customer_event(
+                connection,
+                customer_id=customer_row["id"],
+                workflow_id=workflow["id"],
+                event_type="sequence_enroll_deduped",
+                payload={"sequence_name": existing_sequence_name, "email": email, "product_name": product_name},
+            )
+        return StepOutcome(
+            summary=f"Already enrolled in {existing_sequence_name} since {existing_enrollment.get('enrolled_at', '')}; duplicate enrollment skipped.",
+            artifacts=[],
+            workflow_status="fulfilled",
+            workflow_stage="fulfilled",
+        )
+
     sequence_config_path, sequence_name = ensure_post_purchase_sequence(
         source_workflow=source_workflow,
         customer_email=email,
@@ -3483,7 +3626,7 @@ def handle_sequence_enroll(connection: sqlite3.Connection, workflow: sqlite3.Row
         email=email,
         customer_name=str(context.get("customer_name", "")).strip(),
         delivery_url=delivery_url,
-        product_name=context.get("source_workflow_title", source_workflow["title"]),
+        product_name=product_name,
         workflow_id=workflow["id"],
     )
 
@@ -3508,6 +3651,8 @@ def handle_sequence_enroll(connection: sqlite3.Connection, workflow: sqlite3.Row
                 "- Step 1: immediate delivery",
                 "- Step 2: day 2 quick win",
                 "- Step 3: day 7 feedback / testimonial ask",
+                "- Step 4: day 14 value nudge",
+                "- Step 5: day 25 pre-renewal notice (subscription products only)",
             ]
         ),
     )
