@@ -74,6 +74,7 @@ from typing import Iterable
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 STATE_FILE = DATA_ROOT / "operations" / "stripe-poll-state.json"
+CANCEL_REASONS_FILE = DATA_ROOT / "churn" / "cancel-reasons.jsonl"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 DUNNING_REMINDER_DAYS = 3
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -708,6 +709,94 @@ def _customer_email(api_key: str, customer_id: str, cache: dict) -> str:
     return cache[customer_id]
 
 
+def harvest_cancellation_details(
+    api_key: str,
+    conn,
+    sub: dict,
+    effective: str,
+    end_date: str,
+    email_cache: dict,
+    *,
+    dry_run: bool,
+    source: str = "stripe-poll",
+) -> bool:
+    """Persist Stripe cancellation_details for a canceled/canceling sub — once.
+
+    2026-07-16: cancel reasons used to evaporate (never harvested from Stripe,
+    never stored). Record feedback/comment/reason into customer_events
+    (event_type=cancel_reason) + churn/cancel-reasons.jsonl. All-None details
+    are recorded explicitly as 'none' so "checked, survey empty" (Diane) is
+    distinguishable from "never harvested". Idempotent via details_sig: an
+    existing cancel_reason event with the same subscription_id + signature
+    means done — but a LATER survey answer (new signature) records again.
+    Returns True only when a new record was written.
+    """
+    sub_id = str(sub.get("id") or "")
+    details = sub.get("cancellation_details")
+    if not isinstance(details, dict):
+        details = {}
+    feedback = str(details.get("feedback") or "none")
+    comment = str(details.get("comment") or "none")
+    reason = str(details.get("reason") or "none")
+    details_sig = f"feedback={feedback}|comment={comment}|reason={reason}"
+
+    if conn is not None:
+        already = conn.execute(
+            "SELECT 1 FROM customer_events WHERE event_type = 'cancel_reason' "
+            "AND payload_json LIKE ? AND payload_json LIKE ? LIMIT 1",
+            (f'%"subscription_id": "{sub_id}"%', f'%"details_sig": "{details_sig}"%'),
+        ).fetchone()
+        if already:
+            return False
+    if dry_run:
+        print(f"DRY-RUN would record cancel reason for {sub_id}: {details_sig}")
+        return False
+
+    email = _customer_email(api_key, str(sub.get("customer") or ""), email_cache)
+    if not email:
+        print(
+            f"ERROR: cancel-reason harvest: no email for {sub_id} — will retry next poll.",
+            file=sys.stderr,
+        )
+        return False
+    row = conn.execute(
+        "SELECT id FROM customers WHERE lower(email) = lower(?)", (email,)
+    ).fetchone()
+    if row is None:
+        print(
+            f"ERROR: cancel-reason harvest: {email} ({sub_id}) has no customers row — "
+            f"backfill needed.",
+            file=sys.stderr,
+        )
+        return False
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    rec = {
+        "ts": now_iso,
+        "customer": email,
+        "customer_id": row["id"],
+        "source": source,
+        "subscription_id": sub_id,
+        "subscription_status": effective,
+        "end_date": end_date,
+        "feedback": feedback,
+        "comment": comment,
+        "reason": reason,
+        "details_sig": details_sig,
+        "tag": "churn_feedback",
+    }
+    conn.execute(
+        "INSERT INTO customer_events (id, customer_id, workflow_id, event_type, payload_json, created_at) "
+        "VALUES (?, ?, NULL, 'cancel_reason', ?, ?)",
+        (f"evt_{uuid.uuid4().hex[:12]}", row["id"], json.dumps(rec), now_iso),
+    )
+    conn.commit()
+    CANCEL_REASONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with CANCEL_REASONS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"CANCEL REASON recorded: {email} {sub_id} {details_sig}")
+    return True
+
+
 def sync_subscription_statuses(api_key: str, conn, state: dict, *, dry_run: bool) -> int:
     """Reconcile Stripe subscription statuses into customers/customer_events.
 
@@ -727,6 +816,19 @@ def sync_subscription_statuses(api_key: str, conn, state: dict, *, dry_run: bool
         if not sub_id:
             continue
         effective, end_date = _effective_sub_status(sub)
+        # Cancel-reason harvest runs every poll (not only on status change):
+        # idempotent, and a survey answer arriving later must still land.
+        if effective in ("canceled", "canceling"):
+            try:
+                harvest_cancellation_details(
+                    api_key, conn, sub, effective, end_date, email_cache,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"ERROR: cancel-reason harvest failed for {sub_id}: {exc}",
+                    file=sys.stderr,
+                )
         previous = known.get(sub_id)
         if previous == effective:
             continue

@@ -19,19 +19,28 @@ For each genuine reply (not automated/notification), classifies intent:
 CALL-intent leads are appended to ~/rick-vault/control/call-queue.jsonl and a
 'reply' event is logged to the attribution ledger.
 
+2026-07-16 cancel-reason capture: an email reply from a canceling/canceled
+customer (customers table) is the answer to a churn-save "why did you cancel"
+ask. Those answers used to evaporate in the triage inbox — now they are tagged
+churn_feedback and stored durably in BOTH ~/rick-vault/churn/cancel-reasons.jsonl
+and a customer_events row (event_type=cancel_reason) before any routing.
+
 Triage + queue only — does NOT auto-send any replies. Caps at 50 items.
 
 Usage:
   python3 scripts/reply-triage.py
 """
 import os
+import re
 import sys
 import json
+import uuid
 import subprocess
 import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(HERE))  # workspace root, for runtime.db
 import attribution  # noqa: E402
 
 VAULT = os.path.expanduser("~/rick-vault")
@@ -39,6 +48,9 @@ WARM_SIGNALS = os.path.join(VAULT, "signals", "warm-signals.jsonl")
 CALL_QUEUE = os.path.join(VAULT, "control", "call-queue.jsonl")
 STATE_FILE = os.path.join(VAULT, "control", "reply-triage-state.json")
 TRIAGE_DIR = os.path.join(VAULT, "mailbox", "triage")
+CANCEL_REASONS = os.path.join(VAULT, "churn", "cancel-reasons.jsonl")
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 PROCESS_CAP = 50
 
@@ -193,9 +205,87 @@ def queue_call(item, intent):
         sys.stderr.write("queue_call WARN: %s\n" % (str(e)[:160]))
 
 
+def _sender_email(sender):
+    m = EMAIL_RE.search(sender or "")
+    return m.group(0).lower() if m else ""
+
+
+def load_churn_customers():
+    """Map email(lower) -> {id, status} for canceling/canceled customers.
+
+    Fail-loud-but-degrade: a DB hiccup must not kill the call-queue path, so
+    on error we warn to stderr (heartbeat keeps stderr) and return {} —
+    unprocessed replies stay in state for the next run anyway.
+    """
+    try:
+        from runtime.db import connect  # noqa: E402
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, email, status FROM customers "
+                "WHERE status IN ('canceling', 'canceled')"
+            ).fetchall()
+            return {str(r["email"]).lower(): {"id": r["id"], "status": r["status"]}
+                    for r in rows}
+        finally:
+            conn.close()
+    except Exception as e:
+        sys.stderr.write(
+            "reply-triage: churn-customer lookup FAILED (cancel reasons NOT "
+            "captured this run): %s\n" % (str(e)[:200]))
+        return {}
+
+
+def record_cancel_reason(item, email, cust):
+    """Durably store a churn-save reply in cancel-reasons.jsonl + customer_events.
+
+    Returns True only if BOTH stores took the record; on False the caller must
+    leave the item unprocessed so the next run retries instead of evaporating
+    the one datum the churn saves exist to collect.
+    """
+    rec = {
+        "ts": _now(),
+        "customer": email,
+        "customer_id": cust["id"],
+        "customer_status": cust["status"],
+        "source": "reply-triage",
+        "email_id": (item.get("id") or "").split(":", 1)[-1],
+        "subject": item.get("subject") or "",
+        "verbatim_text": (item.get("text") or "").strip(),
+        "tag": "churn_feedback",
+    }
+    ok = True
+    try:
+        os.makedirs(os.path.dirname(CANCEL_REASONS), exist_ok=True)
+        with open(CANCEL_REASONS, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        ok = False
+        sys.stderr.write("record_cancel_reason jsonl FAILED: %s\n" % (str(e)[:200]))
+    try:
+        from runtime.db import connect  # noqa: E402
+        conn = connect()
+        try:
+            conn.execute(
+                "INSERT INTO customer_events (id, customer_id, workflow_id, "
+                "event_type, payload_json, created_at) "
+                "VALUES (?, ?, NULL, 'cancel_reason', ?, ?)",
+                ("evt_%s" % uuid.uuid4().hex[:12], cust["id"],
+                 json.dumps(rec, ensure_ascii=False), rec["ts"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        ok = False
+        sys.stderr.write("record_cancel_reason customer_events FAILED: %s\n" % (str(e)[:200]))
+    return ok
+
+
 def main():
     state = load_state()
     processed = set(state.get("processed", []))
+    churn_customers = load_churn_customers()
 
     items = fetch_triage() + fetch_warm_signals()
     items = items[:PROCESS_CAP]
@@ -203,6 +293,7 @@ def main():
     replies_found = 0
     call_intent = 0
     routed = 0
+    churn_feedback = 0
     new_processed = []
 
     for it in items:
@@ -217,13 +308,25 @@ def main():
         text_for_class = (it.get("subject") or "") + " " + (it.get("text") or "")
         intent = classify(text_for_class)
 
+        # Cancel-reason capture: churn-save answers get stored durably BEFORE
+        # any routing. On store failure, skip marking processed so the next
+        # run retries — the reply must not evaporate.
+        churn_tag = ""
+        if it.get("channel") == "email":
+            cust = churn_customers.get(_sender_email(it.get("sender")))
+            if cust:
+                if not record_cancel_reason(it, _sender_email(it.get("sender")), cust):
+                    continue
+                churn_feedback += 1
+                churn_tag = ";churn_feedback"
+
         attribution.log_event(
             stage="reply",
             channel=it.get("channel"),
             asset_id=None,
             src="reply-triage",
             lead=it.get("sender"),
-            detail="intent=%s" % intent,
+            detail="intent=%s%s" % (intent, churn_tag),
             amount=0,
         )
 
@@ -240,8 +343,8 @@ def main():
         state["processed"] = state["processed"][-2000:]
         save_state(state)
 
-    print("reply-triage: %d replies found, %d call-intent, %d routed to call-queue" % (
-        replies_found, call_intent, routed))
+    print("reply-triage: %d replies found, %d call-intent, %d routed to call-queue, "
+          "%d churn-feedback captured" % (replies_found, call_intent, routed, churn_feedback))
     return 0
 
 
