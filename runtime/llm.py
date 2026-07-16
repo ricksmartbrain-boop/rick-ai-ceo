@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import os
 import shutil
@@ -16,9 +17,13 @@ import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from runtime.log import get_logger
+
+_LOGGER = get_logger("rick.llm")
 
 
 # ── Per-job cost tracking ────────────────────────────────────────────────────
@@ -75,6 +80,12 @@ def cleanup_job_tracking(job_id: str) -> None:
         _JOB_COST.pop(job_id, None)
 
 
+# 2026-07-16 GPT-5.6 rebuild (gpt56-model-strategy-briefing-2026-07-16.md):
+# judgment routes on gpt-5.6-sol, analysis on terra, heartbeat on luna.
+# All gemini rungs/primaries deleted — no GOOGLE_API_KEY exists (0.45%
+# lifetime success). gemini returns when GOOGLE_API_KEY is configured.
+# Provider "claude-cli" is the subscription CLI rung (see call_claude_cli):
+# it keeps working when ANTHROPIC_API_KEY is credit-dead.
 ROUTES = {
     "strategy": {
         "env": "RICK_MODEL_OPENAI_STRATEGIC",
@@ -89,22 +100,22 @@ ROUTES = {
     "writing": {
         "env": "RICK_MODEL_ANTHROPIC_WORKHORSE",
         "default": "claude-sonnet-4-6",
-        "provider": "anthropic",
+        "provider": "claude-cli",
     },
     "review": {
-        "env": "RICK_MODEL_ANTHROPIC_STRATEGIC",
-        "default": "claude-opus-4-8",
-        "provider": "anthropic",
+        "env": "RICK_MODEL_OPENAI_STRATEGIC",
+        "default": "gpt-5.6-sol",
+        "provider": "openai",
     },
     "analysis": {
-        "env": "RICK_MODEL_GOOGLE_WORKHORSE",
-        "default": "gemini-3.1-pro-preview",
-        "provider": "google",
+        "env": "RICK_MODEL_OPENAI_WORKHORSE",
+        "default": "gpt-5.6-terra",
+        "provider": "openai",
     },
     "heartbeat": {
-        "env": "RICK_MODEL_GOOGLE_BUDGET",
-        "default": "gemini-3.1-flash-lite-preview",
-        "provider": "google",
+        "env": "RICK_MODEL_OPENAI_BUDGET",
+        "default": "gpt-5.6-luna",
+        "provider": "openai",
     },
     "research": {
         "env": "RICK_MODEL_XAI_RESEARCH",
@@ -140,7 +151,7 @@ ROUTE_SYSTEM_PROMPTS = {
 ROUTE_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "heartbeat": 2048,
     "analysis": 8192,
-    "writing": 8192,
+    "writing": 8192,  # long-form riders (seo posts 1200-1800 words, newsletter) bind on API fallback rungs; cap is runaway protection, not a spend trim
     "coding": 16384,
     "strategy": 8192,
     "review": 8192,
@@ -150,57 +161,71 @@ ROUTE_REASONING_EFFORT: dict[str, str] = {
     "strategy": "high",
     "review": "high",
     "coding": "high",
+    "analysis": "medium",
+    "writing": "low",  # applies on OpenAI rungs only (call_openai)
+    "heartbeat": "none",  # gpt-5.6 supports effort "none" — near-free ops parse
 }
 STRATEGY_PANEL_DEFAULTS = (
     ("openai", "RICK_MODEL_OPENAI_STRATEGIC_PRO", "gpt-5.6-sol"),
-    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-8"),
-    ("google", "RICK_MODEL_GOOGLE_WORKHORSE", "gemini-3.1-pro-preview"),
+    ("anthropic", "RICK_MODEL_ANTHROPIC_STRATEGIC", "claude-opus-4-8"),  # health-gated
+    ("openai", "RICK_MODEL_OPENAI_WORKHORSE", "gpt-5.6-terra"),  # gemini removed (no key)
 )
+# 2026-07-16 chains: rungs walk in order; the provider health gate skips
+# providers with ≥3 consecutive billing/auth failures in 30 min (anthropic
+# additionally seeded from billing-watchdog.jsonl). claude-cli rungs bill to
+# the Claude subscription and stay live when API credits die. gemini rungs
+# deleted — gemini returns when GOOGLE_API_KEY is configured.
 ROUTE_FALLBACK_DEFAULTS = {
-    "coding": (
-        ("openai", "gpt-5.6-terra"),
-        ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-sonnet-4-6"),
-        ("openai", "gpt-5.3-codex"),
+    "strategy": (
         ("anthropic", "claude-opus-4-8"),
+        ("claude-cli", "claude-sonnet-4-6"),
+        ("openai", "gpt-5.6-terra"),  # downgrade alert fires when a call lands here
     ),
-    "writing": (
+    "coding": (
+        ("claude-cli", "claude-sonnet-4-6"),
         ("openai", "gpt-5.6-terra"),
-        ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-opus-4-8"),
+        ("openai", "gpt-5.3-codex"),
     ),
     "review": (
-        # 2026-04-27: Anthropic billing-skip caught dropping review
-        # (opus-4-8) → gpt-5.4-mini, violating smart-models invariant.
-        # GPT-5.6 Sol/Terra keep review work on smart OpenAI models when
-        # Anthropic fails, without degrading to a cheap mini-class model.
-        ("google", "gemini-3.1-pro-preview"),
-        ("openai", "gpt-5.6-sol"),
+        ("anthropic", "claude-opus-4-8"),
+        ("claude-cli", "claude-sonnet-4-6"),
+        ("openai", "gpt-5.6-terra"),  # downgrade alert fires when a call lands here
+    ),
+    "writing": (
+        ("anthropic", "claude-sonnet-4-6"),
         ("openai", "gpt-5.6-terra"),
     ),
     "analysis": (
-        ("openai", "gpt-5.6-terra"),
-        ("anthropic", "claude-sonnet-4-6"),
+        ("openai", "gpt-5.6-sol"),
+        ("claude-cli", "claude-sonnet-4-6"),
     ),
     "heartbeat": (
-        ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-sonnet-4-6"),
-        ("openai", "gpt-5.6-luna"),
+        ("openai", "gpt-5.6-terra"),
     ),
     "research": (
         ("openai", "gpt-5.6-terra"),
-        ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
-    ),
-    "strategy": (
-        # When Anthropic is down (billing-skip 2026-04-27) the chain used
-        # to fall to Google then break. GPT-5.6 Terra keeps strategic
-        # reasoning from degrading silently after non-OpenAI failures.
-        ("anthropic", "claude-sonnet-4-6"),
-        ("google", "gemini-3.1-pro-preview"),
-        ("openai", "gpt-5.6-terra"),
     ),
 }
+# Budget caps on these routes raise BudgetExceeded instead of returning canned
+# fallback text (2026-07-16 fail-loud decision — canned strategy output is
+# indistinguishable from real output downstream).
+FAIL_LOUD_ROUTES = frozenset({"strategy", "review", "coding"})
+# Rungs below the route's primary intelligence tier. Landing here is survival,
+# not health — ledger note + deduped operator alert. opus-4-8 and claude-cli
+# sonnet are designed same-class rungs, NOT downgrades
+# (feedback_no_intelligence_downgrades).
+DOWNGRADE_ALERT_RUNGS: dict[str, frozenset[tuple[str, str]]] = {
+    "strategy": frozenset({("openai", "gpt-5.6-terra")}),
+    "review": frozenset({("openai", "gpt-5.6-terra")}),
+    "coding": frozenset({("openai", "gpt-5.6-terra"), ("openai", "gpt-5.3-codex")}),
+}
+KNOWN_GOOD_MODEL_IDS = frozenset({
+    # Canary-proven 2026-07-16: POST /v1/responses → HTTP 200 status=completed
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+})
 STRATEGY_SYNTHESIS_DEFAULT = ("openai", "RICK_STRATEGY_PANEL_SYNTHESIS_MODEL", "openai:gpt-5.6-sol")
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -227,6 +252,11 @@ class UsageStats:
     input_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int = 0
+    # 2026-07-16 cache visibility: prompt tokens read from cache
+    # (usage.input_tokens_details.cached_tokens) and written to cache
+    # (usage.cache_write_tokens, gpt-5.6+ bills writes at 1.25x).
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
     estimated: bool = True
 
 
@@ -248,6 +278,16 @@ class LiveCallResult:
     runner: str
     provider: str
     usage: UsageStats | None = None
+
+
+class BudgetExceeded(RuntimeError):
+    """A budget cap blocked a fail-loud route (strategy/review/coding).
+
+    2026-07-16: these routes must never silently return canned fallback text
+    on a budget block — the exception propagates to the engine job runner,
+    which records last_error and escalates. Other routes keep the
+    canned-fallback behavior.
+    """
 
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
@@ -330,10 +370,13 @@ def usage_from_openai(payload: dict[str, Any]) -> UsageStats | None:
     if not isinstance(usage, dict):
         return None
     details = usage.get("output_tokens_details", {})
+    input_details = usage.get("input_tokens_details") or {}
     return UsageStats(
         input_tokens=int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0),
         output_tokens=int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0),
         reasoning_tokens=int(details.get("reasoning_tokens", 0) or 0),
+        cached_tokens=int(input_details.get("cached_tokens", 0) or 0),
+        cache_write_tokens=int(usage.get("cache_write_tokens", 0) or 0),
         estimated=False,
     )
 
@@ -414,7 +457,7 @@ def call_gateway(provider: str, model: str, route: str, prompt: str) -> LiveCall
     return LiveCallResult(text=text, runner="gateway", provider=provider, usage=usage_from_openai(response))
 
 
-def call_openai(model: str, route: str, prompt: str) -> LiveCallResult | None:
+def call_openai(model: str, route: str, prompt: str, effort: str | None = None) -> LiveCallResult | None:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
@@ -423,10 +466,20 @@ def call_openai(model: str, route: str, prompt: str) -> LiveCallResult | None:
         "model": model,
         "input": prompt,
         "instructions": system_prompt(route),
+        # 2026-07-16 prompt caching: `instructions` (static per route) precedes
+        # `input` in the model context, so the request is stable-prefix-first;
+        # prompt_cache_key routes same-route calls to the same cache node
+        # (implicit mode — explicit breakpoints need content-block input and
+        # our stable prefix is far below the 1024-token cacheable minimum).
+        "prompt_cache_key": f"rick:{route}:v1",
         "max_output_tokens": ROUTE_MAX_OUTPUT_TOKENS.get(route, int(os.getenv("RICK_LLM_MAX_OUTPUT_TOKENS", "4096"))),
     }
     default_effort = ROUTE_REASONING_EFFORT.get(route)
-    if default_effort or model.endswith("-pro"):
+    if effort:
+        # Explicit per-call escalation (e.g. xhigh on the ≥$499 deal branch)
+        # wins over env + route default.
+        payload["reasoning"] = {"effort": effort}
+    elif default_effort or model.endswith("-pro"):
         payload["reasoning"] = {"effort": os.getenv("RICK_OPENAI_REASONING_EFFORT", default_effort or "high")}
     response = http_json(
         f"{base}/v1/responses",
@@ -567,42 +620,70 @@ def cli_fallback(model: str, route: str, prompt: str) -> LiveCallResult | None:
                     usage=usage_from_anthropic(payload),
                 )
 
-    if infer_provider(model, "") == "anthropic" and shutil.which("claude"):
-        result = subprocess.run(
-            ["claude", "--print", prompt],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return LiveCallResult(text=result.stdout.strip(), runner="claude-cli", provider="anthropic")
+    if infer_provider(model, "") == "anthropic":
+        return call_claude_cli(model, route, prompt)
     return None
 
 
-def run_live_generation(provider: str, model: str, route: str, prompt: str) -> LiveCallResult | None:
+def call_claude_cli(model: str, route: str, prompt: str) -> LiveCallResult | None:
+    """Subscription-billed `claude --print` rung — first-class chain member.
+
+    This is the existing path that produced every runner=claude-cli ledger row
+    (267 lifetime, latest success 2026-07-16 04:49). It bills the Claude
+    subscription, not ANTHROPIC_API_KEY, so it stays live when API credits are
+    dead. --model pins the rung's model id so the ledger row matches what ran.
+    """
+    if not shutil.which("claude"):
+        return None
+    timeout = int(os.getenv("RICK_CLI_REQUEST_TIMEOUT_SECONDS", str(REQUEST_TIMEOUT_SECONDS)))
+    # The CLI prefers an exported ANTHROPIC_API_KEY over its subscription
+    # login; with rick.env sourced that key is credit-dead and the rung fails
+    # ("Credit balance is too low"). Strip it so the subscription always bills.
+    cli_env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    result = subprocess.run(
+        ["claude", "--print", "--model", model, prompt],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=cli_env,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return LiveCallResult(text=result.stdout.strip(), runner="claude-cli", provider="anthropic")
+    return None
+
+
+def run_live_generation(provider: str, model: str, route: str, prompt: str, effort: str | None = None) -> LiveCallResult | None:
     if _circuit_is_open(provider):
-        from runtime.log import get_logger
-        get_logger("rick.llm").warning("Circuit breaker open for %s — skipping", provider)
+        _LOGGER.warning("Circuit breaker open for %s — skipping", provider)
+        if provider == "claude-cli":
+            return None
         return cli_fallback(model, route, prompt)
     try:
-        gateway_result = call_gateway(provider, model, route, prompt)
-        if gateway_result:
-            _circuit_record_success(provider)
-            return gateway_result
+        if provider == "claude-cli":
+            # Subscription rung — never routed through the gateway; it must
+            # exercise the real CLI so it stays live when API credits die.
+            result = call_claude_cli(model, route, prompt)
+        else:
+            gateway_result = call_gateway(provider, model, route, prompt)
+            if gateway_result:
+                _circuit_record_success(provider)
+                _provider_health_record_success(provider)
+                return gateway_result
 
-        result = None
-        if provider == "openai":
-            result = call_openai(model, route, prompt)
-        elif provider == "anthropic":
-            result = call_anthropic(model, route, prompt) or cli_fallback(model, route, prompt)
-        elif provider == "google":
-            result = call_google(model, route, prompt)
-        elif provider == "xai":
-            result = call_xai(model, route, prompt)
+            result = None
+            if provider == "openai":
+                result = call_openai(model, route, prompt, effort=effort)
+            elif provider == "anthropic":
+                result = call_anthropic(model, route, prompt) or cli_fallback(model, route, prompt)
+            elif provider == "google":
+                result = call_google(model, route, prompt)
+            elif provider == "xai":
+                result = call_xai(model, route, prompt)
 
         if result:
             _circuit_record_success(provider)
+            _provider_health_record_success(provider)
         else:
             _circuit_record_failure(provider)
         return result
@@ -614,8 +695,12 @@ def run_live_generation(provider: str, model: str, route: str, prompt: str) -> L
         ValueError,
         KeyError,
         json.JSONDecodeError,
-    ):
+    ) as exc:
         _circuit_record_failure(provider)
+        if _is_billing_auth_error(exc):
+            _record_provider_billing_failure(provider)
+        if provider == "claude-cli":
+            return None
         return cli_fallback(model, route, prompt)
 
 
@@ -645,6 +730,8 @@ def log_generation(
         "input_tokens": usage_stats.input_tokens or estimate_tokens(prompt),
         "output_tokens": usage_stats.output_tokens or estimate_tokens(content),
         "reasoning_tokens": usage_stats.reasoning_tokens,
+        "cached_tokens": usage_stats.cached_tokens,
+        "cache_write_tokens": usage_stats.cache_write_tokens,
         "task": route,
         "project": "",
         "status": "done" if mode != "error" else "failed",
@@ -779,7 +866,14 @@ def pricing_for_model(model: str, provider: str) -> dict[str, float]:
 def estimate_generation_cost(model: str, provider: str, usage: UsageStats) -> float:
     prices = pricing_for_model(model, provider)
     if not prices:
-        return 0.0
+        # 2026-07-16: unknown models used to price at $0.00 — silent spend
+        # blindness. Price at Sol rates (worst realistic case) and warn.
+        _LOGGER.warning(
+            "estimate_generation_cost: unknown model %s (provider=%s) — pricing at Sol rates ($5/$30 per 1M)",
+            model,
+            provider,
+        )
+        prices = {"input": 5.0, "output": 30.0, "reasoning": 30.0}
 
     input_rate = prices.get("input", 0.0)
     output_rate = prices.get("output", 0.0)
@@ -799,11 +893,15 @@ def generate_candidate(
     model: str,
     fallback_text: str,
     allow_fallback: bool,
+    effort: str | None = None,
 ) -> GenerationResult:
     if os.getenv("RICK_LLM_FALLBACK_ONLY", "").strip() == "1":
         return finalize(route, model, "fallback", "fallback", prompt, fallback_text, provider)
 
-    live = run_live_generation(provider, model, route, prompt)
+    if effort is None:
+        live = run_live_generation(provider, model, route, prompt)
+    else:
+        live = run_live_generation(provider, model, route, prompt, effort=effort)
     if live and live.text.strip():
         return finalize(route, model, live.runner, "live", prompt, live.text, live.provider, usage=live.usage)
 
@@ -876,6 +974,96 @@ def _emit_silent_failure_event(route: str, refs_failed: list[tuple[str, str]], p
         pass
 
 
+def _fire_llm_alert(kind: str, text: str, dedup_window_hours: int = 24) -> None:
+    """Send an operator alert through Rick's existing deduped Telegram path.
+
+    Reuses engine.notify_operator_deduped (notification_dedupe table) — same
+    lazy-import pattern as fenix_gate/proactive. Best-effort: alert delivery
+    failure must never break generation.
+    """
+    try:
+        from runtime.db import connect
+        from runtime.engine import notify_operator_deduped
+
+        connection = connect()
+        try:
+            notify_operator_deduped(
+                connection,
+                text,
+                kind=kind,
+                dedup_window_hours=dedup_window_hours,
+                purpose="ops",
+            )
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _LOGGER.warning("llm alert delivery failed (kind=%s): %s", kind, exc)
+
+
+# ── Startup model-id sanity ──────────────────────────────────────────────────
+# gpt-5.6-sol sat as the strategy/coding "default" for 2 days with 0 ledger
+# calls before anyone noticed (2026-07-16 audit). Validate every configured
+# model id against the pricing file / known-good set once per process, at
+# first use. Local-only — NO network calls (daemon cycles every 120s).
+_model_ids_validated = False
+_model_ids_lock = threading.Lock()
+
+
+def validate_configured_model_ids() -> list[str]:
+    """Return configured model ids missing from pricing + known-good set.
+
+    Every unknown id gets a CRITICAL log; one deduped operator alert covers
+    the whole batch.
+    """
+    payload = load_pricing_config()
+    models = payload.get("models", {})
+    priced = set(models.keys()) if isinstance(models, dict) else set()
+
+    def known(model: str) -> bool:
+        if model in KNOWN_GOOD_MODEL_IDS or model in priced:
+            return True
+        return any(prefix.endswith("*") and model.startswith(prefix[:-1]) for prefix in priced)
+
+    configured: set[str] = set()
+    for route in ROUTES:
+        provider = resolve_provider(route)
+        model = resolve_model(route)
+        configured.add(model)
+        configured.update(m for _, m in route_fallback_refs(route, provider, model))
+    configured.update(m for _, m in strategy_panel_refs())
+    configured.add(strategy_synthesis_ref()[1])
+
+    unknown = sorted(m for m in configured if not known(m))
+    for model in unknown:
+        _LOGGER.critical(
+            "unknown model id configured: %s — not in %s or KNOWN_GOOD_MODEL_IDS",
+            model,
+            PRICING_FILE,
+        )
+    if unknown:
+        _fire_llm_alert(
+            "llm_unknown_model_id",
+            "LLM config sanity: unknown model id(s) configured: "
+            + ", ".join(unknown)
+            + " — not in model-pricing.json or the known-good set. Fix the id or add pricing.",
+        )
+    return unknown
+
+
+def _ensure_model_ids_validated() -> None:
+    global _model_ids_validated  # noqa: PLW0603
+    if _model_ids_validated:
+        return
+    with _model_ids_lock:
+        if _model_ids_validated:
+            return
+        _model_ids_validated = True
+        try:
+            validate_configured_model_ids()
+        except Exception as exc:  # noqa: BLE001 — sanity check must never block generation
+            _LOGGER.warning("model-id validation errored: %s", exc)
+
+
 def _run_chain_once(
     route: str,
     prompt: str,
@@ -883,19 +1071,40 @@ def _run_chain_once(
     primary_provider: str,
     primary_model: str,
     notes: list[str],
+    effort: str | None = None,
 ) -> GenerationResult | None:
     """Attempt every ref in order; return result on first success, None on full exhaustion.
 
-    Appends live_failed / route_fallback_used entries to *notes* in-place so the
-    caller accumulates failure history across retry attempts.
+    Appends live_failed / route_fallback_used / health_gate_skipped entries to
+    *notes* in-place so the caller accumulates failure history across retry
+    attempts. Rungs whose provider is cooling (≥3 consecutive billing/auth
+    failures in 30 min) are skipped without burning a call.
     """
     failed: list[tuple[str, str]] = []
     for index, (provider, model) in enumerate(refs):
-        live = run_live_generation(provider, model, route, prompt)
+        if _provider_cooling(provider):
+            notes.append(f"health_gate_skipped={provider}:{model}")
+            continue
+        # effort forwarded only when set so patched test doubles with the
+        # original 4-arg run_live_generation signature keep working.
+        if effort is None:
+            live = run_live_generation(provider, model, route, prompt)
+        else:
+            live = run_live_generation(provider, model, route, prompt, effort=effort)
         if live and live.text.strip():
             if index > 0:
                 notes.append(f"route_fallback_used={provider}:{model}")
                 _emit_silent_failure_event(route, failed, (primary_provider, primary_model))
+                if (provider, model) in DOWNGRADE_ALERT_RUNGS.get(route, ()):
+                    # Landed below the primary intelligence tier — ledger note
+                    # + deduped operator ping (fail loud, never silently).
+                    notes.append(f"downgrade_below_primary={provider}:{model}")
+                    _fire_llm_alert(
+                        f"llm_downgrade_{route}",
+                        f"LLM downgrade: {route} call landed on {provider}:{model} "
+                        f"(below primary {primary_provider}:{primary_model}). "
+                        "Check provider credits/health.",
+                    )
             return finalize(
                 route, model, live.runner, "live", prompt, live.text, live.provider,
                 usage=live.usage, notes=notes,
@@ -913,6 +1122,7 @@ def generate_route_with_fallbacks(
     fallback: str,
     primary_provider: str,
     primary_model: str,
+    effort: str | None = None,
 ) -> GenerationResult:
     if os.getenv("RICK_LLM_FALLBACK_ONLY", "").strip() == "1":
         return finalize(route, primary_model, "fallback", "fallback", prompt, fallback, primary_provider)
@@ -921,7 +1131,7 @@ def generate_route_with_fallbacks(
     refs = [(primary_provider, primary_model), *route_fallback_refs(route, primary_provider, primary_model)]
 
     # First attempt — existing behaviour.
-    result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes)
+    result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes, effort=effort)
     if result is not None:
         return result
 
@@ -939,7 +1149,7 @@ def generate_route_with_fallbacks(
         time.sleep(RETRY_SLEEP_SECS)
         # Smart-models invariant: retry always walks the FULL chain, not just
         # the cheapest model.  Notes accumulate across attempts for auditability.
-        result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes)
+        result = _run_chain_once(route, prompt, refs, primary_provider, primary_model, notes, effort=effort)
         if result is not None:
             _log_retry_event(route, retry_num, len(refs), 0, outcome="recovered")
             return result
@@ -992,14 +1202,24 @@ def build_strategy_synthesis_prompt(original_prompt: str, panel_results: list[Ge
     )
 
 
-def generate_strategy_panel(route: str, prompt: str, fallback: str) -> GenerationResult:
-    refs = strategy_panel_refs()
-    ordered_results: list[GenerationResult | None] = [None] * len(refs)
+def generate_strategy_panel(route: str, prompt: str, fallback: str, effort: str | None = None) -> GenerationResult:
     notes: list[str] = []
+    refs: list[tuple[str, str]] = []
+    for provider, model in strategy_panel_refs():
+        # Health gate: don't burn a panel seat on a provider that is cooling
+        # (e.g. credit-dead anthropic → opus member skipped).
+        if _provider_cooling(provider):
+            notes.append(f"health_gate_skipped={provider}:{model}")
+        else:
+            refs.append((provider, model))
+    ordered_results: list[GenerationResult | None] = [None] * len(refs)
+    # effort forwarded only when set so patched test doubles with the
+    # original 6-arg generate_candidate signature keep working.
+    _effort_kwargs: dict[str, str] = {} if effort is None else {"effort": effort}
 
     with ThreadPoolExecutor(max_workers=max(1, len(refs))) as executor:
         future_map = {
-            executor.submit(generate_candidate, route, prompt, provider, model, "", False): (index, provider, model)
+            executor.submit(generate_candidate, route, prompt, provider, model, "", False, **_effort_kwargs): (index, provider, model)
             for index, (provider, model) in enumerate(refs)
         }
         for future in as_completed(future_map):
@@ -1029,7 +1249,7 @@ def generate_strategy_panel(route: str, prompt: str, fallback: str) -> Generatio
 
     synthesis_provider, synthesis_model = strategy_synthesis_ref()
     synthesis_prompt = build_strategy_synthesis_prompt(prompt, panel_results)
-    synthesis_result = generate_candidate(route, synthesis_prompt, synthesis_provider, synthesis_model, "", False)
+    synthesis_result = generate_candidate(route, synthesis_prompt, synthesis_provider, synthesis_model, "", False, **_effort_kwargs)
     if synthesis_result.mode == "live" and synthesis_result.content.strip():
         return GenerationResult(
             content=synthesis_result.content,
@@ -1110,6 +1330,193 @@ def _circuit_record_success(provider: str) -> None:
     """Reset a provider's circuit breaker on success."""
     with _circuit_breaker_lock:
         _circuit_breaker.pop(provider, None)
+
+
+# ── Provider health gate (billing/auth) ──────────────────────────────────────
+# 2026-07-16 briefing: the fallback walker skips a provider's rungs after ≥3
+# consecutive billing/auth failures within 30 min (credit-dead Anthropic burned
+# 2,490 guaranteed failures Jul 5→16). Unlike the in-memory circuit breaker
+# above, counters persist in DATA_ROOT/operations/provider-health.json so
+# daemon restarts don't forget. Anthropic is additionally seeded from the
+# billing watchdog: a fresh credits_low event in billing-watchdog.jsonl means
+# the API is cooling before we burn even one call. One operator alert per
+# cooldown entry; a successful call on the provider clears its entry
+# (auto-revive after top-up).
+PROVIDER_HEALTH_FILE = DATA_ROOT / "operations" / "provider-health.json"
+BILLING_WATCHDOG_FILE = DATA_ROOT / "operations" / "billing-watchdog.jsonl"
+PROVIDER_HEALTH_FAILURE_THRESHOLD = 3
+PROVIDER_HEALTH_WINDOW_SECS = 30 * 60
+_provider_health_lock = threading.Lock()
+
+
+def _load_provider_health() -> dict[str, Any]:
+    try:
+        payload = json.loads(PROVIDER_HEALTH_FILE.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_provider_health(state: dict[str, Any]) -> None:
+    try:
+        PROVIDER_HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # tmp + rename so parallel daemon workers never read a torn file
+        # (same pattern as _dedup_store).
+        tmp = PROVIDER_HEALTH_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(PROVIDER_HEALTH_FILE)
+    except OSError as exc:
+        _LOGGER.warning("provider-health.json write failed: %s", exc)
+
+
+def _seconds_since(iso_ts: str) -> float | None:
+    try:
+        parsed = datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return (datetime.now() - parsed).total_seconds()
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+def _is_billing_auth_error(exc: Exception) -> bool:
+    """True for HTTP failures that mean money/credentials, not transport."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return False
+    if exc.code in (401, 402, 403):
+        return True
+    if exc.code == 400:
+        # Anthropic reports credit exhaustion as 400 (see billing-watchdog).
+        try:
+            body = exc.read().decode("utf-8", "replace").lower()
+        except (OSError, ValueError):
+            return False
+        return "credit" in body or "billing" in body
+    return False
+
+
+def _record_provider_billing_failure(provider: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    crossed = False
+    with _provider_health_lock:
+        state = _load_provider_health()
+        entry = state.get(provider)
+        if not isinstance(entry, dict):
+            entry = {}
+        age = _seconds_since(str(entry.get("last_failure_at", "")))
+        if age is None or age > PROVIDER_HEALTH_WINDOW_SECS:
+            entry = {"failures": 0, "first_failure_at": now_iso}
+        # A real API failure now drives this entry — drop the watchdog-seed
+        # marker so the counter path (not the watchdog) governs the gate.
+        entry.pop("source", None)
+        entry["failures"] = int(entry.get("failures", 0)) + 1
+        entry["last_failure_at"] = now_iso
+        if entry["failures"] >= PROVIDER_HEALTH_FAILURE_THRESHOLD and not entry.get("alerted"):
+            entry["cooling_since"] = now_iso
+            entry["alerted"] = True
+            crossed = True
+        state[provider] = entry
+        _save_provider_health(state)
+    if crossed:
+        _fire_llm_alert(
+            f"llm_provider_cooldown_{provider}",
+            f"LLM provider cooldown: {provider} hit {PROVIDER_HEALTH_FAILURE_THRESHOLD} "
+            "consecutive billing/auth failures within 30 min — skipping its rungs "
+            "until a call succeeds or the failures age out.",
+        )
+
+
+def _provider_health_record_success(provider: str) -> None:
+    with _provider_health_lock:
+        state = _load_provider_health()
+        if provider in state:
+            state.pop(provider, None)
+            _save_provider_health(state)
+
+
+def _watchdog_says_anthropic_cooling() -> tuple[bool, str]:
+    """Read the billing watchdog tail: fresh credits_low → (True, ts).
+
+    The most recent decisive event wins — probe_ok / disabled_cleared mean
+    healthy; credits_low within the health window means cooling.
+    """
+    try:
+        with BILLING_WATCHDOG_FILE.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return False, ""
+    for line in reversed(tail.strip().splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("event")
+        if kind in ("probe_ok", "disabled_cleared"):
+            return False, ""
+        if kind == "credits_low":
+            ts = str(event.get("ts", ""))
+            age = _seconds_since(ts)
+            if age is not None and age <= PROVIDER_HEALTH_WINDOW_SECS:
+                return True, ts
+            return False, ""
+    return False, ""
+
+
+def _seed_anthropic_cooldown(watchdog_ts: str) -> None:
+    """Persist a watchdog-seeded anthropic cooldown; alert once per entry."""
+    fire = False
+    with _provider_health_lock:
+        state = _load_provider_health()
+        entry = state.get("anthropic")
+        if not (isinstance(entry, dict) and entry.get("alerted")):
+            state["anthropic"] = {
+                "failures": PROVIDER_HEALTH_FAILURE_THRESHOLD,
+                "first_failure_at": watchdog_ts,
+                "last_failure_at": watchdog_ts,
+                "cooling_since": watchdog_ts,
+                "alerted": True,
+                "source": "billing-watchdog",
+            }
+            _save_provider_health(state)
+            fire = True
+    if fire:
+        _fire_llm_alert(
+            "llm_provider_cooldown_anthropic",
+            "LLM provider cooldown: anthropic API is credit-dead per billing-watchdog "
+            "(fresh credits_low) — skipping anthropic API rungs. "
+            "claude-cli subscription rungs stay live.",
+        )
+
+
+def _provider_cooling(provider: str) -> bool:
+    """True when the fallback walker should skip this provider's rungs."""
+    with _provider_health_lock:
+        entry = _load_provider_health().get(provider)
+    # Watchdog-seeded entries defer to the watchdog below — a probe_ok must
+    # reopen the gate immediately (auto-revive after top-up), so only
+    # counter-driven entries close the gate here.
+    entry_is_seeded = isinstance(entry, dict) and entry.get("source") == "billing-watchdog"
+    if (
+        not entry_is_seeded
+        and isinstance(entry, dict)
+        and int(entry.get("failures", 0)) >= PROVIDER_HEALTH_FAILURE_THRESHOLD
+    ):
+        age = _seconds_since(str(entry.get("last_failure_at", "")))
+        if age is not None and age <= PROVIDER_HEALTH_WINDOW_SECS:
+            return True
+    if provider == "anthropic":
+        cooling, watchdog_ts = _watchdog_says_anthropic_cooling()
+        if cooling:
+            _seed_anthropic_cooldown(watchdog_ts)
+            return True
+        # Watchdog reports healthy — clear any watchdog-seeded entry so the
+        # next real cooldown alerts again.
+        if entry_is_seeded:
+            _provider_health_record_success("anthropic")
+    return False
 
 
 # ── Chain-failure retry layer ─────────────────────────────────────────────────
@@ -1314,12 +1721,136 @@ def check_route_budget(route: str) -> tuple[bool, str]:
     return True, ""
 
 
-def generate_text(route: str, prompt: str, fallback: str) -> GenerationResult:
+# ── 24h dedup cache (writing / analysis / research only) ─────────────────────
+# 2026-07-16 economics layer: an identical call that succeeded within 24h
+# replays the stored text instead of burning a live call. Judgment routes
+# (strategy/review/coding) and heartbeat are excluded on purpose — never trade
+# freshness on decisions. One JSON file per key under
+# DATA_ROOT/operations/llm-dedup/, written via tmp+atomic-rename so concurrent
+# daemon workers can never tear a read (worst case both miss and both pay).
+DEDUP_ROUTES = frozenset({"writing", "analysis", "research"})
+DEDUP_DIR = DATA_ROOT / "operations" / "llm-dedup"
+DEDUP_TTL_SECS = 24 * 60 * 60
+_dedup_prune_lock = threading.Lock()
+_dedup_last_prune = 0.0
+
+
+def _dedup_key(route: str, prompt: str, provider: str, model: str, effort: str | None) -> str:
+    """sha256 over everything that changes what a call would return."""
+    material = json.dumps(
+        {
+            "route": route,
+            "system": system_prompt(route),
+            "prompt": prompt,
+            "provider": provider,
+            "model": model,
+            "effort": effort or ROUTE_REASONING_EFFORT.get(route),
+            "max_output_tokens": ROUTE_MAX_OUTPUT_TOKENS.get(route),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _dedup_lookup(key: str) -> dict[str, Any] | None:
+    try:
+        entry = json.loads((DEDUP_DIR / f"{key}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    age = _seconds_since(str(entry.get("ts", "")))
+    if age is None or age > DEDUP_TTL_SECS:
+        return None
+    text = entry.get("text")
+    if not (isinstance(text, str) and text.strip()):
+        return None
+    return entry
+
+
+def _dedup_store(key: str, result: GenerationResult) -> None:
+    try:
+        DEDUP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DEDUP_DIR / f".{key}.{os.getpid()}.tmp"
+        tmp.write_text(
+            json.dumps(
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "route": result.route,
+                    "provider": result.provider,
+                    "model": result.model,
+                    "runner": result.runner,
+                    "text": result.content,
+                }
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(DEDUP_DIR / f"{key}.json")
+    except OSError as exc:
+        _LOGGER.warning("dedup-cache store failed: %s", exc)
+    _dedup_prune()
+
+
+def _dedup_prune() -> None:
+    """Unlink expired entries; runs at most once per hour per process."""
+    global _dedup_last_prune  # noqa: PLW0603
+    with _dedup_prune_lock:
+        now = time.monotonic()
+        if _dedup_last_prune and now - _dedup_last_prune < 3600:
+            return
+        _dedup_last_prune = now
+    cutoff = time.time() - DEDUP_TTL_SECS
+    try:
+        for path in DEDUP_DIR.glob("*.json"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def generate_text(route: str, prompt: str, fallback: str, *, effort: str | None = None, force_fresh: bool = False) -> GenerationResult:
+    """Route-aware generation.
+
+    effort: optional per-call reasoning-effort override for OpenAI rungs
+    (e.g. "xhigh" on the ≥$499 Managed deal branch). None → route default
+    from ROUTE_REASONING_EFFORT.
+    force_fresh: bypass the 24h dedup cache (writing/analysis/research) and
+    always make a live call.
+    """
+    _ensure_model_ids_validated()
     provider = resolve_provider(route)
     model = resolve_model(route)
 
+    # Dedup check runs BEFORE budget gates: a hit costs $0, and replaying a
+    # real answer beats returning canned fallback text under a budget block.
+    dedup_key: str | None = None
+    if route in DEDUP_ROUTES and not force_fresh:
+        dedup_key = _dedup_key(route, prompt, provider, model, effort)
+        cached = _dedup_lookup(dedup_key)
+        if cached is not None:
+            return finalize(
+                route,
+                str(cached.get("model", model)),
+                "dedup-cache",
+                "cached",
+                prompt,
+                str(cached.get("text", "")),
+                str(cached.get("provider", provider)),
+                usage=UsageStats(),  # all-zero tokens → usd=0 in the ledger row
+                notes=[f"dedup_cache_hit={dedup_key[:16]}"],
+            )
+
     allowed, spent = check_daily_budget(route)
     if not allowed:
+        if route in FAIL_LOUD_ROUTES:
+            # Fail loud: canned strategy/review/coding output is
+            # indistinguishable from real output downstream.
+            raise BudgetExceeded(
+                f"daily LLM cap blocked {route} call: spent=${spent:.2f} cap=${_get_daily_cap():.2f}"
+            )
         return finalize(
             route, model, "budget-cap", "fallback", prompt, fallback, provider,
             notes=[f"daily_cap_exceeded_usd={spent:.2f}"],
@@ -1327,6 +1858,8 @@ def generate_text(route: str, prompt: str, fallback: str) -> GenerationResult:
 
     route_allowed, route_reason = check_route_budget(route)
     if not route_allowed:
+        if route in FAIL_LOUD_ROUTES:
+            raise BudgetExceeded(f"route budget blocked {route} call: {route_reason}")
         return finalize(
             route, model, "route-budget-cap", "fallback", prompt, fallback, provider,
             notes=[route_reason],
@@ -1382,7 +1915,14 @@ def generate_text(route: str, prompt: str, fallback: str) -> GenerationResult:
         elif panel_blocked_by_cap:
             # Per-panel daily cap hit — degrade. Telegram alert via finalize notes.
             pass
+        elif all(_provider_cooling(p) for p, _ in strategy_panel_refs()):
+            # Every panel provider cooling — degrade to the single-model chain,
+            # which keeps the claude-cli rung reachable instead of canned text.
+            pass
         else:
-            return generate_strategy_panel(route, prompt, fallback)
+            return generate_strategy_panel(route, prompt, fallback, effort=effort)
 
-    return generate_route_with_fallbacks(route, prompt, fallback, provider, model)
+    result = generate_route_with_fallbacks(route, prompt, fallback, provider, model, effort=effort)
+    if dedup_key is not None and result.mode == "live" and result.content.strip():
+        _dedup_store(dedup_key, result)
+    return result

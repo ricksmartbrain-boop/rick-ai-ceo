@@ -15,7 +15,7 @@ runtime.inbound.imap_watcher touches IMAP; everything downstream reads
 triage) and the Resend open-tracker (it keyed on the same dead workflow set).
 
 On first detection of a new classified human reply:
-  1. Generates a draft response via claude-opus-4-8 (NO auto-send)
+  1. Generates a draft response via runtime.llm route='review' (NO auto-send)
   2. Saves draft  → ~/rick-vault/mailbox/drafts/auto/{triage_id}.json
   3. Fires notify_operator_deduped with PURPOSE=revenue (bypasses dedup)
   4. Marks the email_threads row status='replied' + intent_class,
@@ -53,6 +53,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from runtime.llm import BudgetExceeded  # noqa: E402
+
 DATA_ROOT   = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 DB_PATH     = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
 STATE_FILE  = DATA_ROOT / "control" / "reply-watcher-state.json"
@@ -60,9 +62,8 @@ LOG_FILE    = DATA_ROOT / "operations" / "reply-watcher.jsonl"
 DRAFT_DIR   = DATA_ROOT / "mailbox" / "drafts" / "auto"
 TRIAGE_DIR  = DATA_ROOT / "mailbox" / "triage"
 
-# Models — smart-models invariant: only full models for draft generation
-DRAFT_MODEL_ANTHROPIC = "claude-opus-4-8"
-DRAFT_MODEL_OPENAI    = "gpt-4o"     # fallback if Anthropic unavailable
+# Models — drafts go through runtime.llm route='review'; the router owns
+# model choice, fallbacks, and budget metering (smart-models invariant lives there).
 
 # Classifier labels that mean "a human wrote to us and it's warm enough to
 # fast-lane". unsubscribe / not_interested / objection / automated_notification
@@ -163,23 +164,20 @@ def _row_ctx(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 2. Auto-drafter — opus-4-8 / gpt fallback only (smart-models invariant)
+# 2. Auto-drafter — runtime.llm route='review' (router owns models + fallbacks)
 # ---------------------------------------------------------------------------
 
 def _generate_draft(ctx: dict, reply_body: str, reply_label: str, dry_run: bool, verbose: bool) -> dict | None:
-    """Generate a reply draft using claude-opus-4-8. NO auto-send.
+    """Generate a reply draft via runtime.llm route='review'. NO auto-send.
 
     Returns draft dict or None on failure.
     """
     if dry_run:
         return {
             "draft_body": f"[DRY-RUN DRAFT]\nRe: {ctx['opener_subj']}\n\nThanks for replying, {ctx['name']}. [Generated response would appear here]",
-            "model":      DRAFT_MODEL_ANTHROPIC,
+            "model":      "dry-run",
             "dry_run":    True,
         }
-
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    openai_key    = os.getenv("OPENAI_API_KEY", "").strip()
 
     prompt = f"""You are Rick, AI CEO of meetrick.ai — sharp, warm, commercially serious.
 Draft a reply to this inbound email.
@@ -203,61 +201,17 @@ Draft a reply that:
 If label is 'sales_inquiry': move toward a 15-min call.
 If label is 'question': answer directly + CTA."""
 
-    # Try Anthropic first
-    if anthropic_key:
-        try:
-            import urllib.request
-            payload = json.dumps({
-                "model":      DRAFT_MODEL_ANTHROPIC,
-                "max_tokens": 500,
-                "messages":   [{"role": "user", "content": prompt}],
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=payload,
-                headers={
-                    "x-api-key":         anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type":      "application/json",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            body = result["content"][0]["text"].strip()
-            return {"draft_body": body, "model": DRAFT_MODEL_ANTHROPIC, "prompt_tokens": result.get("usage", {}).get("input_tokens", 0)}
-        except Exception as exc:
-            if verbose:
-                print(f"  [drafter] Anthropic error: {exc}")
-
-    # Fallback: OpenAI
-    if openai_key:
-        try:
-            import urllib.request
-            payload = json.dumps({
-                "model":    DRAFT_MODEL_OPENAI,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500,
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {openai_key}",
-                    "Content-Type":  "application/json",
-                    "User-Agent": "meetrick-rick/1.0",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            body = result["choices"][0]["message"]["content"].strip()
-            return {"draft_body": body, "model": DRAFT_MODEL_OPENAI}
-        except Exception as exc:
-            if verbose:
-                print(f"  [drafter] OpenAI error: {exc}")
-
-    return None
+    from runtime.llm import generate_text
+    result = generate_text("review", prompt, "")
+    if result.mode != "live" or not result.content.strip():
+        if verbose:
+            print(f"  [drafter] generate_text failed: mode={result.mode} notes={result.notes}")
+        return None
+    return {
+        "draft_body":    result.content.strip(),
+        "model":         result.model,
+        "prompt_tokens": result.usage.input_tokens if result.usage else 0,
+    }
 
 
 def _save_draft(ctx: dict, draft: dict, row: dict) -> str:
@@ -434,8 +388,13 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
             if verbose:
                 print(f"\n  *** REPLY: {ctx['email']} label={ctx['label']}")
 
-            # Generate draft (smart-models invariant: opus-4-8 first)
-            draft = _generate_draft(ctx, row.get("body") or "", ctx["label"], dry_run, verbose)
+            # Generate draft (runtime.llm route='review'). A budget cap must
+            # never kill the P0 alert below — draft is optional, alert is not.
+            try:
+                draft = _generate_draft(ctx, row.get("body") or "", ctx["label"], dry_run, verbose)
+            except BudgetExceeded as exc:
+                print(f"  !! draft unavailable: LLM budget cap ({exc})", file=sys.stderr)
+                draft = None
             draft_path = ""
             if draft:
                 draft_path = _save_draft(ctx, draft, row) if not dry_run else "(dry-run)"

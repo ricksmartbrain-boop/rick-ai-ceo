@@ -89,8 +89,8 @@ def _log(event: dict) -> None:
 # ── Draft generation ──────────────────────────────────────────────────────────
 
 def _generate_draft(row: dict) -> dict:
-    """Generate a draft response using Claude (opus-4-8). No auto-send."""
-    import anthropic
+    """Generate a draft response via runtime.llm route='review'. No auto-send."""
+    from runtime.llm import generate_text
 
     email = row.get("email", "")
     body = row.get("body", "")
@@ -116,21 +116,13 @@ def _generate_draft(row: dict) -> dict:
         "Draft a reply. 150 words max. One clear next step."
     )
 
-    try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        msg = client.messages.create(
-            model="claude-opus-4-8",
-            max_tokens=300,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        draft_body = msg.content[0].text.strip()
-    except Exception as exc:
-        draft_body = (
-            f"[DRAFT GENERATION FAILED: {exc}]\n\n"
-            f"Manual draft needed for: {email}\n"
-            f"Their message: {body[:200]}"
-        )
+    fallback = (
+        "[DRAFT GENERATION FAILED: llm router exhausted all providers]\n\n"
+        f"Manual draft needed for: {email}\n"
+        f"Their message: {body[:200]}"
+    )
+    result = generate_text("review", f"{system_prompt}\n\n{user_prompt}", fallback)
+    draft_body = result.content.strip()
 
     draft_subject = f"Re: {subject}" if not subject.startswith("Re:") else subject
 
@@ -150,7 +142,7 @@ def _generate_draft(row: dict) -> dict:
         "original_body": body[:400],
         "auto_send": False,
         "review_required": True,
-        "model": "claude-opus-4-8",
+        "model": result.model,
         "created_at": _now_iso(),
     }
 

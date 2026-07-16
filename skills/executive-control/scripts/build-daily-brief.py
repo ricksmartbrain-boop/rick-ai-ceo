@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, timedelta
+import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -49,6 +50,33 @@ def count_open_rows(path: Path) -> int:
         if line.startswith("|") and "| open |" in line:
             count += 1
     return count
+
+
+def brain_done_counts(window_hours: int = 24) -> dict[str, int]:
+    """Count done execution-ledger rows per brain route in the trailing window.
+
+    Zero-activity floor (2026-07-16): the nightly was dead Jul 14-16 while every
+    brief read as healthy. Zero strategy/coding output must lead the brief as an
+    ALARM — silence is failure, not health.
+    """
+    counts = {"strategy": 0, "coding": 0}
+    ledger = DATA_ROOT / "operations" / "execution-ledger.jsonl"
+    if not ledger.exists():
+        return counts
+    cutoff = datetime.now() - timedelta(hours=window_hours)
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("route") not in counts or row.get("status") != "done":
+            continue
+        try:
+            if datetime.fromisoformat(row["timestamp"]) >= cutoff:
+                counts[row["route"]] += 1
+        except (KeyError, TypeError, ValueError):
+            continue
+    return counts
 
 
 def overnight_actions_summary() -> str:
@@ -112,11 +140,28 @@ def main() -> None:
     dependency_lines = summarize_markdown(latest_deps, limit=8)
     open_approvals = count_open_rows(approvals)
 
-    output = [
+    brain_counts = brain_done_counts()
+    alarm_lines = [
+        f"ALARM: BRAIN SILENT — {route} done-count is 0 in the last 24h. "
+        f"The nightly/daemon pipeline emitted no {route} work. "
+        "Treat this brief as a failure report, not health."
+        for route in ("strategy", "coding")
+        if brain_counts[route] == 0
+    ]
+
+    output = []
+    if alarm_lines:
+        # The alarm must lead the brief — nothing may read as healthy above it.
+        output.extend(alarm_lines)
+        output.append("")
+        for line in alarm_lines:
+            print(f"[ALARM] {line}", file=sys.stderr)
+
+    output.extend([
         f"# Morning Brief — {brief_date:%Y-%m-%d}",
         "",
         "## Revenue Snapshot",
-    ]
+    ])
 
     if revenue_lines:
         output.extend(revenue_lines)

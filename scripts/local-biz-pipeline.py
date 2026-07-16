@@ -7,6 +7,13 @@ import json, urllib.request, urllib.parse, re, sys, os, time, subprocess
 from datetime import datetime
 from email_safety import block_reason_for_recipient
 
+# Bootstrap sys.path so runtime imports work from scripts/
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from runtime.llm import generate_text  # noqa: E402
+
 PIPELINE_FILE = os.path.expanduser("~/rick-vault/logs/pipeline.jsonl")
 
 # Permanent outreach exclusions — never pitch these domains/emails
@@ -31,8 +38,8 @@ def log_pipeline(entry):
     with open(PIPELINE_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-def roast_site(url, api_key):
-    """Roast a website using Anthropic API"""
+def roast_site(url):
+    """Roast a website via runtime.llm (route='writing')"""
     # Fetch page content
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -60,25 +67,13 @@ def roast_site(url, api_key):
 URL: {url}
 Page content: {page}"""
 
-    payload = json.dumps({
-        "model": "gpt-5.4-mini",
-        "max_completion_tokens": 800,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-    )
+    result = generate_text(route="writing", prompt=prompt, fallback="")
+    if result.mode not in ("live", "cached"):
+        print(f"  Roast error: LLM call failed (mode={result.mode}, model={result.model})", file=sys.stderr)
+        return None
     try:
-        resp = json.loads(urllib.request.urlopen(req, timeout=45).read())
-        text = resp["choices"][0]["message"]["content"]
         # Extract JSON from response
-        match = re.search(r'\{.*\}', text, re.DOTALL)
+        match = re.search(r'\{.*\}', result.content, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
@@ -160,7 +155,6 @@ if __name__ == "__main__":
     parser.add_argument("--send", action="store_true", help="Actually send emails")
     args = parser.parse_args()
     
-    anthropic_key = os.environ.get("OPENAI_API_KEY", "")
     resend_key = os.environ.get("RESEND_API_KEY", "")
     
     print(f"=== Local Biz Pipeline: {args.business_type} in {args.location} ===")
@@ -197,7 +191,7 @@ if __name__ == "__main__":
         
         # Roast
         print("  Roasting...")
-        roast = roast_site(url, anthropic_key)
+        roast = roast_site(url)
         if roast:
             print(f"  Score: {roast.get('score', '?')}/10")
             print(f"  Problems: {roast.get('problems', [])[:2]}")

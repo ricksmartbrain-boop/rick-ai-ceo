@@ -32,6 +32,7 @@ class SubagentSpec:
     role: str
     lane: str
     model: str
+    model_live: bool
     persona: str
     capabilities: list[str]
     triggers: list[str]
@@ -47,6 +48,7 @@ class SubagentSpec:
             role=data["role"],
             lane=data.get("lane", "customer-lane"),
             model=data.get("model", "claude-sonnet-4-6"),
+            model_live=bool(data.get("model_live", False)),
             persona=data["persona"],
             capabilities=data.get("capabilities", []),
             triggers=data.get("triggers", []),
@@ -440,6 +442,13 @@ def dispatch_openclaw(
         "--timeout", "900",
         "--thinking", thinking_level,
     ]
+    # 2026-07-16: pass the persona's model pin to the gateway. Confirmed
+    # against `openclaw agent --help` on 2026.6.11: `--model <id>` takes
+    # "provider/model or model id". Gated per-persona by model_live for
+    # staged activation (archer first) — false means gateway default, which
+    # is what every persona got before this flag existed.
+    if spec.model_live:
+        cmd += ["--model", spec.model]
     # 2026-04-25: forked_context plumbing reserved for future OpenClaw CLI
     # support. Confirmed against `openclaw agent --help` on 4.23: no
     # --forked-context flag exists yet. The 4.23 release note describes a JS
@@ -554,7 +563,9 @@ def dispatch_openclaw(
     tokens_out = 0
     tokens_cache_read = 0
     tokens_cache_write = 0
-    winner_model = f"anthropic/{spec.model}"
+    # spec.model may already be provider-qualified ("openai/gpt-5.6-sol");
+    # only bare model ids get the historical anthropic/ prefix.
+    winner_model = spec.model if "/" in spec.model else f"anthropic/{spec.model}"
     try:
         result_block = output_payload.get("result") if isinstance(output_payload, dict) else None
         agent_meta = (result_block or {}).get("meta", {}).get("agentMeta", {}) if isinstance(result_block, dict) else {}
@@ -568,12 +579,22 @@ def dispatch_openclaw(
     except Exception:  # noqa: BLE001
         pass
 
+    # Rates for the winner model from config/model-pricing.json (was
+    # hardcoded sonnet $3/$15 — wrong for opus/gpt winners). Lazy import
+    # mirrors the runtime.db idiom; fallback = anthropic provider default
+    # so a pricing-file problem never blocks the dispatch return.
+    _provider, _, _model_id = winner_model.partition("/")
+    try:
+        from runtime.llm import pricing_for_model
+        _prices = pricing_for_model(_model_id, _provider)
+    except Exception:  # noqa: BLE001
+        _prices = {}
+    base_in_per_m = _prices.get("input", 3.0)
+    base_out_per_m = _prices.get("output", 15.0)
+
     if tokens_in or tokens_out or tokens_cache_read:
-        # Anthropic pricing (sonnet-4-6 baseline; opus-4-8 is ~5x but we don't
-        # know provider-side rate here). Cache read @ 10% of base input; cache
-        # write @ 125% of base input. Output = output rate.
-        base_in_per_m = 3.0
-        base_out_per_m = 15.0
+        # Cache read @ 10% of base input; cache write @ 125% of base input
+        # (pricing file carries no cache rates). Output = output rate.
         cost_usd = round(
             (tokens_in / 1_000_000) * base_in_per_m
             + (tokens_cache_read / 1_000_000) * base_in_per_m * 0.10
@@ -583,7 +604,7 @@ def dispatch_openclaw(
         )
     else:
         estimated_tokens = max(1, len(prompt.encode("utf-8")) // 4)
-        cost_usd = round((estimated_tokens / 1_000_000) * 3.0 + 0.01, 4)
+        cost_usd = round((estimated_tokens / 1_000_000) * base_in_per_m + 0.01, 4)
 
     log_payload = {
         "run_id": delegation.run_id,

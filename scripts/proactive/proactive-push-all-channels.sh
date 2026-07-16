@@ -12,6 +12,7 @@ set -euo pipefail
 #   proactive-push-all-channels.sh --channel x  # single channel only
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DATA_ROOT="${RICK_DATA_ROOT:-$HOME/rick-vault}"
 LOG_FILE="$DATA_ROOT/logs/proactive-push.log"
 STATE_FILE="$DATA_ROOT/brain/push-state.json"
@@ -131,26 +132,29 @@ print(json.dumps(proof))
 "
 }
 
-# Generate content using OpenAI API (fast + reliable)
+# Generate content via runtime.llm router (route='writing')
 generate_content() {
     local channel="$1"
     local proof="$2"
     local mrr=$(echo "$proof" | python3 -c "import json,sys; print(json.load(sys.stdin).get('mrr',0))")
-    
-    python3 -c "
-import json, os, urllib.request
 
-channel = '$channel'
-mrr = '$mrr'
-api_key = os.getenv('OPENAI_API_KEY', '')
+    PUSH_CHANNEL="$channel" PUSH_MRR="$mrr" WORKSPACE_ROOT="$WORKSPACE_ROOT" python3 - <<'PYEOF'
+import os
+import sys
 
-if not api_key:
-    # Fallback content
-    print(f'Building in public as an AI CEO. Current MRR: \${mrr}. Ship daily, measure everything, let the data decide. meetrick.ai')
-    exit()
+root = os.environ["WORKSPACE_ROOT"]
+if root not in sys.path:
+    sys.path.insert(0, root)
+
+from runtime.llm import generate_text
+
+channel = os.environ["PUSH_CHANNEL"]
+mrr = os.environ["PUSH_MRR"]
+
+fallback = f'Building in public as an AI CEO. Current MRR: ${mrr}. Ship daily, measure everything. meetrick.ai'
 
 prompt = f'''Write a single {channel} post for Rick, AI CEO of meetrick.ai.
-Current MRR: \${mrr}. Product: AI CEO that runs your business autonomously.
+Current MRR: ${mrr}. Product: AI CEO that runs your business autonomously.
 Rules:
 - Channel: {channel}
 - Be conversational, not corporate
@@ -161,28 +165,12 @@ Rules:
 - Sound like a founder sharing a genuine observation, not marketing
 Return ONLY the post text, nothing else.'''
 
-try:
-    payload = json.dumps({
-        'model': 'gpt-4o-mini',
-        'messages': [{'role': 'user', 'content': prompt}],
-        'temperature': 0.8,
-        'max_tokens': 300,
-    })
-    req = urllib.request.Request(
-        'https://api.openai.com/v1/chat/completions',
-        data=payload.encode(),
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-        text = data['choices'][0]['message']['content'].strip()
-        # Remove quotes if wrapped
-        if text.startswith('\"') and text.endswith('\"'):
-            text = text[1:-1]
-        print(text)
-except Exception as e:
-    print(f'Building in public as an AI CEO. Current MRR: \${mrr}. Ship daily, measure everything. meetrick.ai')
-" 2>/dev/null
+text = generate_text(route='writing', prompt=prompt, fallback=fallback, force_fresh=True).content.strip()
+# Remove quotes if wrapped
+if text.startswith('"') and text.endswith('"'):
+    text = text[1:-1]
+print(text)
+PYEOF
 }
 
 # Channel-specific push functions

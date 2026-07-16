@@ -8,7 +8,7 @@ Outputs:
 - ElevenLabs narration audio
 - MP4 slideshow, if ffmpeg is available
 
-Dry-run mode still composes the narration with opus-4-8 (route='review') so
+Dry-run mode still composes the narration via runtime.llm (route='writing') so
 we can inspect the voiceover without spending image/audio/video budget.
 """
 
@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -33,6 +32,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from runtime.llm import generate_text  # noqa: E402
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 OPS_DIR = DATA_ROOT / "operations"
@@ -48,8 +49,6 @@ ENV_FILES = [
 OPENAI_IMAGE_MODEL = "gpt-image-2"
 OPENAI_IMAGE_SIZE = "1536x1024"
 OPENAI_IMAGE_QUALITY = "high"
-OPENROUTER_MODEL = os.getenv("RICK_DEMO_VIDEO_MODEL", "anthropic/claude-opus-4.8")
-OPENROUTER_MAX_TOKENS = int(os.getenv("RICK_DEMO_VIDEO_MAX_TOKENS", "320"))
 VOICE_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 DEFAULT_VOICE_SETTINGS = {
     "stability": 0.45,
@@ -251,146 +250,14 @@ def build_narration_prompt(summary: LogSummary) -> str:
     )
 
 
-def _anthropic_chat_completion(prompt: str) -> str:
-    """Fallback: call Anthropic Messages API directly."""
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    # Smart-models invariant: fleet-standard sonnet, never mini/haiku.
-    model = "claude-sonnet-4-6"
-    payload = {
-        "model": model,
-        "system": "You write concise founder-voice demo narration.",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.35,
-        "max_tokens": OPENROUTER_MAX_TOKENS,
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    content = data.get("content") or []
-    text = " ".join(block.get("text", "") for block in content if block.get("type") == "text")
-    text = " ".join(text.split()).strip().strip('"').strip("'")
-    if not text:
-        raise RuntimeError("Anthropic narration response was empty")
-    return text
-
-
-def _openai_chat_completion(prompt: str) -> str:
-    """Last-resort fallback: OpenAI direct (the non-Anthropic provider the
-    fleet already runs on when Anthropic credits are depleted). gpt-5.5 —
-    never mini/nano."""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    payload = {
-        "model": "gpt-5.5",
-        "messages": [
-            {"role": "system", "content": "You write concise founder-voice demo narration."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_completion_tokens": OPENROUTER_MAX_TOKENS,
-    }
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    choices = data.get("choices") or []
-    message = ((choices[0] or {}).get("message") or {}).get("content") or ""
-    text = " ".join(str(message).split()).strip().strip('"').strip("'")
-    if not text:
-        raise RuntimeError("OpenAI narration response was empty")
-    return text
-
-
-def _openrouter_chat_completion(prompt: str) -> str:
-    # Try Anthropic direct first if OpenRouter creds absent or busted
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not openrouter_key:
-        try:
-            return _anthropic_chat_completion(prompt)
-        except Exception as anth_err:
-            try:
-                return _openai_chat_completion(prompt)
-            except Exception as openai_err:
-                raise RuntimeError(
-                    f"Anthropic fallback failed: {anth_err}; "
-                    f"OpenAI fallback also failed: {openai_err}"
-                )
-    last_error: str | None = None
-    for token_budget in (OPENROUTER_MAX_TOKENS, 192, 128):
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": [
-                {"role": "system", "content": "You write concise founder-voice demo narration."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.35,
-            "max_tokens": token_budget,
-        }
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {openrouter_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://meetrick.ai",
-                "X-Title": "Rick Demo Video Engine",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            choices = data.get("choices") or []
-            if not choices:
-                raise RuntimeError("OpenRouter narration response missing choices")
-            message = ((choices[0] or {}).get("message") or {}).get("content") or ""
-            text = " ".join(str(message).split()).strip().strip('"').strip("'")
-            if not text:
-                raise RuntimeError("OpenRouter narration response was empty")
-            return text
-        except urllib.error.HTTPError as exc:
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            last_error = f"HTTP {exc.code}: {exc.reason} {body}".strip()
-            if exc.code == 402:
-                # Out of credits — fall through to Anthropic direct
-                break
-            if token_budget == 128:
-                break
-    # Fallback to Anthropic direct, then OpenAI direct (credits-depleted path)
-    try:
-        return _anthropic_chat_completion(prompt)
-    except Exception as anth_err:
-        try:
-            return _openai_chat_completion(prompt)
-        except Exception as openai_err:
-            raise RuntimeError(
-                f"OpenRouter failed ({last_error}); Anthropic fallback failed: "
-                f"{anth_err}; OpenAI fallback also failed: {openai_err}"
-            )
-
-
 def compose_narration(summary: LogSummary, dry_run: bool) -> str:
     prompt = build_narration_prompt(summary)
-    text = _openrouter_chat_completion(prompt)
+    result = generate_text(route="writing", prompt=prompt, fallback="")
+    text = " ".join(result.content.split()).strip().strip('"').strip("'")
+    if result.mode not in ("live", "cached") or not text:
+        # Raise so main() can skip this week's video gracefully — a canned
+        # fallback string must never become the public narration.
+        raise RuntimeError(f"narration generation failed (mode={result.mode}, model={result.model})")
     return text.replace("—", "-").replace("–", "-")
 
 

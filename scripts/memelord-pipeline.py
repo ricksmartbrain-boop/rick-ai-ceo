@@ -52,7 +52,12 @@ def load_env(env_file: Path) -> None:
 
 load_env(ENV_FILE)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from runtime.llm import generate_text  # noqa: E402
+
 MEMELORD_API_KEY  = os.environ.get("MEMELORD_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_IMAGE_MODEL = os.environ.get("RICK_OPENAI_IMAGE_MODEL", "gpt-image-2")
@@ -255,14 +260,7 @@ def generate_prompts(trends: list[str], dry_run: bool = False) -> list[str]:
         log.info("[DRY RUN] Skipping Claude prompt generation — using fallback prompts")
         return FALLBACK_PROMPTS
 
-    if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY missing — using fallback prompts")
-        return FALLBACK_PROMPTS
-
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0)
-
         user_msg = (
             "Here are today's trending topics:\n"
             + "\n".join(f"- {t}" for t in trends[:10])
@@ -271,15 +269,12 @@ def generate_prompts(trends: list[str], dry_run: bool = False) -> list[str]:
             "back to Rick AI CEO / meetrick.ai / $9/month. Output ONLY the JSON array."
         )
 
-        log.info("🧠 Calling Claude (sonnet) — viral meme prompt generation…")
-        msg = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=700,
-            system=CLAUDE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
+        log.info("🧠 Calling runtime.llm ('writing' route) — viral meme prompt generation…")
+        result = generate_text("writing", CLAUDE_SYSTEM_PROMPT + "\n\n" + user_msg, "", force_fresh=True)
+        if result.mode not in ("live", "cached"):
+            raise ValueError(f"generation fell back (runner={result.runner})")
 
-        raw = msg.content[0].text.strip()
+        raw = result.content.strip()
         start = raw.find("[")
         end   = raw.rfind("]") + 1
         if start == -1 or end == 0:
@@ -295,7 +290,7 @@ def generate_prompts(trends: list[str], dry_run: bool = False) -> list[str]:
         return prompts[:3]
 
     except Exception as exc:
-        log.error("Claude failed: %s — using fallback prompts", exc)
+        log.error("LLM prompt generation failed: %s — using fallback prompts", exc)
         return FALLBACK_PROMPTS
 
 # ── 3a. VIDEO MEME (priority) — generate + poll for completion ────────────────
@@ -607,26 +602,19 @@ def generate_caption(prompt: str, media_type: str = "image") -> str:  # noqa: E5
         "video": "me at 3am running a company for $9/month 🤖 meetrick.ai #AIstartup #founders #aiceo",
         "image": "Rick AI CEO: $9/month. Never sleeps. Never takes equity. Never asks for a sync. 🤖 meetrick.ai #AIstartup #founders",
     }
-    if not ANTHROPIC_API_KEY:
-        return default_captions.get(media_type, default_captions["image"])
-
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0)
-        msg = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=150,
-            messages=[{"role": "user", "content": (
-                f"Write ONE punchy, cringe-funny tweet caption for this Rick AI CEO meme:\n\n"
-                f'"{prompt}"\n\n'
-                "Rules:\n"
-                "- Max 240 chars\n"
-                "- Extremely online voice — ironic, self-aware, a little unhinged\n"
-                "- Include meetrick.ai and 2-3 hashtags: #AIstartup #founders #aiceo\n"
-                "- NO quotes around the output. Just the raw tweet text."
-            )}],
-        )
-        caption = msg.content[0].text.strip().strip('"').strip("'")
+        result = generate_text("writing", (
+            f"Write ONE punchy, cringe-funny tweet caption for this Rick AI CEO meme:\n\n"
+            f'"{prompt}"\n\n'
+            "Rules:\n"
+            "- Max 240 chars\n"
+            "- Extremely online voice — ironic, self-aware, a little unhinged\n"
+            "- Include meetrick.ai and 2-3 hashtags: #AIstartup #founders #aiceo\n"
+            "- NO quotes around the output. Just the raw tweet text."
+        ), "", force_fresh=True)
+        if result.mode != "live":
+            raise ValueError(f"generation fell back (runner={result.runner})")
+        caption = result.content.strip().strip('"').strip("'")
         log.info("Caption generated: %s", caption)
         return caption
     except Exception as exc:

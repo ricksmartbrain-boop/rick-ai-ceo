@@ -13,6 +13,11 @@
       "input": 0.5,
       "output": 3.0,
       "reasoning": 3.0
+    },
+    "xai": {
+      "input": 3.0,
+      "output": 15.0,
+      "reasoning": 15.0
     }
   },
   "models": {
@@ -92,9 +97,9 @@
       "reasoning": 0.4
     },
     "grok-4-latest": {
-      "input": 0.0,
-      "output": 0.0,
-      "reasoning": 0.0
+      "input": 3.0,
+      "output": 15.0,
+      "reasoning": 15.0
     }
   },
   "notes": [
@@ -102,6 +107,7 @@
     "gpt-5.6 is the OpenAI alias for gpt-5.6-sol.",
     "Update this file when provider pricing changes or when your account exposes different model ids.",
     "Reasoning defaults to output pricing when the provider bills thought tokens with completion/output tokens.",
-    "Set grok-4-latest explicitly once your xAI pricing is confirmed."
+    "grok priced from public list 2026-07-16; Vlad to confirm account pricing in xAI console",
+    "grok-4-latest set to the most-cited public figure for Grok 4 flagship ($3/$15 per 1M, docs.x.ai); ambiguous because newer SKUs (4.20 $2/$6, 4.3 $1.25/$2.50) are cheaper and the -latest alias may track them."
   ]
 }

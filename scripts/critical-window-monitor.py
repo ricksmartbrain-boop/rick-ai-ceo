@@ -11,7 +11,7 @@ Detection sources (layered):
   (d) mailbox/triage/inbound-*.jsonl
 
 Escalation logic:
-  - replied                    → P0 alert (Telegram + notify) + opus-4-8 auto-draft (NO auto-send)
+  - replied                    → P0 alert (Telegram + notify) + auto-draft via runtime.llm route='review' (NO auto-send)
   - opened + clicked (warm++)  → P1 warm alert + pre-stage draft for Vlad review
   - opened only                → warm-signal log entry (no alert)
 
@@ -19,7 +19,7 @@ De-escalation:
   - Per-wf: after 72h from last_touch_at → automatically drops back to standard reply-watcher
   - Global: if no wfs remain in critical window → script exits cleanly, LaunchAgent keeps polling
 
-Smart-models invariant: opus-4-8 ONLY for auto-draft. No cheap models.
+Auto-drafts route through runtime.llm route='review' (router enforces smart-models invariant).
 Kill-switch: RICK_CRITICAL_WINDOW_LIVE=1
 
 State:   ~/rick-vault/control/critical-window-state.json
@@ -55,6 +55,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from runtime.llm import BudgetExceeded  # noqa: E402
+
 DATA_ROOT  = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 DB_PATH    = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
 STATE_FILE = DATA_ROOT / "control" / "critical-window-state.json"
@@ -66,9 +68,8 @@ TRIAGE_DIR = DATA_ROOT / "mailbox" / "triage"
 CRITICAL_WINDOW_HOURS  = 72
 # Reply scan cutoff: look back 7 days for replies
 REPLY_SCAN_HOURS       = 7 * 24
-# Smart-models invariant: opus-4-8 only for drafts
-DRAFT_MODEL_ANTHROPIC  = "claude-opus-4-8"
-DRAFT_MODEL_OPENAI     = "gpt-4o"   # hard fallback if Anthropic down
+# Drafts go through runtime.llm route='review'; the router owns model
+# choice, fallbacks, and budget metering (smart-models invariant lives there).
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -401,7 +402,7 @@ def _load_triage_files(cutoff_iso: str) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# 3. Auto-drafter — opus-4-8 ONLY (smart-models invariant)
+# 3. Auto-drafter — runtime.llm route='review' (router owns models + fallbacks)
 # ---------------------------------------------------------------------------
 
 def _generate_draft(wf: dict, reply_body: str, reply_label: str,
@@ -411,11 +412,8 @@ def _generate_draft(wf: dict, reply_body: str, reply_label: str,
         return {
             "draft_body": f"[DRY-RUN DRAFT — trigger={trigger}]\nRe: {wf['opener_subj']}\n\n"
                           f"Hey {wf['name']}, [Generated response would appear here]",
-            "model": DRAFT_MODEL_ANTHROPIC, "dry_run": True,
+            "model": "dry-run", "dry_run": True,
         }
-
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    openai_key    = os.getenv("OPENAI_API_KEY", "").strip()
 
     if trigger == "opened_clicked":
         prompt = f"""You are Rick, AI CEO of meetrick.ai. 
@@ -456,56 +454,16 @@ If label is 'not_interested'/'unsubscribe': graceful 1-sentence close.
 If label is 'sales_inquiry': move toward a 15-min call.
 If label is 'question': answer directly + CTA."""
 
-    # Try Anthropic opus-4-8 first (smart-models invariant)
-    if anthropic_key:
-        try:
-            import urllib.request
-            payload = json.dumps({
-                "model": DRAFT_MODEL_ANTHROPIC, "max_tokens": 500,
-                "messages": [{"role": "user", "content": prompt}],
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages", data=payload,
-                headers={
-                    "x-api-key": anthropic_key, "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                }, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            body = result["content"][0]["text"].strip()
-            tokens = result.get("usage", {}).get("input_tokens", 0)
-            if verbose:
-                print(f"  [draft] opus-4-8 generated ({tokens} input tokens)")
-            return {"draft_body": body, "model": DRAFT_MODEL_ANTHROPIC, "prompt_tokens": tokens}
-        except Exception as exc:
-            if verbose:
-                print(f"  [draft] Anthropic error: {exc}")
-
-    # Fallback: OpenAI (hard fallback, only if Anthropic fully down)
-    if openai_key:
-        try:
-            import urllib.request
-            payload = json.dumps({
-                "model": DRAFT_MODEL_OPENAI, "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500,
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions", data=payload,
-                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            body = result["choices"][0]["message"]["content"].strip()
-            if verbose:
-                print(f"  [draft] gpt-4o fallback used (Anthropic was unavailable)")
-            return {"draft_body": body, "model": DRAFT_MODEL_OPENAI}
-        except Exception as exc:
-            if verbose:
-                print(f"  [draft] OpenAI fallback error: {exc}")
-
-    return None
+    from runtime.llm import generate_text
+    result = generate_text("review", prompt, "")
+    if result.mode != "live" or not result.content.strip():
+        if verbose:
+            print(f"  [draft] generate_text failed: mode={result.mode} notes={result.notes}")
+        return None
+    tokens = result.usage.input_tokens if result.usage else 0
+    if verbose:
+        print(f"  [draft] {result.model} generated ({tokens} input tokens)")
+    return {"draft_body": result.content.strip(), "model": result.model, "prompt_tokens": tokens}
 
 
 def _save_draft(wf_id: str, wf: dict, draft: dict, reply_info: dict, trigger: str) -> str:
@@ -811,9 +769,14 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"\n  🚨 REPLY: {em} ({wf['company']}) label={reply_info.get('label','?')}")
 
-                # Draft (opus-4-8 — smart-models invariant)
-                draft = _generate_draft(wf, reply_info.get("body",""), reply_info.get("label",""),
-                                        trigger="reply", dry_run=dry_run, verbose=verbose)
+                # Draft (runtime.llm route='review'). A budget cap must never
+                # kill the P0 alert below — draft is optional, alert is not.
+                try:
+                    draft = _generate_draft(wf, reply_info.get("body",""), reply_info.get("label",""),
+                                            trigger="reply", dry_run=dry_run, verbose=verbose)
+                except BudgetExceeded as exc:
+                    print(f"  !! draft unavailable: LLM budget cap ({exc})", file=sys.stderr)
+                    draft = None
                 draft_path = ""
                 if draft:
                     draft_path = _save_draft(wf_id, wf, draft, reply_info, trigger="reply")
@@ -856,9 +819,13 @@ def run(dry_run: bool = False, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"\n  🔥 WARM++: {em} opened+clicked (no reply yet)")
 
-                # Pre-stage draft
-                draft = _generate_draft(wf, "", "", trigger="opened_clicked",
-                                        dry_run=dry_run, verbose=verbose)
+                # Pre-stage draft (optional — never let a budget cap crash the run)
+                try:
+                    draft = _generate_draft(wf, "", "", trigger="opened_clicked",
+                                            dry_run=dry_run, verbose=verbose)
+                except BudgetExceeded as exc:
+                    print(f"  !! draft unavailable: LLM budget cap ({exc})", file=sys.stderr)
+                    draft = None
                 draft_path = ""
                 if draft:
                     draft_path = _save_draft(wf_id, wf, draft, {}, trigger="opened_clicked")

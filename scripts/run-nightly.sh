@@ -52,7 +52,15 @@ python3 "$ROOT_DIR/skills/reflection-engine/scripts/daily-retro.py"
 python3 "$ROOT_DIR/skills/reflection-engine/scripts/self-growth.py" || true
 python3 "$ROOT_DIR/scripts/archive-conversations.py" >/dev/null || true
 python3 "$ROOT_DIR/skills/obsidian-memory/scripts/rebuild-memory-index.py" rebuild --write --quiet >/dev/null || true
-python3 "$ROOT_DIR/skills/executive-orchestrator/scripts/initiative-scanner.py" || true
+# initiative-scanner failures must be LOUD (2026-07-16): it seeds the initiative
+# queue that produces nearly all strategy/coding brain rows (Jul 14-16 brain
+# silence hid behind "Nightly run complete"). No silent || true.
+if python3 "$ROOT_DIR/skills/executive-orchestrator/scripts/initiative-scanner.py"; then
+  echo "[ok] initiative-scanner"
+else
+  rc=$?
+  echo "[error] initiative-scanner FAILED (exit $rc) — no initiatives queued; expect ZERO strategy/coding brain rows from this nightly" >&2
+fi
 python3 "$ROOT_DIR/skills/executive-control/scripts/build-daily-brief.py"
 python3 "$ROOT_DIR/skills/execution-ledger/scripts/execution-ledger.py" record --kind system-run --title "Nightly loop" --status done --area executive-control --project rick-v6 --route analysis --notes "Doctor, guardrails audit, health-target check, watchdog/service check, memory index rebuild, runtime heartbeat/work, email sequence dispatch, claude session digest, revenue report, nightly review, retro, brief, scoreboard refresh." >/dev/null
 python3 "$ROOT_DIR/skills/execution-ledger/scripts/execution-ledger.py" summary --write >/dev/null

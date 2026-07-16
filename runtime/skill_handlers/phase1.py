@@ -919,6 +919,8 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
 
     qualification = deal_files.get("qualification.json", {})
     total_score = qualification.get("total_score", 5)
+    product = qualification.get("recommended_product", "rick-pro-29")
+    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499}.get(product, 29)
 
     # 2026-04-24: pattern READ side fanned to close_or_escalate. Strategy
     # route is opus-4-8 (smart) — pattern context helps Rick make better
@@ -951,7 +953,11 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
         "next_action": "Schedule founder call" if total_score >= 7 else "Archive and monitor",
         "revenue_estimate": 0,
     })
-    result = generate_text("strategy", prompt, fallback)
+    # 2026-07-16: deterministic high-stakes branch (Rule 5 — code, not model
+    # judgment). Managed-tier deals ($499+) get xhigh reasoning effort on the
+    # close decision; below $499 unchanged (effort=None keeps route default).
+    effort = "xhigh" if price >= 499 else None
+    result = generate_text("strategy", prompt, fallback, effort=effort)
 
     try:
         decision = json.loads(result.content)

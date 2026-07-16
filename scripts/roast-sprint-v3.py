@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Hourly Roast Sprint v3 — curl for both Anthropic and Resend"""
+"""Hourly Roast Sprint v3 — roasts via runtime.llm ('writing' route), Resend via curl"""
 import json, re, os, sys, time, datetime, urllib.request, urllib.error, subprocess, urllib.parse
 from email_safety import block_reason_for_recipient
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from runtime.llm import generate_text  # noqa: E402
 
 # Load env by reading the file directly
 ENV_FILE = os.path.expanduser('~/clawd/config/rick.env')
@@ -23,7 +29,6 @@ RESEND_KEY = env_vars.get('RESEND_API_KEY', os.environ.get('RESEND_API_KEY', '')
 SOCIAVAULT_KEY = env_vars.get('SOCIAVAULT_API_KEY', os.environ.get('SOCIAVAULT_API_KEY', ''))
 FROM_EMAIL = 'rick@meetrick.ai'
 LOG_FILE = os.path.expanduser('~/rick-vault/logs/pipeline.jsonl')
-OPENAI_MODEL = 'gpt-5.4-mini'
 SOCIAVAULT_CALLS = 0
 SOCIAVAULT_MAX_CALLS = 5
 
@@ -140,7 +145,7 @@ def fetch_page(url):
     except Exception as e:
         return f'Could not fetch page: {e}', None
 
-def roast_curl(business, url, page_text, category, social_note=''):
+def roast_llm(business, url, page_text, category, social_note=''):
     page_snippet = page_text[:2200] if not page_text.startswith('Could not') else 'Website could not be fetched — probably a broken or empty site.'
     prompt = f"""You are Rick, an AI CEO who roasts local business websites. Brutally honest, specific, funny, genuinely helpful.
 
@@ -157,23 +162,10 @@ VERDICT: [one punchy sentence]
 
 Under 170 words. Be entertaining and specific."""
 
-    payload = json.dumps({
-        'model': OPENAI_MODEL,
-        'max_completion_tokens': 320,
-        'messages': [{'role': 'user', 'content': prompt}]
-    })
-
-    result = subprocess.run(
-        ['curl', '-s', '-X', 'POST', 'https://api.openai.com/v1/chat/completions',
-         '-H', f'Authorization: Bearer {OPENAI_KEY}',
-         '-H', 'Content-Type: application/json',
-         '-d', payload],
-        capture_output=True, text=True, timeout=45
-    )
-    resp = json.loads(result.stdout)
-    if 'error' in resp:
-        raise Exception(resp['error'].get('message', str(resp)))
-    return resp['choices'][0]['message']['content']
+    result = generate_text('writing', prompt, '')
+    if result.mode not in ('live', 'cached'):
+        raise Exception(f'llm generation failed (runner={result.runner})')
+    return result.content
 
 def extract_score(text):
     m = re.search(r'SCORE[:\s]+(\d+)', text, re.IGNORECASE) or re.search(r'(\d+)/10', text)
@@ -354,7 +346,7 @@ for i, lead in enumerate(leads):
     
     # Roast
     try:
-        roast = roast_curl(biz, url, page_text, cat_l, social_note=social_note)
+        roast = roast_llm(biz, url, page_text, cat_l, social_note=social_note)
         score = extract_score(roast)
         print(f"   🔥 Score: {score}/10")
         for ln in [l.strip() for l in roast.split('\n') if l.strip()][:4]:

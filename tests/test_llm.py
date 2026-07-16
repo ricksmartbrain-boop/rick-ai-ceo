@@ -49,7 +49,15 @@ class LlmRoutingTests(unittest.TestCase):
   "models": {
     "gpt-5.4-pro": {"input": 30.0, "output": 180.0, "reasoning": 180.0},
     "claude-opus-4-6": {"input": 5.0, "output": 25.0},
-    "gemini-3.1-pro-preview": {"input": 2.0, "output": 12.0, "reasoning": 12.0}
+    "gemini-3.1-pro-preview": {"input": 2.0, "output": 12.0, "reasoning": 12.0},
+    "gpt-5.4": {"input": 2.5, "output": 15.0, "reasoning": 15.0},
+    "gpt-5.6-sol": {"input": 5.0, "output": 30.0, "reasoning": 30.0},
+    "gpt-5.6-terra": {"input": 2.5, "output": 15.0, "reasoning": 15.0},
+    "gpt-5.6-luna": {"input": 1.0, "output": 6.0, "reasoning": 6.0},
+    "gpt-5.3-codex": {"input": 1.75, "output": 14.0, "reasoning": 14.0},
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+    "grok-4-latest": {"input": 3.0, "output": 15.0, "reasoning": 15.0}
   }
 }
 """,
@@ -123,6 +131,7 @@ class LlmRoutingTests(unittest.TestCase):
         self.assertIn("fallback plan", result.content)
 
     def test_non_strategy_routes_use_single_candidate(self) -> None:
+        """Analysis is a single-candidate route: the terra primary serves and no fallback rung is touched."""
         with patch.object(
             self.llm,
             "run_live_generation",
@@ -134,10 +143,15 @@ class LlmRoutingTests(unittest.TestCase):
         ) as patched:
             result = self.llm.generate_text("analysis", "Summarize the vault.", "fallback")
 
-        self.assertEqual(result.model, "gpt-5.4")
-        patched.assert_called_once_with("openai", "gpt-5.4", "analysis", "Summarize the vault.")
+        self.assertEqual(result.model, "gpt-5.6-terra")
+        self.assertEqual(patched.call_count, 1)
+        args, _kwargs = patched.call_args
+        self.assertEqual(args[0], "openai")
+        self.assertEqual(args[1], "gpt-5.6-terra")
+        self.assertEqual(args[2], "analysis")
 
     def test_non_strategy_routes_walk_fallback_chain(self) -> None:
+        """When the terra primary fails, analysis escalates to the sol rung and the ledger note records it."""
         with patch.object(
             self.llm,
             "run_live_generation",
@@ -145,15 +159,15 @@ class LlmRoutingTests(unittest.TestCase):
                 None,
                 self.llm.LiveCallResult(
                     text="fallback answer",
-                    runner="anthropic-api",
-                    provider="anthropic",
+                    runner="openai-responses",
+                    provider="openai",
                 ),
             ],
         ) as patched:
             result = self.llm.generate_text("analysis", "Summarize the vault.", "fallback")
 
-        self.assertEqual(result.model, "claude-opus-4-6")
-        self.assertIn("route_fallback_used=anthropic:claude-opus-4-6", result.notes)
+        self.assertEqual(result.model, "gpt-5.6-sol")
+        self.assertIn("route_fallback_used=openai:gpt-5.6-sol", result.notes)
         self.assertEqual(patched.call_count, 2)
 
     def test_cost_estimation_uses_model_pricing(self) -> None:
@@ -161,72 +175,85 @@ class LlmRoutingTests(unittest.TestCase):
         cost = self.llm.estimate_generation_cost("gpt-5.4-pro", "openai", usage)
         self.assertAlmostEqual(cost, 210.0)
 
-    def test_heartbeat_route_defaults_to_haiku(self) -> None:
-        """A1: Heartbeat should use cheap model by default."""
-        self.assertEqual(self.llm.ROUTES["heartbeat"]["default"], "claude-haiku-4-5-20251001")
-        self.assertEqual(self.llm.ROUTES["heartbeat"]["env"], "RICK_MODEL_ANTHROPIC_CHEAP")
+    def test_heartbeat_route_stays_on_budget_tier(self) -> None:
+        """A1: Heartbeat is high-frequency plumbing — it must default to the budget tier
+        (luna) and never chain into an expensive judgment-class model."""
+        self.assertEqual(self.llm.ROUTES["heartbeat"]["default"], "gpt-5.6-luna")
+        self.assertEqual(self.llm.ROUTES["heartbeat"]["env"], "RICK_MODEL_OPENAI_BUDGET")
+        expensive = {"gpt-5.6-sol", "claude-opus-4-8", "gpt-5.4-pro"}
+        chain_models = {model for _prov, model in self.llm.ROUTE_FALLBACK_DEFAULTS["heartbeat"]}
+        self.assertFalse(chain_models & expensive, f"heartbeat chain contains expensive models: {chain_models}")
+
+    def _write_usage_row(self, bucket: str, usd: float) -> None:
+        from datetime import datetime
+
+        usage_path = Path(os.environ["RICK_LLM_USAGE_LOG_FILE"])
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "bucket": bucket, "usd": usd}
+        with usage_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
 
     def test_per_bucket_budget_blocks_when_exceeded(self) -> None:
-        """A3: Per-bucket caps should block routes that exceed their bucket cap."""
-        budget_path = Path(self.tempdir.name) / "config" / "token-budgets.json"
-        budget_path.parent.mkdir(parents=True, exist_ok=True)
-        budget_path.write_text(json.dumps({"daily_usd_caps": {"workhorse": 0.001}}), encoding="utf-8")
-
-        self.llm = importlib.reload(self.llm)
-        # Patch TOKEN_BUDGET_FILE to our test file
-        with patch.object(self.llm, "TOKEN_BUDGET_FILE", budget_path):
-            # Directly inject bucket spend above the cap via the cache
-            from datetime import datetime
-            today = datetime.now().strftime("%Y-%m-%d")
-            self.llm._daily_spend_cache["date"] = today
-            self.llm._daily_spend_cache["total"] = 0.01
-            self.llm._daily_bucket_spend_cache[today] = {"workhorse": 0.01}
-
-            allowed, _ = self.llm.check_daily_budget("writing")
+        """A3: Per-bucket caps block routes whose bucket is exhausted; heartbeat is exempt
+        (it is Rick's operational pulse and must never be silenced by spend)."""
+        self._write_usage_row("workhorse", 0.01)
+        with patch.object(self.llm, "load_route_budgets", return_value={"workhorse": {"daily_cap_usd": 0.001}}):
+            allowed, reason = self.llm.check_route_budget("writing")
             self.assertFalse(allowed)
+            self.assertIn("route_budget_exceeded:workhorse", reason)
 
-            # Heartbeat should still be allowed
-            allowed_hb, _ = self.llm.check_daily_budget("heartbeat")
+            allowed_hb, _ = self.llm.check_route_budget("heartbeat")
             self.assertTrue(allowed_hb)
 
-    def test_budget_pressure_level(self) -> None:
-        """A6: Budget pressure returns correct levels."""
-        with patch.object(self.llm, "daily_spend_usd", return_value=10.0), \
-             patch.object(self.llm, "_get_daily_cap", return_value=50.0):
-            self.assertEqual(self.llm.budget_pressure_level(), "normal")
+    def test_budget_cap_raises_on_judgment_routes(self) -> None:
+        """A6/fail-loud: a capped day must ABORT judgment work (review), never hand
+        back canned text that callers could mistake for a real red-team verdict."""
+        with patch.object(self.llm, "check_daily_budget", return_value=(False, 15.0)):
+            with self.assertRaises(self.llm.BudgetExceeded):
+                self.llm.generate_text("review", "Review this plan.", "canned verdict")
 
-        with patch.object(self.llm, "daily_spend_usd", return_value=42.0), \
-             patch.object(self.llm, "_get_daily_cap", return_value=50.0):
-            self.assertEqual(self.llm.budget_pressure_level(), "tight")
+    def test_budget_cap_returns_fallback_on_non_judgment_routes(self) -> None:
+        """A6: non-judgment routes (writing) degrade to the caller's fallback text with
+        mode='fallback' so the pipeline can skip gracefully instead of crashing."""
+        with patch.object(self.llm, "check_daily_budget", return_value=(False, 15.0)):
+            result = self.llm.generate_text("writing", "Draft a post.", "canned copy")
+        self.assertEqual(result.mode, "fallback")
+        self.assertIn("canned copy", result.content)
 
-        with patch.object(self.llm, "daily_spend_usd", return_value=46.0), \
-             patch.object(self.llm, "_get_daily_cap", return_value=50.0):
-            self.assertEqual(self.llm.budget_pressure_level(), "critical")
+    def test_claude_cli_subprocess_env_strips_api_key(self) -> None:
+        """The claude-cli rung bills the subscription. An exported (possibly
+        credit-dead) ANTHROPIC_API_KEY must never reach the subprocess, or the
+        CLI prefers it and the rung dies with the API (2026-07-16 incident)."""
+        captured: dict = {}
 
-    def test_graceful_degradation_downgrades_on_tight_budget(self) -> None:
-        """A6: Under tight budget pressure, routes should downgrade to cheapest fallback."""
-        with patch.object(self.llm, "budget_pressure_level", return_value="tight"):
-            provider, model = self.llm._apply_budget_degradation("writing", "anthropic", "claude-sonnet-4-6")
-            # Should use the last fallback in the chain (cheapest)
-            self.assertNotEqual(model, "claude-sonnet-4-6")
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
 
-        with patch.object(self.llm, "budget_pressure_level", return_value="critical"):
-            provider, model = self.llm._apply_budget_degradation("writing", "anthropic", "claude-sonnet-4-6")
-            self.assertEqual(model, "claude-haiku-4-5-20251001")
+            class R:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
 
-    def test_graceful_degradation_does_not_downgrade_heartbeat(self) -> None:
-        """A6: Heartbeat and cheap routes should not be downgraded even under critical pressure."""
-        with patch.object(self.llm, "budget_pressure_level", return_value="critical"):
-            provider, model = self.llm._apply_budget_degradation("heartbeat", "anthropic", "claude-haiku-4-5-20251001")
-            self.assertEqual(model, "claude-haiku-4-5-20251001")
+            return R()
 
-            provider, model = self.llm._apply_budget_degradation("cheap", "anthropic", "claude-haiku-4-5-20251001")
-            self.assertEqual(model, "claude-haiku-4-5-20251001")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-dead-key"
+        with patch.object(self.llm.shutil, "which", return_value="/usr/local/bin/claude"), \
+             patch.object(self.llm.subprocess, "run", side_effect=fake_run):
+            result = self.llm.call_claude_cli("claude-sonnet-4-6", "writing", "hi")
 
-    def test_latency_tracked_on_live_call_result(self) -> None:
-        """D1: LiveCallResult should have latency_ms field."""
-        result = self.llm.LiveCallResult(text="test", runner="test", provider="test", latency_ms=123.4)
-        self.assertEqual(result.latency_ms, 123.4)
+        self.assertIsNotNone(result)
+        self.assertIn("env", captured)
+        self.assertNotIn("ANTHROPIC_API_KEY", captured["env"])
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured["env"])
+
+    def test_budget_cap_never_blocks_heartbeat(self) -> None:
+        """A6: heartbeat is exempt from both cap layers — Rick's pulse must keep
+        reporting operational truth even on a blown-budget day."""
+        self._write_usage_row("heartbeat", 999.0)
+        allowed, _spent = self.llm.check_daily_budget("heartbeat")
+        self.assertTrue(allowed)
+        allowed_route, _ = self.llm.check_route_budget("heartbeat")
+        self.assertTrue(allowed_route)
 
 
 if __name__ == "__main__":

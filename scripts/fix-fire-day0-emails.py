@@ -9,7 +9,7 @@ Fix sequence per workflow:
   1. Promote trigger_payload fields to top-level ctx
   2. Remove stale skipped email-cold-1 entry from touch_log
   3. Generate opus-4-8 opener via generate_text('review')
-  4. Verify model is opus-4-8 or gpt-5.4 (hard-fail on mini)
+  4. Verify model is in APPROVED_MODELS (runtime/sequencer.py; hard-fail otherwise)
   5. Save vault JSON
   6. Write mailbox outbox file (email formatter pattern)
   7. Create outbound_job in DB
@@ -56,8 +56,10 @@ TARGETS = [
     {"wf_id": "wf_8c40eea7ce2f", "email": "hello@octokraft.com",     "name": "Ciprian",      "domain": "octokraft.com"},
 ]
 
-# Smart-model invariant: only these are acceptable for cold openers
-APPROVED_MODELS = {"claude-opus-4-8", "gpt-5.4"}
+# Smart-model invariant: only review-chain models are acceptable for cold
+# openers. Canonical allowlist lives in runtime/sequencer.py (2026-07-16
+# chain: sol -> opus-4-8 -> claude-cli sonnet -> terra).
+from runtime.sequencer import APPROVED_MODELS
 
 FROM_EMAIL = os.getenv("MEETRICK_FROM_EMAIL", "Rick <rick@meetrick.ai>")
 

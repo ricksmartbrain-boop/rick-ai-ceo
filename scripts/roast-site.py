@@ -2,6 +2,12 @@
 """roast-site.py — Roast a website and output as Twitter thread or JSON"""
 import json, urllib.request, subprocess, sys, os, re
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from runtime.llm import generate_text  # noqa: E402
+
 def fetch_page(url):
     """Fetch and extract text from a URL"""
     try:
@@ -43,23 +49,13 @@ Page content: {page}"""
 URL: {url}
 Page: {page}"""
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    payload = json.dumps({
-        "model": "gpt-5.4-mini",
-        "max_completion_tokens": 1200,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=45).read())
-    result = resp["choices"][0]["message"]["content"]
+    # 'writing' = public-facing thread copy; 'analysis' = structured JSON audit
+    route = "writing" if fmt == "thread" else "analysis"
+    gen = generate_text(route, prompt, "")
+    if gen.mode not in ("live", "cached"):
+        print(json.dumps({"error": f"llm generation failed (runner={gen.runner})"}))
+        return None
+    result = gen.content.strip()
     print(result)
     return result
 

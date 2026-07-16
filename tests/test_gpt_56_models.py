@@ -56,8 +56,11 @@ class Gpt56ModelRoutingTests(unittest.TestCase):
         self.assertEqual(self.llm.ROUTES["strategy"]["default"], "gpt-5.6-sol")
         self.assertEqual(self.llm.ROUTES["coding"]["default"], "gpt-5.6-sol")
         self.assertIn(("openai", "gpt-5.6-terra"), self.llm.ROUTE_FALLBACK_DEFAULTS["coding"])
-        self.assertIn(("openai", "gpt-5.6-terra"), self.llm.ROUTE_FALLBACK_DEFAULTS["analysis"])
-        self.assertIn(("openai", "gpt-5.6-luna"), self.llm.ROUTE_FALLBACK_DEFAULTS["heartbeat"])
+        # 2026-07-16: terra/luna were promoted from fallback rungs to route primaries.
+        self.assertEqual(self.llm.ROUTES["analysis"]["default"], "gpt-5.6-terra")
+        self.assertIn(("openai", "gpt-5.6-sol"), self.llm.ROUTE_FALLBACK_DEFAULTS["analysis"])
+        self.assertEqual(self.llm.ROUTES["heartbeat"]["default"], "gpt-5.6-luna")
+        self.assertIn(("openai", "gpt-5.6-terra"), self.llm.ROUTE_FALLBACK_DEFAULTS["heartbeat"])
         self.assertEqual(self.llm.STRATEGY_SYNTHESIS_DEFAULT[2], "openai:gpt-5.6-sol")
 
     def test_gpt_56_pricing_is_registered(self) -> None:

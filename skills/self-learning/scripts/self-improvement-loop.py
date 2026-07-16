@@ -30,6 +30,14 @@ from typing import Optional
 # ── Paths ─────────────────────────────────────────────────────────────────────
 WORKSPACE = Path(os.getenv("RICK_OPENCLAW_HOME", str(Path.home() / ".openclaw/workspace")))
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
+
+# Bootstrap sys.path so runtime imports work. Anchor on WORKSPACE, not
+# __file__: this script runs via the scripts/ symlink and __file__ resolves
+# into skills/self-learning/.
+if str(WORKSPACE) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE))
+
+from runtime.llm import generate_text  # noqa: E402
 LEARNINGS_DIR = WORKSPACE / ".learnings"
 ERRORS_FILE = LEARNINGS_DIR / "ERRORS.md"
 LEARNINGS_FILE = LEARNINGS_DIR / "LEARNINGS.md"
@@ -188,11 +196,11 @@ def distill_rule(summaries: list, fix: str) -> str:
 
 # ── LLM-assisted rule generation for complex clusters ────────────────────────
 def llm_distill_rule(cluster: list) -> Optional[str]:
-    """Use LLM to distill complex error clusters into a MEMORY.md rule."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        return None
+    """Use LLM to distill complex error clusters into a MEMORY.md rule.
 
+    Routes through runtime.llm (route='coding'): these rules permanently
+    change Rick's behavior, so they must never come from a mini model.
+    """
     summaries = "\n".join(f"- {e['summary']}" for e in cluster[:5])
     fixes = "\n".join(f"- {e['suggested_fix']}" for e in cluster[:5] if e['suggested_fix'])
 
@@ -208,24 +216,10 @@ Write ONE concise rule (1-2 sentences max) that prevents this class of error per
 Format: imperative, specific, actionable. Example: "Himalaya: always put flags before search query string."
 Return ONLY the rule text."""
 
-    try:
-        import urllib.request
-        payload = json.dumps({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 150,
-        })
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=payload.encode(),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-            return data["choices"][0]["message"]["content"].strip().strip('"')
-    except Exception:
+    result = generate_text(route="coding", prompt=prompt, fallback="")
+    if result.mode != "live" or not result.content.strip():
         return None
+    return result.content.strip().strip('"')
 
 
 # ── Stage rules for review ────────────────────────────────────────────────────

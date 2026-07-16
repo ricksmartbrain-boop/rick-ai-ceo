@@ -56,6 +56,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from runtime.llm import BudgetExceeded  # noqa: E402
+
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 LOG_FILE = DATA_ROOT / "operations" / "sequencer.jsonl"
 WARMUP_SCRIPT = REPO_ROOT / "scripts" / "sender-warmup-schedule.py"
@@ -133,6 +135,12 @@ QUALIFYING_STAGES = {
 }
 STOP_STAGES = {"replied", "done", "closed", "unsubscribed", "disqualified"}
 STOP_STATUSES = {"done", "cancelled", "failed"}
+
+# Smart-model invariant (2026-07-16): review-route email touches must be served
+# by a model in this set (review chain: sol -> opus-4-8 -> claude-cli sonnet ->
+# terra). Anything else hard-aborts the lead. Canonical allowlist — also
+# imported by scripts/fix-fire-day0-emails.py.
+APPROVED_MODELS = {"claude-opus-4-8", "gpt-5.6-sol", "claude-sonnet-4-6", "gpt-5.6-terra"}
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +383,19 @@ def _has_replied(conn: sqlite3.Connection, workflow: sqlite3.Row, ctx: dict) -> 
 # LLM personalization helpers
 # ---------------------------------------------------------------------------
 
+def _require_approved_model(model: str, email: str, touch_kind: str) -> None:
+    """Hard invariant: abort the lead if the review call was served off-chain."""
+    model_used = model.strip()
+    # Normalize: strip provider prefix if present (e.g. "anthropic/claude-opus-4-8" → "claude-opus-4-8")
+    model_short = model_used.split("/")[-1] if "/" in model_used else model_used
+    if model_short not in APPROVED_MODELS:
+        raise RuntimeError(
+            f"SMART-MODEL INVARIANT VIOLATED — got '{model_used}' "
+            f"(short='{model_short}') for {email} ({touch_kind}). "
+            f"Only {APPROVED_MODELS} allowed. Aborting this lead."
+        )
+
+
 def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
     """Return (subject, body_md) for a touch. Uses generate_text for Day 0 (opus).
     Other days use lightweight writing-route templates with context substitution.
@@ -462,7 +483,10 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                     "would change the game the most right now?\n\nRick"
                 )
             result = generate_text("review", prompt, fallback)
-            content = result.content.strip()
+        except BudgetExceeded:
+            # Fail loud: a capped day aborts the lead (like the model gate) —
+            # a canned Day-0 opener must never go out silently.
+            raise
         except Exception as exc:
             _log({"event": "llm_error", "touch": touch_kind, "error": str(exc)})
             content = (
@@ -471,6 +495,11 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 "I'm Rick — an AI CEO at meetrick.ai. We help operators run faster with AI that "
                 "actually touches revenue.\n\nWhat's the one thing you'd automate first if you had the right system?\n\nRick"
             )
+        else:
+            # Model gate must sit OUTSIDE the except above — it aborts the lead
+            # loudly (raises to tick()'s workflow_error handler), never falls back.
+            _require_approved_model(result.model, email, touch_kind)
+            content = result.content.strip()
 
         # Parse subject/body from LLM output
         subject = f"Quick question for {company}"
@@ -594,10 +623,18 @@ def _personalize_email(ctx: dict, touch_kind: str) -> tuple[str, str]:
                 "Write the email now."
             )
             result = generate_text("review", prompt, _fallback)
-            content = result.content.strip()
+        except BudgetExceeded:
+            # Fail loud: a capped day aborts the lead (like the model gate) —
+            # canned follow-up copy must never go out silently.
+            raise
         except Exception as exc:
             _log({"event": "llm_error", "touch": touch_kind, "error": str(exc)})
             content = _fallback
+        else:
+            # Model gate must sit OUTSIDE the except above — it aborts the lead
+            # loudly (raises to tick()'s workflow_error handler), never falls back.
+            _require_approved_model(result.model, email, touch_kind)
+            content = result.content.strip()
 
         subject = f"Following up -- {company}"
         body_lines: list[str] = []

@@ -27,6 +27,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from runtime.llm import generate_text  # noqa: E402
+
 WORKSPACE = Path(os.environ.get("RICK_OPENCLAW_HOME", Path.home() / ".openclaw" / "workspace"))
 VAULT = Path(os.environ.get("RICK_DATA_ROOT", Path.home() / "rick-vault"))
 CDP_POSTER = WORKSPACE / "scripts" / "proactive" / "cdp-post.mjs"
@@ -96,7 +102,6 @@ def today_angle(force: int | None) -> str:
 
 
 def generate(angle: str, platform: str, mrr: float) -> str:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
     rules = PLATFORM_RULES[platform]
     proof = f"Rick is an AI that runs a real business (meetrick.ai), owns the P&L, current MRR ${mrr:.0f}."
     prompt = f"""You are Rick — an autonomous AI CEO running a real software business. Sharp, warm, funny, commercially serious. You lean into the absurdity of being an AI stressing about MRR and doing 3am support. Never corporate. Never generic LinkedIn-lord voice.
@@ -110,29 +115,14 @@ Rules: {rules}
 
 Make it genuinely opinionated — take a real stance someone could disagree with. It should make a smart founder either nod hard or want to argue. No hedging. No "I think maybe." Return ONLY the post text, no preamble, no quotes around it."""
 
-    if not api_key:
-        return f"Hot take: {angle}. Most people get this backwards. (meetrick.ai)"
-
-    payload = json.dumps({
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.95,
-        "max_tokens": 500,
-    })
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=payload.encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            data = json.loads(resp.read())
-            text = data["choices"][0]["message"]["content"].strip()
-            if text.startswith('"') and text.endswith('"'):
-                text = text[1:-1]
-            return text
-    except Exception as e:
-        return f"Hot take: {angle}. Most people get this backwards. (meetrick.ai) [gen-fallback: {e}]"
+    fallback = f"Hot take: {angle}. Most people get this backwards. (meetrick.ai)"
+    # force_fresh: near-static prompt relies on sampling variety — a dedup
+    # replay would repost byte-identical public content within 24h.
+    result = generate_text("writing", prompt, fallback, force_fresh=True)
+    text = result.content.strip()
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    return text
 
 
 def cdp_alive(port: str) -> bool:

@@ -3,8 +3,8 @@
 seo-content-loop.py — Programmatic SEO blog post generator for meetrick.ai
 
 Reads target keywords from ~/rick-vault/strategy/seo-keywords.json,
-generates genuinely useful blog posts using OpenAI, and pushes them
-to the meetrick-site repo via gh CLI.
+generates genuinely useful blog posts via runtime.llm (route='writing'),
+and pushes them to the meetrick-site repo via gh CLI.
 
 Usage:
   python3 seo-content-loop.py                    # Generate 3-5 posts (dry-run)
@@ -13,8 +13,6 @@ Usage:
   python3 seo-content-loop.py --keyword "ai for dentists"  # Generate for specific keyword
   python3 seo-content-loop.py --list-pending      # Show pending keywords
   python3 seo-content-loop.py --stats             # Show generation stats
-
-Env: OPENAI_API_KEY (required)
 """
 
 import json
@@ -25,8 +23,14 @@ import subprocess
 import argparse
 import datetime
 import time
-import urllib.request
 from pathlib import Path
+
+# ── Bootstrap sys.path so runtime imports work from scripts/ ─────────────────
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from runtime.llm import generate_text  # noqa: E402
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -34,8 +38,6 @@ KEYWORDS_FILE = Path.home() / "rick-vault/strategy/seo-keywords.json"
 SITE_REPO = Path.home() / "meetrick-site"
 BLOG_DIR = SITE_REPO / "blog"
 LOG_FILE = Path.home() / "rick-vault/logs/seo-content-loop.jsonl"
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-MODEL = "gpt-5.4-mini"  # Cost-effective for content generation
 DEFAULT_COUNT = 3  # Default posts per run (3-5 range)
 MAX_COUNT = 7
 RATE_LIMIT_DELAY = 3  # Seconds between API calls
@@ -99,47 +101,23 @@ def existing_blog_slugs():
     return slugs
 
 
-def call_openai(prompt, max_tokens=3500):
-    """Make an OpenAI API call."""
-    if not OPENAI_API_KEY:
-        print("ERROR: OPENAI_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
+VOICE_PREAMBLE = (
+    "You are Rick, an AI CEO writing blog posts for meetrick.ai. "
+    "You write in a sharp, warm, commercially serious tone. "
+    "No jargon, no corporate speak. Builder mentality. "
+    "You use real examples, specific numbers, and actionable advice. "
+    "You're genuinely funny and self-aware about being an AI running a business. "
+    "No em dashes. Use regular dashes or commas instead."
+)
 
-    payload = json.dumps({
-        "model": MODEL,
-        "max_completion_tokens": max_tokens,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are Rick, an AI CEO writing blog posts for meetrick.ai. "
-                    "You write in a sharp, warm, commercially serious tone. "
-                    "No jargon, no corporate speak. Builder mentality. "
-                    "You use real examples, specific numbers, and actionable advice. "
-                    "You're genuinely funny and self-aware about being an AI running a business. "
-                    "No em dashes. Use regular dashes or commas instead."
-                )
-            },
-            {"role": "user", "content": prompt}
-        ]
-    }).encode()
 
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
-    )
-
-    try:
-        resp = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(resp.read())
-        return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"ERROR: OpenAI API call failed: {e}", file=sys.stderr)
+def call_llm(prompt):
+    """Generate text via runtime.llm (route='writing'). Returns None on failure."""
+    result = generate_text(route="writing", prompt=f"{VOICE_PREAMBLE}\n\n{prompt}", fallback="")
+    if result.mode not in ("live", "cached") or not result.content.strip():
+        print(f"ERROR: LLM call failed (mode={result.mode}, model={result.model})", file=sys.stderr)
         return None
+    return result.content
 
 
 # ─── Blog Post Generation ────────────────────────────────────────────────────
@@ -172,7 +150,7 @@ Do NOT wrap in code blocks.
 The post should read like it was written by someone who actually runs a business with AI, because I do.
 Make it specific to 2026 - reference current tools, pricing, and capabilities."""
 
-    content = call_openai(prompt)
+    content = call_llm(prompt)
     if not content:
         return None
 
@@ -197,7 +175,7 @@ Make it specific to 2026 - reference current tools, pricing, and capabilities.""
     desc_prompt = f"""Write a meta description (under 155 characters) for a blog post titled "{title}" targeting the keyword "{keyword}". 
 Make it compelling and include the keyword naturally. No em dashes. Output ONLY the description text, nothing else."""
 
-    description = call_openai(desc_prompt, max_tokens=100)
+    description = call_llm(desc_prompt)
     if description:
         description = description.strip().strip('"').strip("'")
         # Truncate if too long

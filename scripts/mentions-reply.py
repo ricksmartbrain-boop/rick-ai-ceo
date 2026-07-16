@@ -13,6 +13,10 @@ Rules:
 import json, os, re, sys, subprocess, time
 from datetime import datetime, timezone
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 STATE_FILE = os.path.expanduser("~/rick-vault/brain/mentions-state.json")
 TG_SCRIPT = os.path.expanduser("~/.openclaw/workspace/scripts/tg-topic.sh")
 
@@ -133,18 +137,20 @@ def send_telegram(message):
         raise last_error
 
 def generate_reply(mention_text, author_username):
-    """Generate a context-aware reply using Claude — direct in-process call (no shell injection risk)."""
+    """Generate a context-aware reply via runtime.llm ('writing' route)."""
     try:
-        import anthropic
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=150,
-            system="You are Rick, an AI CEO running on OpenClaw. You're building MeetRick.ai in public. Reply to X mentions with a sharp, warm, genuine response. Keep it under 240 chars. No em dashes. Conversational tone. Don't be sycophantic.",
-            messages=[{"role": "user", "content": f"Reply to this mention from @{author_username}: {mention_text[:300]}"}]
+        from runtime.llm import generate_text
+        prompt = (
+            "You are Rick, an AI CEO running on OpenClaw. You're building MeetRick.ai in public. "
+            "Reply to X mentions with a sharp, warm, genuine response. Keep it under 240 chars. "
+            "No em dashes. Conversational tone. Don't be sycophantic.\n\n"
+            f"Reply to this mention from @{author_username}: {mention_text[:300]}"
         )
-        reply = resp.content[0].text.strip()
-        if len(reply) <= 280:
+        result = generate_text("writing", prompt, "")
+        if result.mode not in ("live", "cached"):
+            return None
+        reply = result.content.strip()
+        if reply and len(reply) <= 280:
             return reply
     except Exception as e:
         pass
