@@ -2,11 +2,22 @@
   "_meta": {
     "purpose": "Config for scripts/rick-guardian.py (consolidated deterministic watchdog).",
     "session_pricing_note": "USD per MTok as [input, output, cacheRead, cacheWrite]. Anthropic list prices (sonnet-4-6 3/15, opus-4-8 5/25) with cacheRead=0.1x input and cacheWrite=2x input (openclaw.json sets cacheRetention long = 1h TTL). OpenAI gpt-5.6 rows use public 2026-07-14 pricing with cacheRead=0.1x input and cacheWrite=1.25x input; older gpt-5.x rows are retained estimates unless confirmed separately.",
-    "zombie_note": "A job is flagged as a zombie when its log shows activity within max_quiet_hours but none of its artifact paths were touched in that window. Grow this list as more silent no-op jobs are identified."
+    "zombie_note": "A job is flagged as a zombie when its log shows activity within max_quiet_hours but none of its artifact paths were touched in that window. Grow this list as more silent no-op jobs are identified.",
+    "stripe_provenance_note": "check_stripe_provenance seen-state: ids that never alert. Initial set = 2026-07-16 already-triaged objects (parked Bundle trio + 5 legacy LinguaLive Tools payment links; decisions/lingualive-tools-bundle-triage-2026-07-16.md). Everything created later must pass the journal test (id in events table or vault) instead of being added here."
   },
   "per_session_cap_usd": 5.0,
   "daily_cap_usd_default": 15.0,
   "stripe_webhook_id": "we_1TtE7oD9G3v6e0OsL1XnBGoj",
+  "stripe_provenance_known_ids": [
+    "prod_TmIzXYpSIUzYKF",
+    "price_1Ttn2fD9G3v6e0OsURFAGk1I",
+    "plink_1Ttn3DD9G3v6e0Osgbj99Yvh",
+    "plink_1SokcqD9G3v6e0OsLHVxvu5a",
+    "plink_1SokdHD9G3v6e0Os6YIkJj3H",
+    "plink_1SokdsD9G3v6e0Os5aQ7MlSl",
+    "plink_1SokeLD9G3v6e0Os07SqnSr2",
+    "plink_1SokecD9G3v6e0OsqUWzYWhv"
+  ],
   "session_pricing": {
     "claude-sonnet-4-6": [
       3.0,

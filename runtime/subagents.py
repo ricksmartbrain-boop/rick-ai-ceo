@@ -144,6 +144,7 @@ def build_task_prompt(spec: SubagentSpec, task: str, context: dict[str, Any] | N
 - Max spend per task: ${spec.max_spend_usd:.2f}
 - If you cannot resolve something, escalate to Rick with a clear summary of what you tried and what's needed.
 - NEVER cancel, relabel, or "clean up" workflows or jobs, resolve/deny approvals, write directly to the runtime DB's workflows/jobs/approvals tables, or kill Rick processes — even if the data looks synthetic, duplicate, stale, or like a drill. Drills intentionally look synthetic; cancelling them defeats their purpose. If something looks wrong, report it and escalate — cleanup decisions belong to the owner.
+- Creating Stripe objects (product, price, payment link, coupon, or any other live-mode write) REQUIRES recording an ops event with the object id in the same action: insert an events row (event_type 'stripe_object_created', payload with the id and why) and note it in today's day note. An unjournaled Stripe write is an incident — the guardian cross-checks Stripe's created timestamps against the journal (2026-07-16 04:01 unattributed Bundle pattern). If you cannot journal it, do not create it.
 - Write outputs to ~/rick-vault/ using appropriate paths.
 - Be concise. Ship outcomes, not plans."""
 

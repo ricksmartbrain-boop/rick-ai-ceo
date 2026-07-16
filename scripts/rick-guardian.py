@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -407,6 +408,210 @@ def check_stripe_webhook(cfg: dict, alerts: list) -> dict:
         ))
     return {"webhook_id": webhook_id, "status": status or "not_found",
             "endpoints_listed": len(body.get("data", []))}
+
+
+# ---------------------------------------------------------------------------
+# Check: Stripe object provenance (creations must leave a journal trace)
+# ---------------------------------------------------------------------------
+STRIPE_PROVENANCE_WINDOW_H = 24
+# The vault grep must never see the guardian's own outputs: the first alert
+# would write the id into them and the journal test would go green on the
+# next run purely from our own noise (self-poisoning).
+STRIPE_PROVENANCE_GREP_EXCLUDES = (
+    "rick-guardian.jsonl",   # LOG_FILE
+    "alerts-pending.jsonl",  # ALERTS_FALLBACK
+    "guardian.log",          # launchd StandardOutPath (ai.rick.guardian)
+    "guardian.err.log",      # launchd StandardErrorPath
+    "stripe-provenance-state.json",  # our own seen-state
+)
+STRIPE_PROVENANCE_STATE = DATA_ROOT / "control" / "stripe-provenance-state.json"
+
+def _stripe_get(path: str, key: str) -> dict:
+    req = urllib.request.Request(
+        f"https://api.stripe.com{path}",
+        headers={"Authorization": f"Bearer {key}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+def _stripe_id_journaled(obj_id: str) -> bool:
+    """Journal test: id appears in the events table or anywhere in the vault."""
+    con = sqlite3.connect(DB_FILE, timeout=5)
+    try:
+        if con.execute(
+            "SELECT 1 FROM events WHERE payload_json LIKE '%' || ? || '%' "
+            "LIMIT 1",
+            (obj_id,),
+        ).fetchone() is not None:
+            return True
+    finally:
+        con.close()
+    cmd = ["grep", "-rIq"]
+    cmd += [f"--exclude={name}" for name in STRIPE_PROVENANCE_GREP_EXCLUDES]
+    cmd += ["--", obj_id, str(DATA_ROOT)]
+    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise RuntimeError(
+        f"vault grep rc={proc.returncode}: "
+        f"{proc.stderr.decode(errors='replace')[:150]}")
+
+def _list_payment_links(key: str) -> tuple[list[dict], bool]:
+    """All payment links (active + inactive), paginated. -> (links, truncated)"""
+    links: list[dict] = []
+    cursor = ""
+    for _ in range(5):  # 500 links is already absurd; beyond that, alert
+        path = "/v1/payment_links?limit=100" + (
+            f"&starting_after={cursor}" if cursor else "")
+        body = _stripe_get(path, key)
+        data = body.get("data", [])
+        links.extend(data)
+        if not body.get("has_more") or not data:
+            return links, False
+        cursor = data[-1].get("id", "")
+    return links, True
+
+def check_stripe_provenance(cfg: dict, alerts: list) -> dict:
+    """Every Stripe object an agent creates must leave a journal trace.
+
+    2026-07-16 04:01:25 PT an autonomous session created a live $39.99
+    payment link on the dead legacy LinguaLive Tools product
+    (price_1Ttn2f… + plink_1Ttn3D… on prod_TmIz…) with ZERO local trace —
+    no events row, no day-note line, no surviving session transcript
+    (04:00-04:02 events are heartbeats only; no rollout was active at
+    04:01:25). Transcripts are prunable; Stripe's own ledger is not. So
+    this check reads Stripe (read-only GETs) and alerts on any new object
+    whose id appears neither in the events table nor anywhere in the vault
+    (the journal test). Prompts now demand an ops event per creation
+    (subagents.py build_task_prompt); this is the hard detection layer.
+
+    Two detection modes, because the API differs per object:
+      - products/prices expose `created` -> true 24h creation window.
+      - payment_links have NO created field (verified live 2026-07-16), so
+        new = never seen before. First run seeds control/
+        stripe-provenance-state.json with every existing link id WITHOUT
+        alerting (85 pre-guard links; 72 are unjournaled history on the
+        shared ~50-business Stripe account — not Rick incidents). After
+        seeding, every unseen id gets the journal test; only ACTIVE
+        unjournaled links alert (deactivated = defused, the accepted
+        remediation in the 2026-07-16 triage); inactive ones are recorded
+        in results. Unjournaled ids are NOT added to the seen-state, so
+        they re-alert (once per 24h via dedupe) until journaled or
+        deactivated.
+
+    stripe_provenance_known_ids in the config never alert: today's
+    already-triaged objects (the parked Bundle trio + the 5 legacy links,
+    decisions/lingualive-tools-bundle-triage-2026-07-16.md).
+    """
+    key = _rick_env("STRIPE_SECRET_KEY")
+    if not key:
+        raise RuntimeError("STRIPE_SECRET_KEY not available")
+    known = set(cfg.get("stripe_provenance_known_ids", []))
+    cutoff = int(NOW.timestamp()) - STRIPE_PROVENANCE_WINDOW_H * 3600
+
+    known_skipped: list[str] = []
+    journaled: list[str] = []
+    unjournaled: list[str] = []
+    truncated: list[str] = []
+
+    def vet(kind: str, obj_id: str, extra: str) -> bool:
+        """Journal-test one object; alert if untraced. True = journaled."""
+        if _stripe_id_journaled(obj_id):
+            journaled.append(obj_id)
+            return True
+        unjournaled.append(obj_id)
+        alerts.append(alert(
+            f"guardian:stripe_provenance:{obj_id}",
+            f"🚨 [rick-guardian] STRIPE PROVENANCE: {kind} {obj_id} "
+            f"({extra}) — its id appears NOWHERE in the events table or "
+            f"the vault: an unjournaled live Stripe write (2026-07-16 "
+            f"04:01 Bundle pattern). Find who created it; journal it or "
+            f"deactivate it.",
+        ))
+        return False
+
+    # --- products & prices: true created-window ---------------------------
+    in_window = 0
+    for kind, path in (
+        ("product", f"/v1/products?limit=100&created[gte]={cutoff}"),
+        ("price", f"/v1/prices?limit=100&created[gte]={cutoff}"),
+    ):
+        body = _stripe_get(path, key)
+        for obj in body.get("data", []):
+            obj_id = obj.get("id")
+            if not obj_id or int(obj.get("created") or 0) < cutoff:
+                continue
+            in_window += 1
+            if obj_id in known:
+                known_skipped.append(obj_id)
+                continue
+            created_iso = datetime.fromtimestamp(
+                int(obj["created"]), tz=timezone.utc).isoformat(
+                    timespec="seconds")
+            vet(kind, obj_id, f"created {created_iso}")
+        if body.get("has_more"):
+            truncated.append(kind)
+
+    # --- payment links: first-seen state (no created field in the API) ----
+    links, links_truncated = _list_payment_links(key)
+    if links_truncated:
+        truncated.append("payment_link")
+    listed_ids = [lk.get("id", "") for lk in links if lk.get("id")]
+
+    seeded = False
+    new_inactive: list[str] = []
+    if not STRIPE_PROVENANCE_STATE.exists():
+        # Seed silently: everything existing predates the guard. Ghosts in
+        # this initial set are history, not incidents (known ids cover the
+        # 2026-07-16 triage); alerting on 72 dead links is noise, not signal.
+        seeded = True
+        seen = set(listed_ids)
+        state = {"seeded_at": TS, "payment_link_ids": sorted(seen)}
+    else:
+        state = json.loads(STRIPE_PROVENANCE_STATE.read_text(encoding="utf-8"))
+        seen = set(state.get("payment_link_ids", []))
+        for lk in links:
+            obj_id = lk.get("id")
+            if not obj_id or obj_id in seen:
+                continue
+            if obj_id in known:
+                known_skipped.append(obj_id)
+                seen.add(obj_id)
+                continue
+            active = bool(lk.get("active"))
+            if not active:
+                # Already defused — record, don't alarm, don't re-test.
+                new_inactive.append(obj_id)
+                seen.add(obj_id)
+                continue
+            if vet("payment_link", obj_id,
+                   f"ACTIVE, url {lk.get('url', '?')}"):
+                seen.add(obj_id)
+            # unjournaled: stays out of seen -> re-alerts until resolved
+        state["payment_link_ids"] = sorted(seen)
+        state["updated_at"] = TS
+    STRIPE_PROVENANCE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    STRIPE_PROVENANCE_STATE.write_text(
+        json.dumps(state, indent=1) + "\n", encoding="utf-8")
+
+    if truncated:
+        alerts.append(alert(
+            "guardian:stripe_provenance_truncated",
+            f"🚨 [rick-guardian] STRIPE PROVENANCE: {'/'.join(truncated)} "
+            f"listing truncated (>100 in-window creations or >500 links) — "
+            f"provenance not fully checked. That volume is itself an "
+            f"incident.",
+        ))
+    return {"window_hours": STRIPE_PROVENANCE_WINDOW_H,
+            "products_prices_in_window": in_window,
+            "payment_links_listed": len(listed_ids),
+            "links_seeded": seeded,
+            "new_inactive_links": new_inactive,
+            "known_skipped": known_skipped, "journaled": journaled,
+            "unjournaled": unjournaled, "truncated": truncated}
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +1111,7 @@ def main() -> int:
         ("session_cost", lambda a: check_session_cost(cfg, a)),
         ("sender", check_sender),
         ("stripe_webhook", lambda a: check_stripe_webhook(cfg, a)),
+        ("stripe_provenance", lambda a: check_stripe_provenance(cfg, a)),
         ("zombies", lambda a: check_zombies(cfg, a)),
         ("churn", check_churn),
         ("approval_integrity", check_approval_integrity),
