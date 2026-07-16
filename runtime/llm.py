@@ -633,7 +633,19 @@ def call_claude_cli(model: str, route: str, prompt: str) -> LiveCallResult | Non
     subscription, not ANTHROPIC_API_KEY, so it stays live when API credits are
     dead. --model pins the rung's model id so the ledger row matches what ran.
     """
-    if not shutil.which("claude"):
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        # LaunchAgent PATHs omit ~/.local/bin, so which() fails under the
+        # daemon/watchers even though the CLI is installed — probe the known
+        # install locations before giving up (2026-07-16: every daemon writing
+        # call silently skipped this rung to terra).
+        for candidate in (Path.home() / ".local" / "bin" / "claude",
+                          Path("/opt/homebrew/bin/claude"),
+                          Path("/usr/local/bin/claude")):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                claude_bin = str(candidate)
+                break
+    if not claude_bin:
         return None
     timeout = int(os.getenv("RICK_CLI_REQUEST_TIMEOUT_SECONDS", str(REQUEST_TIMEOUT_SECONDS)))
     # The CLI prefers an exported ANTHROPIC_API_KEY over its subscription
@@ -641,7 +653,7 @@ def call_claude_cli(model: str, route: str, prompt: str) -> LiveCallResult | Non
     # ("Credit balance is too low"). Strip it so the subscription always bills.
     cli_env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     result = subprocess.run(
-        ["claude", "--print", "--model", model, prompt],
+        [claude_bin, "--print", "--model", model, prompt],
         capture_output=True,
         text=True,
         check=False,
