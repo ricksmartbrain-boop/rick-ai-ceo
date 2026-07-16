@@ -174,6 +174,17 @@ else
   python3 "$ROOT_DIR/skills/self-learning/scripts/content-signal-tracker.py" >/dev/null || true
 fi
 
+# Day-14 kill-gate scoreboard (strategy 2026-07-13): regenerate control/day14-gate.md
+# from ledgers. Runs on EVERY heartbeat (outside the skip-heavy gate) because its
+# inputs — Vlad's CHECKLIST.md ticks, sub status, days-to-gate — change without
+# producing runtime outcomes. Same no-new-jobs pattern as the approvals mirror.
+if python3 "$ROOT_DIR/scripts/day14-gate.py" >/dev/null 2>>"$RICK_DATA_ROOT/logs/cron/day14-gate.err.log"; then
+  echo "[ok] day14-gate"
+else
+  rc=$?
+  echo "[error] day14-gate FAILED (exit $rc) — see $RICK_DATA_ROOT/logs/cron/day14-gate.err.log" >&2
+fi
+
 # Write self-learning summary to daily note
 if [[ "$HB_SHOULD_LOG" == "1" ]]; then
   {
