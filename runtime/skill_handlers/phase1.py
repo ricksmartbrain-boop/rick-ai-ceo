@@ -1557,9 +1557,19 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
 
         try:
             try:
-                from runtime.kill_switches import ChannelPaused, assert_channel_active, record_send, is_send_allowed
-                assert_channel_active(connection, "email")
+                from runtime.kill_switches import TRANSACTIONAL_EMAIL_TYPES, ChannelPaused, assert_channel_active, record_send, is_send_allowed
+                # Transactional items (delivery/dunning) waive ONLY the
+                # quiet-hours clause; every other channel check still applies.
+                assert_channel_active(
+                    connection, "email",
+                    transactional=str(msg.get("type") or "") in TRANSACTIONAL_EMAIL_TYPES,
+                )
             except ChannelPaused as exc:
+                if exc.reason == "quiet hours":
+                    # Marketing item inside quiet hours: leave it pending for
+                    # the 07:00 release but keep walking — a transactional
+                    # item later in the batch must still go out now.
+                    continue
                 return StepOutcome(
                     summary=f"Outbox send paused by email safety gate: {exc.reason}",
                     artifacts=[],

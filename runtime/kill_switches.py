@@ -41,6 +41,18 @@ class ChannelPaused(Exception):
         super().__init__(f"channel {channel!r} paused: {reason}")
 
 
+# Transactional outbox item `type` values that must NOT wait for the 07:00
+# quiet-hours release (2026-07-16: russian@crushermail.com's paid access
+# email sat ~2h behind the quiet-hours gate; only luck it wasn't 8h).
+# Exemption is quiet-hours ONLY — master kill, channel pause/disable,
+# daily/per-minute caps, sender-warmup ramp, suppression and is_send_allowed
+# all still apply. Marketing-ish types (pitch/followup/nurture/cold/welcome/
+# win-back) deliberately keep quiet hours. Canonical list — import this,
+# don't scatter string literals. "dunning"/"dunning-reminder" are the two
+# payment-fix types stripe-poll's dunning machinery emits (day-0 + day-N).
+TRANSACTIONAL_EMAIL_TYPES = frozenset({"delivery", "dunning", "dunning-reminder"})
+
+
 def _load_limits() -> dict[str, Any]:
     if not CHANNEL_LIMITS_FILE.exists():
         return {"channels": {}}
@@ -122,8 +134,12 @@ def _email_warmup_cap_status() -> tuple[int | None, int | None, str]:
         return 0, None, f"warmup_gate_error:{type(exc).__name__}:{exc}"
 
 
-def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
-    """Raise ChannelPaused if the channel can't send right now."""
+def assert_channel_active(conn: sqlite3.Connection, channel: str, *, transactional: bool = False) -> None:
+    """Raise ChannelPaused if the channel can't send right now.
+
+    transactional=True (item type in TRANSACTIONAL_EMAIL_TYPES) waives ONLY
+    the quiet-hours clause; every other check below still applies.
+    """
     if os.getenv("RICK_OUTBOUND_ENABLED", "1") == "0":
         raise ChannelPaused(channel, "master kill: RICK_OUTBOUND_ENABLED=0")
 
@@ -153,7 +169,7 @@ def assert_channel_active(conn: sqlite3.Connection, channel: str) -> None:
         else:
             raise ChannelPaused(channel, f"{status}: {row['pause_reason']}")
 
-    if _inside_quiet_hours(cfg):
+    if not transactional and _inside_quiet_hours(cfg):
         raise ChannelPaused(channel, "quiet hours")
 
     # Daily cap check — we compare against updated_at date; if stale, reset counter.

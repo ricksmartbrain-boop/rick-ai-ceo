@@ -36,7 +36,7 @@ def _workspace_root() -> Path:
     return current.parents[3]
 
 
-def email_channel_block_reason() -> str | None:
+def email_channel_block_reason(transactional: bool = False) -> str | None:
     try:
         root = str(_workspace_root())
         if root not in sys.path:
@@ -46,7 +46,7 @@ def email_channel_block_reason() -> str | None:
 
         conn = connect()
         try:
-            assert_channel_active(conn, "email")
+            assert_channel_active(conn, "email", transactional=transactional)
             return None
         except ChannelPaused as exc:
             return exc.reason
@@ -54,6 +54,25 @@ def email_channel_block_reason() -> str | None:
             conn.close()
     except Exception as exc:
         return f"gate_unavailable: {type(exc).__name__}: {exc}"
+
+
+def transactional_email_types() -> frozenset[str]:
+    """Item `type` values exempt from quiet hours (delivery/dunning).
+
+    Canonical set lives in runtime.kill_switches.TRANSACTIONAL_EMAIL_TYPES.
+    Fail-safe: if the import breaks, return the empty set — nothing is
+    exempt and everything keeps the quiet-hours deferral (never the reverse).
+    """
+    try:
+        root = str(_workspace_root())
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from runtime.kill_switches import TRANSACTIONAL_EMAIL_TYPES
+
+        return TRANSACTIONAL_EMAIL_TYPES
+    except Exception as exc:
+        print(f"transactional_email_types unavailable ({exc}); quiet hours apply to all", file=sys.stderr)
+        return frozenset()
 
 
 def load_suppressions() -> set[str]:
@@ -122,9 +141,19 @@ def process_outbox(dry_run: bool = False) -> dict:
     """Process all pending emails in the outbox."""
     if not OUTBOX_DIR.exists():
         return {"status": "empty", "sent": 0, "errors": 0}
+    transactional_only = False
     if not dry_run:
         block_reason = email_channel_block_reason()
-        if block_reason:
+        if block_reason == "quiet hours":
+            # Quiet hours defers marketing only. Transactional mail
+            # (TRANSACTIONAL_EMAIL_TYPES: paid access delivery, dunning) must
+            # go out now — re-check the gate with the quiet-hours clause
+            # waived; if anything ELSE blocks too, abort the whole run.
+            residual = email_channel_block_reason(transactional=True)
+            if residual:
+                return {"status": "channel_paused", "reason": residual, "sent": 0, "errors": 0}
+            transactional_only = True
+        elif block_reason:
             return {"status": "channel_paused", "reason": block_reason, "sent": 0, "errors": 0}
 
     if not dry_run:
@@ -153,6 +182,12 @@ def process_outbox(dry_run: bool = False) -> dict:
         # Check scheduled send time
         send_after = msg.get("send_after", "")
         if send_after and send_after > now:
+            skipped += 1
+            continue
+
+        # Quiet hours: marketing waits for the 07:00 release; transactional
+        # (delivery/dunning) proceeds through the remaining gates below.
+        if transactional_only and str(msg.get("type") or "") not in transactional_email_types():
             skipped += 1
             continue
 

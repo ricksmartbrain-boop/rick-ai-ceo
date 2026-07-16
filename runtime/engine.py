@@ -3516,6 +3516,10 @@ def handle_delivery_email(connection: sqlite3.Connection, workflow: sqlite3.Row,
     body_md = result.content
     if "**Subject:**" not in body_md:
         body_md = f"**Subject:** Your access to {product_title}\n\n{body_md}"
+    # Transactional (type=delivery): NEVER stamp a quiet-hours send_after
+    # here — paid access must go out immediately (2026-07-16; see
+    # kill_switches.TRANSACTIONAL_EMAIL_TYPES). Consumers waive quiet hours
+    # for these types; all other gates still apply.
     outbox_path = write_file(
         DATA_ROOT / "mailbox" / "outbox" / f"{slugify_email(email)}-{source_workflow['slug']}-delivery.json",
         json.dumps(
