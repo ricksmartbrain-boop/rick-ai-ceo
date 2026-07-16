@@ -741,10 +741,15 @@ def harvest_cancellation_details(
     details_sig = f"feedback={feedback}|comment={comment}|reason={reason}"
 
     if conn is not None:
+        # Exact json_extract match. The earlier LIKE-on-payload_json check
+        # compared the RAW sig against ensure_ascii-escaped JSON, so any
+        # comment with non-ASCII/quotes/newlines never matched and the sub
+        # re-recorded every 30-min poll, unbounded (2026-07-16 review blocker).
         already = conn.execute(
             "SELECT 1 FROM customer_events WHERE event_type = 'cancel_reason' "
-            "AND payload_json LIKE ? AND payload_json LIKE ? LIMIT 1",
-            (f'%"subscription_id": "{sub_id}"%', f'%"details_sig": "{details_sig}"%'),
+            "AND json_extract(payload_json, '$.subscription_id') = ? "
+            "AND json_extract(payload_json, '$.details_sig') = ? LIMIT 1",
+            (sub_id, details_sig),
         ).fetchone()
         if already:
             return False

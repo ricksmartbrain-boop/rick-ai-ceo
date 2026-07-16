@@ -214,8 +214,10 @@ def load_churn_customers():
     """Map email(lower) -> {id, status} for canceling/canceled customers.
 
     Fail-loud-but-degrade: a DB hiccup must not kill the call-queue path, so
-    on error we warn to stderr (heartbeat keeps stderr) and return {} —
-    unprocessed replies stay in state for the next run anyway.
+    on error we warn to stderr (heartbeat keeps stderr) and return {}. Known
+    gap: with {} this batch's churn replies route as ordinary replies and ARE
+    marked processed — their cancel reasons are NOT retried later (the raw
+    reply survives in mailbox/triage/inbound-*.jsonl for manual recovery).
     """
     try:
         from runtime.db import connect  # noqa: E402
