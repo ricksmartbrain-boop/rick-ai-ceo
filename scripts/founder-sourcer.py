@@ -563,6 +563,79 @@ def upsert_prospect(conn, lead: dict) -> str:
 # 4. DRAFT — roast-led value-first email into the gated outbox
 # ---------------------------------------------------------------------------
 
+# Greeting policy (2026-07-16): drafts used to open with the raw HN username
+# ("Hey asm28208 —", "Hey workplace_1 —") — an instant bot-tell. A first name
+# is used ONLY when confidently derivable; everything else gets the neutral
+# "Hey —". Deterministic on purpose (rule 5: code answers, not a model).
+FIRST_NAMES = frozenset("""
+    aaron adam adrian ahmed alan albert alberto alejandro alex alexander
+    alexandra alexei alexis ali alice amanda amir amit amy ana anders andre
+    andrea andreas andrei andres andrew andy angela anil anita anna anne
+    anthony anton antonio arjun arthur arun ashley barbara ben benjamin bill
+    bob boris brad brandon brian bruce bruno bryan cameron carl carla carlos
+    carol caroline catherine chad charles charlie chen chloe chris christian
+    christina christine christopher cindy claire clara claude claudia colin
+    connor craig dale damien dan dana daniel daniela danny dario darren dave
+    david dean dennis derek diana diego dinesh dmitri dmitry dominic don
+    donald donna doug douglas duncan dustin dylan eddie edgar eduardo edward
+    elena eli elias elizabeth ellen emil emily emma enrique eric erik erin
+    ethan eugene eva evan fabian felipe felix fernando filip florian
+    francesco francis francisco frank fred gabriel gary gavin geoffrey george
+    giovanni glenn gordon grace graham grant greg gregory guido guillaume
+    hannah hans harold harry hassan heather hector helen henrik henry holly
+    howard hugo ian igor ilya irene isaac isabel ivan jack jackson jacob
+    jacques jaime jake james jamie jan jane janet jason javier jay jean jeff
+    jeffrey jennifer jenny jeremy jerome jerry jesse jessica jill jim jimmy
+    joanna joe joel johan johannes john johnny jon jonas jonathan jordan
+    jorge jose josef joseph josh joshua juan judith julia julian julie
+    julien justin kai karen karl kate katherine kathleen kathy katie keith
+    kelly ken kenneth kevin kim kirill klaus kumar kurt kyle lars laura
+    lauren laurent lawrence lee leon leonard leonardo leslie liam linda lisa
+    logan lorenzo louis luca lucas luis luke madison manuel marc marcel
+    marco marcos marcus margaret maria marie marina mario marius mark marko
+    martin mary mateo matt matthew matthias mauricio max maxim maya megan
+    mehmet melissa michael michel michelle miguel mikael mike mikhail milan
+    miles mohamed mohammed monica morgan moritz nadia nancy natalia natalie
+    nathan neil nick nicolas nicole nikhil niklas nikolai nina noah nora
+    norman oliver olivia omar oscar owen pablo pamela paolo pascal patricia
+    patrick paul paula paulo pavel pedro peter phil philip philipp philippe
+    pierre piotr priya rachel rafael rahul raj rajesh ralph ramon randy raul
+    ravi ray raymond rebecca ricardo richard rick rob robert roberto robin
+    rodrigo roger roland roman ron ronald ross roy ruben russell ruth ryan
+    sam samantha samir samuel sandeep sandra sanjay sara sarah sasha scott
+    sean sebastian sergei sergey sergio seth shane shannon sharon shawn
+    simon simone sofia sonia sophia sophie stefan stefano stephanie stephen
+    steve steven stuart sunil suresh susan sven tanya tara ted teresa terry
+    theo thomas tiago tim timothy tina tobias todd tom tomas tommy tony
+    travis trevor tristan tyler valentin vanessa victor victoria vijay
+    vikram vincent vinod vlad vladimir walter wayne wei wendy werner wesley
+    will william wolfgang xavier yann yuri yusuf zach zachary
+""".split())
+
+
+def greeting_name(username: str, provided: str = "") -> str:
+    """First name for a cold-draft greeting, or "" when not confidently
+    derivable. A name comes ONLY from (a) `provided` — a display name the
+    founder's own page/profile published — or (b) an HN username that IS a
+    plausible first name: pure alpha, 3-12 chars, and in FIRST_NAMES.
+    A string containing digits or underscores is NEVER used as a name."""
+    tokens = (provided or "").split()
+    if tokens:
+        first = tokens[0].strip(".,")
+        if first.isalpha() and 2 <= len(first) <= 20:
+            return first[0].upper() + first[1:]
+    u = (username or "").strip().lower()
+    if u.isalpha() and 3 <= len(u) <= 12 and u in FIRST_NAMES:
+        return u.capitalize()
+    return ""
+
+
+def greeting(username: str, provided: str = "") -> str:
+    """Greeting line: 'Hey Daniel —' when a name is derivable, else 'Hey —'."""
+    name = greeting_name(username, provided)
+    return f"Hey {name} —" if name else "Hey —"
+
+
 def _observations(facts: dict, story: dict) -> list[str]:
     obs: list[str] = []
     h1 = facts.get("h1") or facts.get("title") or ""
@@ -600,7 +673,7 @@ def _fallback_body(lead: dict, facts: dict) -> str:
     product = lead["title"].removeprefix("Show HN:").strip() or lead["domain"]
     return (
         f"**Subject:** roasted {lead['domain']} (free, takes you 0 minutes)\n\n"
-        f"Hey {lead['author']},\n\n"
+        f"{greeting(lead['author'])}\n\n"
         f"Saw “{lead['title']}” on Show HN and poked around {lead['domain']}. "
         f"A few things jumped out:\n\n"
         f"{obs_md}\n\n"
@@ -618,12 +691,12 @@ def draft_email(lead: dict, facts: dict) -> str:
     output MUST carry subject line, CTA, disclosure and opt-out — anything
     missing means we use the fallback instead (predictable > clever)."""
     fallback = _fallback_body(lead, facts)
+    greet = greeting(lead["author"])
     prompt = (
         "Draft a short cold outreach email (under 180 words) from Rick, an AI "
         "revenue agent at meetrick.ai. Voice: direct, a little wry, zero "
         "corporate filler. Recipient: the founder below, who just posted on "
         "Show HN.\n\n"
-        f"Founder HN username: {lead['author']}\n"
         f"Show HN title: {lead['title']}\n"
         f"Product domain: {lead['domain']}\n"
         "Facts observed on their real landing page (use ONLY these, do not "
@@ -636,10 +709,12 @@ def draft_email(lead: dict, facts: dict) -> str:
         f"- page text excerpt: {facts.get('text_excerpt', '')[:800]}\n\n"
         "Requirements (all mandatory):\n"
         "1. Start with a line exactly like: **Subject:** <subject>\n"
-        "2. 2-3 SPECIFIC observations about THEIR page from the facts above.\n"
-        "3. Offer a free deep roast with exactly one CTA link: " + CTA_URL + "\n"
-        "4. Include this disclosure verbatim: " + DISCLOSURE + "\n"
-        "5. End with this opt-out verbatim: " + OPT_OUT + "\n"
+        "2. Open the body with exactly this greeting line: " + greet + "\n"
+        "   Never greet by HN username and never invent a name.\n"
+        "3. 2-3 SPECIFIC observations about THEIR page from the facts above.\n"
+        "4. Offer a free deep roast with exactly one CTA link: " + CTA_URL + "\n"
+        "5. Include this disclosure verbatim: " + DISCLOSURE + "\n"
+        "6. End with this opt-out verbatim: " + OPT_OUT + "\n"
         "Output ONLY the email body markdown, nothing else."
     )
     try:
@@ -649,7 +724,10 @@ def draft_email(lead: dict, facts: dict) -> str:
     except Exception as e:
         _log("draft.llm_error", domain=lead["domain"], error=str(e)[:160])
         return fallback
-    required = ("**Subject:**", CTA_URL, "Vlad", "no thanks")
+    # `greet` in required markers: a draft that greets any other way (e.g. by
+    # raw HN username) is rejected and the fallback — which always greets
+    # correctly — ships instead.
+    required = ("**Subject:**", greet, CTA_URL, "Vlad", "no thanks")
     if all(marker in body for marker in required) and len(body) < 4000:
         return body + ("\n" if not body.endswith("\n") else "")
     _log("draft.llm_output_rejected", domain=lead["domain"], length=len(body))

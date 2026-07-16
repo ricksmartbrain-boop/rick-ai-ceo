@@ -63,8 +63,17 @@ python3 "$ROOT_DIR/skills/executive-control/scripts/update-scoreboard.py"
 # cd -P resolves the ~/clawd symlink: the git repo lives at the physical workspace path, not ~/clawd.
 # No-ops quietly when nothing changed; failure is LOUD but never blocks the nightly.
 SNAP_DIR="$(cd -P "$(dirname "$0")/.." && pwd)"
+# Secret-scan gate (2026-07-16): never commit a snapshot whose staged diff adds
+# credential-shaped lines. Each literal below is quote-split so the gate cannot
+# match its own definition when this script itself is in the staged diff.
+# Scans ADDED lines only (-U0, '+' prefix, '+++' headers dropped); grep without
+# -q so pipefail never sees a SIGPIPE'd upstream. On hit: abort the snapshot
+# LOUDLY, skip the commit, keep running — the gate must never block the nightly.
+LEAK_PATTERNS='sk_''live|sk-''ant|sk-''proj|re_[A-Za-z0-9_]{25,}|AI''za|xox[bpsoa]|gh''p_|AK''IA|PRIVATE'' KEY|"cookies":\['
 if git -C "$SNAP_DIR" add -A && git -C "$SNAP_DIR" diff-index --quiet --cached HEAD --; then
   echo "[ok] nightly snapshot: no changes"
+elif git -C "$SNAP_DIR" diff --cached -U0 | grep -E '^\+' | grep -Ev '^\+\+\+' | grep -E "$LEAK_PATTERNS" >/dev/null; then
+  echo "[error] nightly snapshot ABORTED — staged diff matches a secret/leak pattern; NOTHING committed. Inspect 'git -C $SNAP_DIR diff --cached', scrub the secret, and snapshot will resume next night." >&2
 elif git -C "$SNAP_DIR" commit -m "nightly snapshot $(date +%F)" >/dev/null; then
   echo "[ok] nightly snapshot: committed"
 else

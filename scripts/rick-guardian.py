@@ -647,6 +647,12 @@ def check_sequence_integrity(alerts: list) -> dict:
       orphaned   — job exists but enabled=0                      -> alert
       failed     — job gone, ran, but never status='ok'          -> alert
       phantom    — job gone and never ran (was it ever created?) -> alert
+
+    Explicit closure (2026-07-16): a 'sequence_closed' customer_event whose
+    payload names the enrollment event id ("enrollment_event") marks THAT
+    enrollment reconciled (canceled/superseded — no sends owed), so its
+    broken crons stop alerting. Per-enrollment only: new enrollments have no
+    closure row and still alert.
     """
     con = sqlite3.connect(DB_FILE, timeout=5)
     try:
@@ -656,6 +662,18 @@ def check_sequence_integrity(alerts: list) -> dict:
             "LEFT JOIN customers c ON c.id = ce.customer_id "
             "WHERE ce.event_type = 'sequence_enrolled'"
         ).fetchall()
+        closed_markers: dict = {}
+        for (closure_raw,) in con.execute(
+            "SELECT payload_json FROM customer_events "
+            "WHERE event_type = 'sequence_closed'"
+        ).fetchall():
+            try:
+                closure = json.loads(closure_raw or "{}")
+            except Exception:
+                continue
+            ref = closure.get("enrollment_event")
+            if ref:
+                closed_markers[str(ref)] = str(closure.get("reason") or "")[:160]
     finally:
         con.close()
 
@@ -666,9 +684,14 @@ def check_sequence_integrity(alerts: list) -> dict:
     enrollments = []
     broken_now: list[str] = []
     broken_stale: list[str] = []
+    closed: list[dict] = []
     non_cron = 0
     try:
         for event_id, created_at, payload_raw, email in rows:
+            if event_id in closed_markers:
+                closed.append({"event": event_id,
+                               "reason": closed_markers[event_id]})
+                continue
             try:
                 payload = json.loads(payload_raw or "{}")
             except Exception:
@@ -738,7 +761,8 @@ def check_sequence_integrity(alerts: list) -> dict:
     finally:
         ccon.close()
     return {"cron_enrollments": enrollments, "non_cron_enrollments": non_cron,
-            "broken": broken_now, "broken_stale": broken_stale}
+            "broken": broken_now, "broken_stale": broken_stale,
+            "closed": closed}
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +822,71 @@ def check_cron_send_bypass(alerts: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Check: nightly heartbeat (pipeline must log completion every night)
+# ---------------------------------------------------------------------------
+NIGHTLY_LOG = DATA_ROOT / "logs" / "cron" / "nightly.log"
+NIGHTLY_MARKER = "Nightly run complete."
+NIGHTLY_MAX_AGE_HOURS = 26.0
+NIGHTLY_INCOMPLETE_GRACE_HOURS = 2.0
+
+def check_nightly_heartbeat(alerts: list) -> dict:
+    """The nightly pipeline must log 'Nightly run complete.' within 26h.
+
+    Jul 14-16 the 03:00 crontab entry silently never fired (Mac asleep at
+    03:00; macOS cron never runs missed jobs) — 3 nights of stripe-poll
+    revenue truth, retro, brief and snapshot lost with zero alerting. The
+    nightly now runs via LaunchAgent ai.rick.nightly (launchd DOES run missed
+    StartCalendarInterval jobs on wake); this is the tripwire if that
+    regresses.
+
+    run-nightly.sh writes no timestamps, so recency comes from log mtime:
+      - mtime older than 26h                    -> nothing ran     -> alert
+      - marker on the last non-blank line       -> completed run   -> healthy
+      - fresh mtime, no tail marker, >2h quiet  -> started, died   -> alert
+      - fresh mtime, no tail marker, <=2h quiet -> likely mid-run  -> ok
+    log-rotate.sh truncates keeping the last 2MB in place, so a completed
+    run's tail marker survives rotation.
+    """
+    if not NIGHTLY_LOG.exists():
+        alerts.append(alert(
+            "guardian:nightly_heartbeat",
+            f"🚨 [rick-guardian] NIGHTLY DEAD: {NIGHTLY_LOG} does not exist — "
+            f"the nightly pipeline (stripe-poll revenue truth, retro, brief, "
+            f"snapshot) is not logging at all. Check 'launchctl list "
+            f"ai.rick.nightly'.",
+        ))
+        return {"state": "log_missing"}
+    age_h = (NOW.timestamp() - NIGHTLY_LOG.stat().st_mtime) / 3600.0
+    last_line = next(
+        (ln for ln in reversed(_tail_lines(NIGHTLY_LOG)) if ln.strip()), "")
+    completed_at_tail = NIGHTLY_MARKER in last_line
+    if age_h > NIGHTLY_MAX_AGE_HOURS:
+        # Whole-night granularity keeps the dedupe hash stable for a day,
+        # then escalates naturally each additional missed night.
+        alerts.append(alert(
+            "guardian:nightly_heartbeat",
+            f"🚨 [rick-guardian] NIGHTLY DEAD: no '{NIGHTLY_MARKER}' for "
+            f"{int(age_h // 24)} night(s) — nightly.log untouched >26h. "
+            f"stripe-poll revenue truth, retro, morning brief and git "
+            f"snapshot are NOT running. Check 'launchctl list "
+            f"ai.rick.nightly' and the log tail.",
+        ))
+        return {"state": "stale", "log_age_hours": round(age_h, 1),
+                "tail_completed": completed_at_tail}
+    if not completed_at_tail and age_h > NIGHTLY_INCOMPLETE_GRACE_HOURS:
+        alerts.append(alert(
+            "guardian:nightly_heartbeat",
+            f"🚨 [rick-guardian] NIGHTLY INCOMPLETE: nightly.log does not end "
+            f"with '{NIGHTLY_MARKER}' — the last run started but died "
+            f"partway (log quiet >{NIGHTLY_INCOMPLETE_GRACE_HOURS:.0f}h). "
+            f"Tail the log for where it stopped.",
+        ))
+        return {"state": "incomplete", "log_age_hours": round(age_h, 1)}
+    return {"state": "healthy" if completed_at_tail else "in_progress",
+            "log_age_hours": round(age_h, 1)}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -822,6 +911,7 @@ def main() -> int:
         ("approval_integrity", check_approval_integrity),
         ("sequence_integrity", check_sequence_integrity),
         ("cron_send_bypass", check_cron_send_bypass),
+        ("nightly_heartbeat", check_nightly_heartbeat),
     ]
     alerts: list[str] = []
     results: dict = {}

@@ -49,6 +49,12 @@ ROAST_TERMS = ["roast", "audit", "feedback", "review my", "findings"]
 AUTO_MARKERS = ["no-reply", "noreply", "donotreply", "do-not-reply",
                 "mailer-daemon", "postmaster", "notification", "unsubscribe",
                 "automated", "out of office", "auto-reply", "delivery status"]
+# Platform-notification senders (2026-07-16): bulk product mail that is never
+# a human reply (a facebookmail reminder hit the call-queue on Jul 15).
+# Matched against the sender only, so a lead mentioning e.g. "linkedin.com"
+# in a subject still gets classified.
+PLATFORM_SENDERS = ["facebookmail.com", "linkedin.com", "producthunt.com",
+                    "notifications.resend.com", "instagram.com"]
 
 
 def _now():
@@ -79,7 +85,10 @@ def save_state(state):
 
 
 def is_automated(sender, subject):
-    blob = ((sender or "") + " " + (subject or "")).lower()
+    sender_l = (sender or "").lower()
+    if any(d in sender_l for d in PLATFORM_SENDERS):
+        return True
+    blob = (sender_l + " " + (subject or "").lower())
     return any(m in blob for m in AUTO_MARKERS)
 
 

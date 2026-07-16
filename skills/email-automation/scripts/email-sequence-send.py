@@ -40,6 +40,7 @@ SEQUENCES_DIR = DATA_ROOT / "mailbox" / "sequences"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 SENT_DIR = DATA_ROOT / "mailbox" / "sent"
 LOG_FILE = DATA_ROOT / "operations" / "email-sequence-send.jsonl"
+SENDS_LEDGER = DATA_ROOT / "operations" / "email-sends.jsonl"  # bounce-rate-guardian denominator
 SUPPRESSION_FILE = DATA_ROOT / "mailbox" / "suppression.txt"
 WARMUP_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "sender-warmup-schedule.py"
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -398,6 +399,19 @@ def deliver_draft(
     if ok:
         ensure_parent(sent_target)
         md_path.rename(sent_target)
+        # Ops send ledger — bounce-rate-guardian counts its denominator
+        # from this file; row shape matches campaign-engine.py.
+        try:
+            ensure_parent(SENDS_LEDGER)
+            with SENDS_LEDGER.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    {"message_id": info.get("id") or "",
+                     "status": "sent",
+                     "to": to_email,
+                     "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    sort_keys=True) + "\n")
+        except OSError as exc:
+            print(f"email-sends.jsonl append failed (send already out): {exc}", file=sys.stderr)
         return {
             "file": str(sent_target),
             "sequence": sequence_name,
