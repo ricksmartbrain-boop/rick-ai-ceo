@@ -7,6 +7,7 @@ import argparse
 import calendar
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 SEQUENCES_DIR = DATA_ROOT / "mailbox" / "sequences"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 LOG_FILE = DATA_ROOT / "operations" / "email-sequence-dispatch.jsonl"
+RUNTIME_DB = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
 
 
 def now() -> datetime:
@@ -78,6 +80,35 @@ def render_template(raw: str, enrollment: dict) -> str:
     return rendered
 
 
+def renewal_block_reason(enrollment: dict) -> str | None:
+    """Reason to withhold a renewal-class step (template 'renewal-*'), else None.
+
+    Stripe cancels flip customers.status ('canceling'/'canceled', stripe-poll)
+    but nothing closes the JSON sequence enrollment — without this check the
+    day-25 "your subscription renews" notice goes to customers who already
+    canceled (every voluntary cancel to date happened by day 23), a false
+    renewal + access claim. Read-only lookup at draft time; fail-closed for
+    this step only — a renewal claim that cannot be verified is not sent,
+    while other steps and enrollees dispatch normally.
+    """
+    email = str(enrollment.get("email", "")).strip().lower()
+    if not email:
+        return "no-email"
+    if not RUNTIME_DB.exists():
+        return f"runtime-db-missing:{RUNTIME_DB}"
+    try:
+        connection = sqlite3.connect(f"file:{RUNTIME_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = connection.execute("SELECT status FROM customers WHERE email = ?", (email,)).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as err:
+        return f"customers-lookup-failed:{err}"
+    if row is not None and str(row[0]) in ("canceling", "canceled"):
+        return f"customer-{row[0]}"
+    return None
+
+
 def due_steps(payload: dict, current_time: datetime) -> list[tuple[dict, dict]]:
     steps = payload.get("steps", [])
     enrollments = payload.get("enrollments", [])
@@ -119,6 +150,24 @@ def dispatch_sequence(config_path: Path, *, current_time: datetime, dry_run: boo
     ensure_parent(sequence_outbox / ".keep")
 
     for enrollment, step in due_steps(payload, current_time):
+        if str(step.get("template", "")).startswith("renewal-"):
+            block = renewal_block_reason(enrollment)
+            if block is not None:
+                if not dry_run and block.startswith("customer-"):
+                    # Verified cancel: the rest of the sequence is moot; close
+                    # the enrollment so a future re-purchase can re-enroll
+                    # (find_active_sequence_enrollment only matches 'active').
+                    enrollment["status"] = "cancelled"
+                dispatched.append(
+                    {
+                        "sequence": sequence_name,
+                        "email": enrollment.get("email", ""),
+                        "step": int(step.get("step", 0) or 0),
+                        "status": "renewal-withheld",
+                        "reason": block,
+                    }
+                )
+                continue
         template_path = config_path.parent / str(step.get("template", ""))
         if not template_path.exists():
             dispatched.append(

@@ -561,6 +561,76 @@ class RuntimeWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(sequence_payload["enrollments"][0]["current_step"], 1)
 
+    def test_dispatch_withholds_renewal_notice_from_canceled_customers(self) -> None:
+        # WHY: stripe-poll flips customers.status on cancel but nothing closes
+        # the JSON sequence enrollment, and every voluntary cancel to date
+        # happened by day 23 — so without a draft-time guard the day-25
+        # "your subscription renews" notice reaches exactly the customers it
+        # is false for (renewal, continued access, reply-to-cancel). The
+        # renewal-class step must be withheld and the moot enrollment closed;
+        # the same step must still draft for active subscribers.
+        subscription = {
+            "title": "LinguaLive Subscription",
+            "slug": "lingualive-subscription",
+            "project": "rick-v6",
+            "context_json": "{}",
+        }
+        config_path, _ = self.engine.ensure_post_purchase_sequence(
+            source_workflow=subscription,
+            customer_email="canceled@example.com",
+            customer_name="Gone Buyer",
+            delivery_url="https://www.lingualive.ai",
+        )
+        for email in ("canceled@example.com", "active@example.com"):
+            self.engine.enroll_post_purchase_sequence(
+                sequence_config_path=config_path,
+                email=email,
+                customer_name="Buyer",
+                delivery_url="https://www.lingualive.ai",
+                product_name="LinguaLive Subscription",
+                workflow_id="wf_renewal_guard",
+            )
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        for enrollment in payload["enrollments"]:
+            enrollment["enrolled_at"] = "2026-06-01T09:00:00"  # day 25 long past
+            enrollment["current_step"] = 4
+            enrollment["sent_steps"] = [1, 2, 3, 4]
+        config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        now = self.engine.now_iso()
+        for customer_id, email, status in (
+            ("cust_gone", "canceled@example.com", "canceled"),
+            ("cust_live", "active@example.com", "active"),
+        ):
+            self.connection.execute(
+                "INSERT INTO customers (id, email, name, source, status, tags_json, metadata_json,"
+                " created_at, updated_at, last_seen_at) VALUES (?, ?, 'Buyer', 'stripe', ?, '[]', '{}', ?, ?, ?)",
+                (customer_id, email, status, now, now, now),
+            )
+        self.connection.commit()
+
+        dispatcher = self.load_script_module(
+            "email_sequence_dispatch_renewal_guard",
+            ROOT_DIR / "skills" / "email-automation" / "scripts" / "email-sequence-dispatch.py",
+        )
+        events = dispatcher.dispatch_sequence(config_path, current_time=dispatcher.now())
+        by_email = {event["email"]: event for event in events}
+        self.assertEqual(by_email["canceled@example.com"]["status"], "renewal-withheld")
+        self.assertEqual(by_email["canceled@example.com"]["reason"], "customer-canceled")
+        self.assertEqual(by_email["active@example.com"]["status"], "drafted")
+
+        refreshed = json.loads(config_path.read_text(encoding="utf-8"))
+        by_enrollment = {e["email"]: e for e in refreshed["enrollments"]}
+        self.assertEqual(by_enrollment["canceled@example.com"]["status"], "cancelled")
+        self.assertNotIn(5, by_enrollment["canceled@example.com"]["sent_steps"])
+        self.assertEqual(by_enrollment["active@example.com"]["status"], "completed")
+        self.assertIn(5, by_enrollment["active@example.com"]["sent_steps"])
+        draft_files = list(
+            (self.data_root / "mailbox" / "outbox" / "lingualive-subscription-post-purchase").glob("*step5.md")
+        )
+        self.assertEqual(len(draft_files), 1)
+        self.assertIn("active-at-example-com", draft_files[0].name)
+
     def test_sequence_enroll_empty_slug_fails_loud(self) -> None:
         # WHY: a hardcoded "" slug named a junk '-post-purchase' sequence dir
         # and double-enrolled a real customer (justynovo, 2026-07-16). An
