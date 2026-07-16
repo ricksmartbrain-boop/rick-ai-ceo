@@ -7,9 +7,14 @@ Extends the earlier checkout-only poller to a full revenue-event bridge:
     -------------------------------------  --------------------------------------
     checkout.session.completed            -> queue post_purchase_fulfillment
                                              + dispatch purchase_completed event
-    invoice.payment_succeeded             -> dispatch renewal_confirmed event
-    invoice.payment_failed                -> dispatch payment_failed event
-    customer.subscription.deleted         -> dispatch subscription_cancelled event
+    invoice.payment_succeeded             -> cancel pending dunning items
+                                             + dispatch renewal_confirmed event
+    invoice.payment_failed                -> queue dunning episode (2 gated
+                                             outbox emails max, deduped per
+                                             (customer, invoice))
+                                             + dispatch payment_failed event
+    customer.subscription.deleted         -> cancel pending dunning items
+                                             + dispatch subscription_cancelled event
     customer.subscription.trial_will_end  -> dispatch trial_expiring event
     charge.refunded                       -> dispatch charge_refunded event
 
@@ -37,6 +42,18 @@ stays thin — policy is in the reactions config, not here.
   * `--dry-run` flag: Stripe GETs only — no engine dispatch, no DB writes,
     no state file writes.
 
+2026-07-16 dunning machinery (involuntary churn — rodrigues_graciano lost
+$15.98 LTV to a Mar-10 card failure with ZERO contact):
+  * invoice.payment_failed on a Rick/LinguaLive product now queues a capped
+    2-email fix-your-card episode through the gated outbox (day-0 + day-3
+    reminder via send_after), linking the invoice's Stripe-hosted pay/update
+    URL. Deduped per (customer, invoice) via an idempotent 'payment_failed'
+    customer_events row. See the Dunning section below for why the hosted
+    invoice URL and not the billing portal.
+  * invoice.payment_succeeded / customer.subscription.deleted cancel any
+    still-pending dunning items for that customer (never nag after recovery
+    or after the sub is terminally gone).
+
 State file at `~/rick-vault/operations/stripe-poll-state.json` tracks
 `last_poll_timestamp`, `processed_event_ids` (kept to last 500), and
 `subscription_statuses` (last known status per subscription id).
@@ -51,12 +68,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 STATE_FILE = DATA_ROOT / "operations" / "stripe-poll-state.json"
+OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
+DUNNING_REMINDER_DAYS = 3
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT_DIR))
@@ -308,6 +327,273 @@ def _handle_checkout_completed(conn, payload: dict, api_key: str, delivery_map: 
     )
 
 
+# --- Dunning (involuntary-churn) machinery, 2026-07-16 -----------------------
+#
+# invoice.payment_failed used to be dispatched into the engine and dropped
+# (event-reactions.json has no 'payment_failed' reaction) — rodrigues_graciano
+# churned 2026-03 after a card failure with zero contact ever. Detection point
+# is THIS poll: the meetrick-api webhook's handlePaymentFailed only flips its
+# own Railway Postgres row ('past_due') and console.logs — nothing local can
+# read it — and the subscription-status sync below sees 'past_due' without
+# invoice granularity, so it cannot dedupe per failure episode.
+#
+# Link choice (verified read-only 2026-07-16 against the live account): the
+# billing-portal configuration bpc_1KtVgm… exists but has
+# payment_method_update=False — a customer cannot fix a card there, and portal
+# sessions would need a Stripe POST at send time. invoice.hosted_invoice_url
+# is present on real failed invoices (checked rodrigues's in_1T9W0G…, status
+# 'open') and lets the customer pay the open invoice with a new card in one
+# step, no Stripe write needed. So: hosted_invoice_url.
+#
+# Episode = (customer, invoice). Hard cap 2 emails: day-0 'your payment
+# failed' + day-3 reminder queued up-front with send_after (the outbox drain
+# honors it); recovery or terminal cancel flips still-pending items to
+# 'cancelled'. The customer_events 'payment_failed' row is the idempotency
+# record — Stripe retries the same invoice repeatedly (rodrigues's invoice
+# shows attempt_count=5) and each retry emits a fresh event that must NOT
+# start a second episode. Shared Stripe account: invoices for non-Rick
+# products are skipped quietly (they belong to Vlad's other businesses).
+# Transactional send policy: dunning auto-sends through the gated pipeline
+# (is_send_allowed + channel state in email-send-outbox.py), like access
+# delivery — NOT held_pending_owner.
+
+
+def _invoice_product_ids(invoice: dict) -> list[str]:
+    """Product ids on an invoice's line items, across Stripe API shapes.
+
+    This account renders invoices with the newer shape where the product sits
+    at lines.data[].pricing.price_details.product (verified live 2026-07-16);
+    price.product / plan.product are kept for older-shaped events.
+    """
+    products: list[str] = []
+    lines = invoice.get("lines") if isinstance(invoice, dict) else None
+    rows = lines.get("data") if isinstance(lines, dict) else None
+    for line in rows or []:
+        if not isinstance(line, dict):
+            continue
+        price = line.get("price") if isinstance(line.get("price"), dict) else {}
+        plan = line.get("plan") if isinstance(line.get("plan"), dict) else {}
+        pricing = line.get("pricing") if isinstance(line.get("pricing"), dict) else {}
+        details = pricing.get("price_details") if isinstance(pricing.get("price_details"), dict) else {}
+        for candidate in (price.get("product"), plan.get("product"), details.get("product")):
+            if isinstance(candidate, str) and candidate not in products:
+                products.append(candidate)
+    return products
+
+
+def _dunning_episode_exists(conn, customer_id: str, invoice_id: str) -> bool:
+    """True if a payment_failed customer_event for this invoice already exists."""
+    rows = conn.execute(
+        "SELECT payload_json FROM customer_events "
+        "WHERE customer_id = ? AND event_type = 'payment_failed'",
+        (customer_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("invoice_id") == invoice_id:
+            return True
+    return False
+
+
+def _dunning_bodies(first_name: str, product_name: str, amount_usd: float, pay_url: str) -> tuple[str, str]:
+    """Day-0 + day-3 dunning email bodies. Plain ASCII on purpose — Don Roth's
+    access email was bounced by duck.com for unicode-in-headers (2026-07-13)."""
+    author = os.getenv("RICK_PUBLIC_AUTHOR", "Rick")
+    amount = f"${amount_usd:.2f}" if amount_usd else "latest"
+    day0 = (
+        f"**Subject:** Your {product_name} payment did not go through\n\n"
+        f"Hi {first_name},\n\n"
+        f"Quick heads-up: the {amount} charge for {product_name} did not go\n"
+        f"through. Cards expire and banks get cautious -- it happens.\n\n"
+        f"You can pay the open invoice and update your card in one step here:\n\n"
+        f"{pay_url}\n\n"
+        f"Your access stays active for now and Stripe will retry automatically,\n"
+        f"but the link above fixes it fastest. If anything looks off, just\n"
+        f"reply to this email.\n\n"
+        f"-- {author}\n"
+    )
+    day3 = (
+        f"**Subject:** Reminder: {product_name} payment still needs a fix\n\n"
+        f"Hi {first_name},\n\n"
+        f"A few days ago the {amount} charge for {product_name} failed, and it\n"
+        f"still has not gone through. To keep your access, you can pay the open\n"
+        f"invoice and update your card here (takes about a minute):\n\n"
+        f"{pay_url}\n\n"
+        f"If you meant to cancel instead -- no hard feelings, just reply and I\n"
+        f"will take care of it.\n\n"
+        f"-- {author}\n"
+    )
+    return day0, day3
+
+
+def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) -> str:
+    """Queue the capped 2-email dunning episode for a failed Rick invoice.
+
+    Idempotent per (customer, invoice): deterministic outbox filenames make a
+    crash between file-write and commit safe to retry, and the committed
+    customer_events row stops every later Stripe retry of the same invoice
+    from starting a second episode.
+    """
+    obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+    invoice_id = str(obj.get("id") or "")
+    email = _extract_email(obj)
+
+    from runtime.revenue_signals import RICK_REAL_PRODUCT_IDS  # type: ignore
+    products = _invoice_product_ids(obj)
+    matched = [p for p in products if p in RICK_REAL_PRODUCT_IDS]
+    if not matched:
+        # Shared Stripe account — other businesses' failed invoices are normal here.
+        return (
+            f"invoice.payment_failed {invoice_id or '<no-id>'} "
+            f"(non-Rick products {products or ['<none>']} — no dunning)"
+        )
+    if not invoice_id or not email:
+        print(
+            f"ERROR: payment_failed invoice={invoice_id or '<no-id>'} "
+            f"email={email or '<none>'} — dunning impossible.",
+            file=sys.stderr,
+        )
+        return f"invoice.payment_failed (missing invoice id or email — dunning skipped LOUDLY)"
+
+    row = conn.execute(
+        "SELECT id, name FROM customers WHERE lower(email) = lower(?)", (email,)
+    ).fetchone()
+    if row is None:
+        print(
+            f"ERROR: payment_failed for {email} ({invoice_id}) has no customers row — "
+            f"dunning skipped, backfill needed.",
+            file=sys.stderr,
+        )
+        return f"invoice.payment_failed {invoice_id} (no customers row for {email} — dunning skipped LOUDLY)"
+    if _dunning_episode_exists(conn, row["id"], invoice_id):
+        return f"invoice.payment_failed {invoice_id} (episode already recorded — dedupe, nothing queued)"
+
+    pay_url = str(obj.get("hosted_invoice_url") or "")
+    if not pay_url:
+        # Transient lookup failures raise so the poll window holds + retries.
+        pay_url = str(
+            _stripe_get(api_key, f"/v1/invoices/{invoice_id}").get("hosted_invoice_url") or ""
+        )
+    if not pay_url:
+        print(
+            f"ERROR: invoice {invoice_id} has no hosted_invoice_url — dunning email "
+            f"would have no fix link, skipped.",
+            file=sys.stderr,
+        )
+        return f"invoice.payment_failed {invoice_id} (no hosted_invoice_url — dunning skipped LOUDLY)"
+
+    entry = next(
+        (delivery_map.get(p) for p in matched if isinstance(delivery_map.get(p), dict)), None
+    )
+    product_name = str((entry or {}).get("name") or "your subscription")
+    first_name = (str(row["name"] or "").split() or ["there"])[0]
+    amount_due = obj.get("amount_due")
+    amount_usd = (amount_due / 100.0) if isinstance(amount_due, (int, float)) else 0.0
+    parent = obj.get("parent") if isinstance(obj.get("parent"), dict) else {}
+    sub_details = (
+        parent.get("subscription_details")
+        if isinstance(parent.get("subscription_details"), dict)
+        else {}
+    )
+    sub_id = str(obj.get("subscription") or sub_details.get("subscription") or "")
+
+    from runtime.engine import slugify_email  # type: ignore
+    now = datetime.now()
+    day0_body, day3_body = _dunning_bodies(first_name, product_name, amount_usd, pay_url)
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    base = f"dunning-{slugify_email(email)}-{invoice_id}"
+    outbox_files: list[str] = []
+    for suffix, item_type, body, send_after in (
+        ("day0", "dunning", day0_body, ""),
+        (
+            f"day{DUNNING_REMINDER_DAYS}",
+            "dunning-reminder",
+            day3_body,
+            (now + timedelta(days=DUNNING_REMINDER_DAYS)).isoformat(timespec="seconds"),
+        ),
+    ):
+        item = {
+            "to": email,
+            "status": "pending",
+            "type": item_type,
+            "cold": False,
+            "invoice_id": invoice_id,
+            "subscription_id": sub_id,
+            "product": product_name,
+            "body_markdown": body,
+            "created_at": now.isoformat(timespec="seconds"),
+        }
+        if send_after:
+            item["send_after"] = send_after
+        path = OUTBOX_DIR / f"{base}-{suffix}.json"
+        path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
+        outbox_files.append(path.name)
+
+    conn.execute(
+        "INSERT INTO customer_events (id, customer_id, workflow_id, event_type, payload_json, created_at) "
+        "VALUES (?, ?, NULL, 'payment_failed', ?, ?)",
+        (
+            f"evt_{uuid.uuid4().hex[:12]}",
+            row["id"],
+            json.dumps({
+                "invoice_id": invoice_id,
+                "subscription_id": sub_id,
+                "amount_usd": amount_usd,
+                "hosted_invoice_url": pay_url,
+                "outbox_files": outbox_files,
+                "source": "stripe-poll",
+            }),
+            now.isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    # stderr on purpose: the runners drop stdout but keep stderr in
+    # logs/cron/stripe-poll.err.log — the ops digest must see dunning starts.
+    line = (
+        f"DUNNING QUEUED: {email} invoice {invoice_id} (${amount_usd:.2f} "
+        f"{product_name}) day-0 + day-{DUNNING_REMINDER_DAYS} reminder"
+    )
+    print(line)
+    print(line, file=sys.stderr)
+    return f"invoice.payment_failed -> dunning queued ({', '.join(outbox_files)})"
+
+
+def _cancel_pending_dunning(email: str, *, cancelled_by: str) -> int:
+    """Flip still-pending dunning outbox items for this address to cancelled.
+
+    Runs on invoice.payment_succeeded (card fixed) and
+    customer.subscription.deleted (nothing left to dun) — a 'please update
+    your card' reminder must never land after the episode is over. Per-email
+    on purpose, not per-invoice: the customer just paid something or is gone;
+    any further card-nagging is noise.
+    """
+    if not email or not OUTBOX_DIR.exists():
+        return 0
+    cancelled = 0
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for path in sorted(OUTBOX_DIR.glob("dunning-*.json")):
+        try:
+            msg = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(msg, dict) or msg.get("status") != "pending":
+            continue
+        if str(msg.get("to") or "").strip().lower() != email.strip().lower():
+            continue
+        msg["status"] = "cancelled"
+        msg["cancelled_at"] = now_iso
+        msg["cancelled_by"] = cancelled_by
+        path.write_text(json.dumps(msg, indent=2) + "\n", encoding="utf-8")
+        cancelled += 1
+        line = f"DUNNING CANCELLED: {path.name} ({cancelled_by})"
+        print(line)
+        print(line, file=sys.stderr)
+    return cancelled
+
+
 _RICK_EVENT_FOR_STRIPE: dict[str, str] = {
     "checkout.session.completed": "purchase_completed",
     "invoice.payment_succeeded": "renewal_confirmed",
@@ -325,6 +611,16 @@ def _process_event(conn, event: dict, api_key: str, delivery_map: dict) -> tuple
     try:
         if event_type == "checkout.session.completed":
             return True, _handle_checkout_completed(conn, payload, api_key, delivery_map)
+        if event_type == "invoice.payment_failed":
+            description = _handle_payment_failed(conn, event, api_key, delivery_map)
+            _dispatch_rick_event(conn, "payment_failed", payload)
+            return True, description
+        if event_type in ("invoice.payment_succeeded", "customer.subscription.deleted"):
+            # Subscription objects carry no email — resolve via the customer id.
+            email = payload.get("email") or _customer_email(
+                api_key, str(payload.get("customer_id") or ""), {}
+            )
+            _cancel_pending_dunning(str(email or ""), cancelled_by=event_type)
         rick_event = _RICK_EVENT_FOR_STRIPE.get(event_type)
         if not rick_event:
             return True, f"{event_type} (no mapping — skipped)"
@@ -543,6 +839,11 @@ def main() -> int:
         processed_ids_list = []
     processed_ids = {str(x) for x in processed_ids_list}
     new_events = _filter_new_events(events, processed_ids)
+    # /v1/events returns newest-first; process chronologically so a recovery
+    # (invoice.payment_succeeded) that lands in the same window as an older
+    # payment failure cancels the dunning items AFTER they are queued, not
+    # before they exist.
+    new_events.sort(key=lambda e: int(e.get("created") or 0))
 
     conn = None
     if not dry_run:
