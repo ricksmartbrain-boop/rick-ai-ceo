@@ -289,6 +289,16 @@ def run(dry_run: bool = False) -> None:
     elif not dry_run:
         print(f"[nurture_runner] processed {steps_run} step(s)")
 
+    # ── Day-30 win-back scan (lapsed customers, not leads) ────────────────────
+    # Daily-gated inside the module; drafts ONE held_pending_owner outbox item
+    # per lapsed customer, ever — nothing sends without owner release. Failures
+    # are loud but must never break lead nurture above.
+    try:
+        from runtime.winback_scheduler import run_daily as _winback_run_daily
+        _winback_run_daily(dry_run=dry_run)
+    except Exception as exc:
+        print(f"[nurture_runner] winback scan FAILED: {exc}", file=sys.stderr)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Nurture sequence runner")
