@@ -37,6 +37,14 @@ class RuntimeWorkflowTests(unittest.TestCase):
                 "LINKEDIN_ACCESS_TOKEN": "linkedin-token",
                 "LINKEDIN_PERSON_URN": "urn:li:person:test",
                 "RICK_XPOST_BIN": "echo",
+                # Dead binary => dispatch_openclaw fails instantly and work()
+                # falls back to inline handlers. Without this, any test that
+                # drives work() on a machine with a live gateway delegates its
+                # jobs to REAL subagents (iris/remy) — burning tokens, writing
+                # junk into the live vault, and making assertions on tempdir
+                # state nondeterministic (observed 2026-07-16: sequence-enroll
+                # dedup test spawned two live iris runs per invocation).
+                "RICK_OPENCLAW_BIN": "/usr/bin/false",
                 "RICK_PUBLIC_AUTHOR": "Rick",
                 "RICK_BRAND_BLURB": "Autonomous operator building public revenue systems.",
                 "BEEHIIV_API_KEY": "test-beehiiv-key",
