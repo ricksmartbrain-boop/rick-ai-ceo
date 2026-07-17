@@ -1272,5 +1272,41 @@ class DunningHardeningTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "cancelled")
 
 
+class FollowupSequenceParseTests(unittest.TestCase):
+    """Deal-close follow-ups were theater until 2026-07-17: outbox items had
+    status='scheduled' (no consumer) and no subject/body. The fix hinges on
+    parsing the LLM's '## Day N' output into real emails — if this parser
+    breaks, follow-ups silently regress to empty drafts."""
+
+    def _parser(self):
+        import runtime.skill_handlers.phase1 as phase1
+        return phase1._parse_followup_emails
+
+    def test_parses_three_sections_with_subjects_and_bodies(self) -> None:
+        text = (
+            "## Day 2: Value-add\n\n**Subject:** One thing most founders miss\n\n"
+            "Hi there,\n\nBody two.\n\n— Rick\n\n"
+            "## Day 5: Proof\n\n**Subject:** This week in Rick's operations\n\n"
+            "Body five with {{checkout_url}}.\n\n— Rick\n\n"
+            "## Day 10: Last chance\n\n**Subject:** Closing the loop\n\nBody ten.\n\n— Rick"
+        )
+        emails = self._parser()(text)
+        self.assertEqual(sorted(emails), [2, 5, 10])
+        self.assertEqual(emails[2][0], "One thing most founders miss")
+        self.assertIn("Body five", emails[5][1])
+        self.assertNotIn("**Subject:**", emails[10][1])
+
+    def test_mangled_section_is_dropped_not_invented(self) -> None:
+        # Day 5 has no Subject line — it must be dropped so the handler
+        # reports the gap loudly instead of sending a subjectless email.
+        text = (
+            "## Day 2: Value-add\n\n**Subject:** Real subject\n\nBody two.\n\n"
+            "## Day 5: Proof\n\nNo subject line here at all.\n\n"
+            "## Day 10: Last\n\n**Subject:** Final\n\nBody ten.\n"
+        )
+        emails = self._parser()(text)
+        self.assertEqual(sorted(emails), [2, 10])
+
+
 if __name__ == "__main__":
     unittest.main()

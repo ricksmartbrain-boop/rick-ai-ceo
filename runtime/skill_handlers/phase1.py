@@ -836,6 +836,34 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
     )
 
 
+def _parse_followup_emails(text: str) -> dict:
+    """Split '## Day N' LLM follow-up output into {day: (subject, body)}.
+
+    Sections the model mangles (no subject or empty body) are dropped —
+    handle_followup_sequence surfaces the gap loudly in its summary.
+    """
+    emails: dict = {}
+    sections = re.split(r"(?m)^##\s*Day\s+(\d+)[^\n]*\n", text)
+    for i in range(1, len(sections) - 1, 2):
+        try:
+            day = int(sections[i])
+        except ValueError:
+            continue
+        body_lines = sections[i + 1].strip().splitlines()
+        subject = ""
+        body_start = 0
+        for j, ln in enumerate(body_lines[:5]):
+            m = re.match(r"^\*\*Subject:\*\*\s*(.+)", ln, re.IGNORECASE)
+            if m:
+                subject = m.group(1).strip()[:120]
+                body_start = j + 1
+                break
+        body = "\n".join(body_lines[body_start:]).strip()
+        if subject and body:
+            emails[day] = (subject, body)
+    return emails
+
+
 def handle_followup_sequence(connection: sqlite3.Connection, workflow: sqlite3.Row, job: sqlite3.Row) -> StepOutcome:
     """Create follow-up emails for day 2, 5, and 10."""
     context = json_loads(workflow["context_json"])
@@ -881,11 +909,24 @@ def handle_followup_sequence(connection: sqlite3.Connection, workflow: sqlite3.R
     )
     result = generate_text("writing", prompt, fallback)
 
-    # Write sequence to outbox with scheduled send dates
+    # Write sequence to outbox as owner-held drafts. Until 2026-07-17 these
+    # were status='scheduled' with no subject/body — a status no consumer
+    # sends, so every deal-close follow-up silently evaporated. Now they
+    # carry full content and are one status flip from sending. Auto-release
+    # stays off: the day-2/5 cadence conflicts with the 7-day cold-recipient
+    # cap in the unified gate (owner decision to change either).
     outbox_dir = DATA_ROOT / "mailbox" / "outbox"
     outbox_dir.mkdir(parents=True, exist_ok=True)
 
+    checkout_url = f"https://meetrick.ai/install?utm_source=followup&utm_campaign={slugify(lead_id)}"
+    emails = _parse_followup_emails(result.content)
+    written = []
     for day_offset, label in [(2, "day2"), (5, "day5"), (10, "day10")]:
+        parsed = emails.get(day_offset)
+        if parsed is None:
+            continue
+        subject, body = parsed
+        body = body.replace("{{checkout_url}}", checkout_url)
         send_after = (datetime.now() + timedelta(days=day_offset)).isoformat(timespec="seconds")
         outbox_file = outbox_dir / f"followup-{slugify(lead_id)}-{label}.json"
         write_file(outbox_file, json.dumps({
@@ -893,14 +934,24 @@ def handle_followup_sequence(connection: sqlite3.Connection, workflow: sqlite3.R
             "type": "followup",
             "sequence_step": label,
             "send_after": send_after,
-            "status": "scheduled",
+            "status": "held_pending_owner",
+            "cold": True,
+            "subject": subject,
+            "body_markdown": f"**Subject:** {subject}\n\n{body}",
             "created_at": now_iso(),
+            "source": "deal-close-followup",
         }, indent=2))
+        written.append(label)
 
     path = write_file(deal_dir / "followup-sequence.md", result.content)
 
+    missing = [lbl for _, lbl in [(2, "day2"), (5, "day5"), (10, "day10")] if lbl not in written]
+    summary = f"Follow-up drafts held for owner release ({', '.join(written) or 'NONE'})"
+    if missing:
+        summary += f" — PARSE FAILED for {', '.join(missing)}, see followup-sequence.md"
+
     return StepOutcome(
-        summary=f"Follow-up sequence created for {lead_id}: day 2, 5, 10",
+        summary=summary,
         artifacts=[{"kind": "followup-sequence", "title": "Follow-up Emails", "path": path, "metadata": {}}],
         workflow_stage="followup-scheduled",
     )
