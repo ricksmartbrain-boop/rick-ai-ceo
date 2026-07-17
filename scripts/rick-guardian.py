@@ -741,6 +741,52 @@ def _parse_lapse(meta: dict):
             continue
     return None
 
+def check_dunning_integrity(alerts: list) -> dict:
+    """Marked-but-unsent detector (2026-07-17): a dunning episode row commits
+    BEFORE its outbox files are written (crash-safe direction), so a crash in
+    that gap leaves a payment_failed row whose listed files exist nowhere —
+    the customer never gets the fix-your-card email and nothing retries.
+    created_at is naive-local (stripe-poll datetime.now()), so the cutoff
+    must be naive-local too."""
+    cutoff = (datetime.now() - timedelta(hours=48)).isoformat(timespec="seconds")
+    con = sqlite3.connect(DB_FILE, timeout=5)
+    try:
+        rows = con.execute(
+            "SELECT id, customer_id, payload_json, created_at FROM customer_events "
+            "WHERE event_type = 'payment_failed' AND created_at >= ?",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        con.close()
+    sent_dir = DATA_ROOT / "mailbox" / "sent"
+    orphaned = []
+    checked = 0
+    for row_id, customer_id, payload_json, created_at in rows:
+        try:
+            files = json.loads(payload_json or "{}").get("outbox_files") or []
+        except Exception:
+            continue
+        if not files:
+            continue
+        checked += 1
+        if not any(
+            (OUTBOX_DIR / name).exists()
+            or (OUTBOX_DIR / (name + ".sending")).exists()
+            or (sent_dir / name).exists()
+            for name in files
+        ):
+            orphaned.append({"event": row_id, "customer": customer_id, "created_at": created_at})
+    for o in orphaned:
+        alerts.append(alert(
+            "guardian:dunning_orphan",
+            f"🚨 [rick-guardian] dunning episode {o['event']} ({o['customer']}) is marked in the DB "
+            f"but NO nag emails exist on disk — the customer never got the payment-fix email and "
+            f"nothing will retry. Re-queue manually or delete the customer_events row so stripe-poll retries.",
+            window_hours=24,
+        ))
+    return {"window_hours": 48, "episodes_checked": checked, "orphaned": orphaned}
+
+
 def check_churn(alerts: list) -> dict:
     con = sqlite3.connect(DB_FILE, timeout=5)
     try:
@@ -1154,6 +1200,7 @@ def main() -> int:
         ("stripe_provenance", lambda a: check_stripe_provenance(cfg, a)),
         ("zombies", lambda a: check_zombies(cfg, a)),
         ("churn", check_churn),
+        ("dunning_integrity", check_dunning_integrity),
         ("approval_integrity", check_approval_integrity),
         ("sequence_integrity", check_sequence_integrity),
         ("cron_send_bypass", check_cron_send_bypass),
