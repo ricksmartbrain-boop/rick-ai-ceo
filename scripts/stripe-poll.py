@@ -52,7 +52,9 @@ $15.98 LTV to a Mar-10 card failure with ZERO contact):
     invoice URL and not the billing portal.
   * invoice.payment_succeeded / customer.subscription.deleted cancel any
     still-pending dunning items for that customer (never nag after recovery
-    or after the sub is terminally gone).
+    or after the sub is terminally gone), scoped to Rick products or the
+    item's own invoice/subscription — other businesses' events on this
+    shared Stripe account must not disarm a Rick episode.
 
 State file at `~/rick-vault/operations/stripe-poll-state.json` tracks
 `last_poll_timestamp`, `processed_event_ids` (kept to last 500), and
@@ -64,6 +66,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +80,9 @@ STATE_FILE = DATA_ROOT / "operations" / "stripe-poll-state.json"
 CANCEL_REASONS_FILE = DATA_ROOT / "churn" / "cancel-reasons.jsonl"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 DUNNING_REMINDER_DAYS = 3
+# Max seconds _cancel_pending_dunning waits for a drain's in-flight
+# .json.sending claim to release before scanning (bounded, no locking).
+_CANCEL_CLAIM_WAIT_SECS = 4.0
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT_DIR))
@@ -382,6 +388,23 @@ def _invoice_product_ids(invoice: dict) -> list[str]:
     return products
 
 
+def _subscription_product_ids(sub: dict) -> list[str]:
+    """Product ids on a subscription's items (price.product, matching
+    _list_rick_subscriptions; plan.product kept for older-shaped events)."""
+    products: list[str] = []
+    items = sub.get("items") if isinstance(sub, dict) else None
+    rows = items.get("data") if isinstance(items, dict) else None
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        price = item.get("price") if isinstance(item.get("price"), dict) else {}
+        plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+        for candidate in (price.get("product"), plan.get("product")):
+            if isinstance(candidate, str) and candidate not in products:
+                products.append(candidate)
+    return products
+
+
 def _dunning_episode_exists(conn, customer_id: str, invoice_id: str) -> bool:
     """True if a payment_failed customer_event for this invoice already exists."""
     rows = conn.execute(
@@ -433,10 +456,10 @@ def _dunning_bodies(first_name: str, product_name: str, amount_usd: float, pay_u
 def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) -> str:
     """Queue the capped 2-email dunning episode for a failed Rick invoice.
 
-    Idempotent per (customer, invoice): deterministic outbox filenames make a
-    crash between file-write and commit safe to retry, and the committed
-    customer_events row stops every later Stripe retry of the same invoice
-    from starting a second episode.
+    Idempotent per (customer, invoice): the customer_events row is committed
+    BEFORE the outbox files are written (fail-safe comment below), and stops
+    every later Stripe retry of the same invoice from starting a second
+    episode.
     """
     obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
     invoice_id = str(obj.get("id") or "")
@@ -504,10 +527,8 @@ def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) 
     from runtime.engine import slugify_email  # type: ignore
     now = datetime.now()
     day0_body, day3_body = _dunning_bodies(first_name, product_name, amount_usd, pay_url)
-    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
     base = f"dunning-{slugify_email(email)}-{invoice_id}"
-    outbox_files: list[str] = []
-    for suffix, item_type, body, send_after in (
+    email_plan = (
         ("day0", "dunning", day0_body, ""),
         (
             f"day{DUNNING_REMINDER_DAYS}",
@@ -515,24 +536,15 @@ def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) 
             day3_body,
             (now + timedelta(days=DUNNING_REMINDER_DAYS)).isoformat(timespec="seconds"),
         ),
-    ):
-        item = {
-            "to": email,
-            "status": "pending",
-            "type": item_type,
-            "cold": False,
-            "invoice_id": invoice_id,
-            "subscription_id": sub_id,
-            "product": product_name,
-            "body_markdown": body,
-            "created_at": now.isoformat(timespec="seconds"),
-        }
-        if send_after:
-            item["send_after"] = send_after
-        path = OUTBOX_DIR / f"{base}-{suffix}.json"
-        path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
-        outbox_files.append(path.name)
+    )
+    outbox_files = [f"{base}-{suffix}.json" for suffix, _, _, _ in email_plan]
 
+    # Commit the dedupe row FIRST, write outbox files SECOND — deliberate
+    # fail-safe direction: a crash between the two leaves the episode
+    # marked-but-unsent (at most one lost nag, spottable via outbox_files in
+    # the committed payload). The old file-first order re-sent 'payment
+    # failed' roughly hourly whenever the commit failed after the drain had
+    # already consumed the day-0 file.
     conn.execute(
         "INSERT INTO customer_events (id, customer_id, workflow_id, event_type, payload_json, created_at) "
         "VALUES (?, ?, NULL, 'payment_failed', ?, ?)",
@@ -551,6 +563,48 @@ def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) 
         ),
     )
     conn.commit()
+
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    sent_dir = OUTBOX_DIR.parent / "sent"
+    queued: list[str] = []
+    for (_suffix, item_type, body, send_after), name in zip(email_plan, outbox_files):
+        path = OUTBOX_DIR / name
+        if (
+            path.exists()
+            or (sent_dir / name).exists()
+            or path.with_name(name + ".sending").exists()
+        ):
+            # Never resurrect an existing item (sent/cancelled/pending, or a
+            # drain's in-flight .sending claim) as a fresh 'pending' — an
+            # overlapping poll must not double-send.
+            print(f"DUNNING SKIP: {name} already exists — not re-queued.", file=sys.stderr)
+            continue
+        item = {
+            "to": email,
+            "status": "pending",
+            "type": item_type,
+            "cold": False,
+            "invoice_id": invoice_id,
+            "subscription_id": sub_id,
+            "product": product_name,
+            "body_markdown": body,
+            "created_at": now.isoformat(timespec="seconds"),
+        }
+        if send_after:
+            item["send_after"] = send_after
+        path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
+        queued.append(name)
+    if not queued:
+        # Overlapping-poll re-run: every episode file already existed. Say so
+        # — a 'DUNNING QUEUED:' line here would double-count the episode
+        # start in the ops digest, and the description must match reality.
+        line = (
+            f"DUNNING ALREADY QUEUED: {email} invoice {invoice_id} — all "
+            f"episode files already exist, nothing re-queued"
+        )
+        print(line)
+        print(line, file=sys.stderr)
+        return f"invoice.payment_failed {invoice_id} (dunning already queued — nothing new written)"
     # stderr on purpose: the runners drop stdout but keep stderr in
     # logs/cron/stripe-poll.err.log — the ops digest must see dunning starts.
     line = (
@@ -559,22 +613,55 @@ def _handle_payment_failed(conn, event: dict, api_key: str, delivery_map: dict) 
     )
     print(line)
     print(line, file=sys.stderr)
-    return f"invoice.payment_failed -> dunning queued ({', '.join(outbox_files)})"
+    return f"invoice.payment_failed -> dunning queued ({', '.join(queued)})"
 
 
-def _cancel_pending_dunning(email: str, *, cancelled_by: str) -> int:
+def _cancel_pending_dunning(
+    email: str,
+    *,
+    cancelled_by: str,
+    rick_product: bool,
+    invoice_id: str = "",
+    subscription_id: str = "",
+) -> int:
     """Flip still-pending dunning outbox items for this address to cancelled.
 
     Runs on invoice.payment_succeeded (card fixed) and
     customer.subscription.deleted (nothing left to dun) — a 'please update
-    your card' reminder must never land after the episode is over. Per-email
-    on purpose, not per-invoice: the customer just paid something or is gone;
-    any further card-nagging is noise.
+    your card' reminder must never land after the episode is over. Scoped on
+    purpose (shared Stripe account, ~50 businesses): an item is cancelled
+    only when the triggering event is for a Rick product (rick_product) OR
+    references the item's own invoice/subscription — a customer paying one
+    of Vlad's OTHER businesses must not silently disarm a still-open Rick
+    dunning episode. Exact-episode match is kept as a fallback because
+    older-shaped events can carry no line-item product data.
+
+    Claim-aware (2026-07-17): a drain holds an item as <name>.json.sending
+    for the seconds around its Resend call. This event fires once-only
+    (processed_event_ids never retries), so a glob that misses the claimed
+    file skips the cancel FOREVER and the day-3 nag can land after
+    recovery. Bounded retry — wait briefly for in-flight dunning claims to
+    release (back to .json on a block, or into sent/ after a send) before
+    scanning; if a claim outlives the wait, log loudly. No locking
+    framework on purpose.
     """
     if not email or not OUTBOX_DIR.exists():
         return 0
     cancelled = 0
     now_iso = datetime.now().isoformat(timespec="seconds")
+    deadline = time.monotonic() + _CANCEL_CLAIM_WAIT_SECS
+    while any(OUTBOX_DIR.glob("dunning-*.json.sending")) and time.monotonic() < deadline:
+        time.sleep(0.25)
+    leftover = sorted(p.name for p in OUTBOX_DIR.glob("dunning-*.json.sending"))
+    if leftover:
+        line = (
+            f"DUNNING CANCEL RACE: claim(s) still held after "
+            f"{_CANCEL_CLAIM_WAIT_SECS:.0f}s — {', '.join(leftover)} cannot "
+            f"be cancelled by this once-only event ({cancelled_by}); check "
+            f"outbox/sent manually."
+        )
+        print(line)
+        print(line, file=sys.stderr)
     for path in sorted(OUTBOX_DIR.glob("dunning-*.json")):
         try:
             msg = json.loads(path.read_text(encoding="utf-8"))
@@ -584,10 +671,35 @@ def _cancel_pending_dunning(email: str, *, cancelled_by: str) -> int:
             continue
         if str(msg.get("to") or "").strip().lower() != email.strip().lower():
             continue
+        same_episode = bool(
+            (invoice_id and msg.get("invoice_id") == invoice_id)
+            or (subscription_id and msg.get("subscription_id") == subscription_id)
+        )
+        if not rick_product and not same_episode:
+            line = (
+                f"DUNNING CANCEL SKIPPED: {path.name} — {cancelled_by} is for a "
+                f"non-Rick product and a different invoice/subscription."
+            )
+            print(line)
+            print(line, file=sys.stderr)
+            continue
         msg["status"] = "cancelled"
         msg["cancelled_at"] = now_iso
         msg["cancelled_by"] = cancelled_by
         path.write_text(json.dumps(msg, indent=2) + "\n", encoding="utf-8")
+        # Post-write verify: if a drain claimed the file between our read and
+        # write, our write_text recreated the .json beside the claim and the
+        # drain's release/settle rename can overwrite the cancel — sub-second
+        # window, but the leaked nag is customer-facing, so never silent.
+        sending_sibling = path.with_name(path.name + ".sending")
+        if not path.exists() or sending_sibling.exists():
+            line = (
+                f"DUNNING CANCEL RACE: {path.name} was claimed mid-cancel — "
+                f"cancelled status may be overwritten; check outbox/sent "
+                f"({cancelled_by})"
+            )
+            print(line)
+            print(line, file=sys.stderr)
         cancelled += 1
         line = f"DUNNING CANCELLED: {path.name} ({cancelled_by})"
         print(line)
@@ -621,7 +733,29 @@ def _process_event(conn, event: dict, api_key: str, delivery_map: dict) -> tuple
             email = payload.get("email") or _customer_email(
                 api_key, str(payload.get("customer_id") or ""), {}
             )
-            _cancel_pending_dunning(str(email or ""), cancelled_by=event_type)
+            from runtime.revenue_signals import RICK_REAL_PRODUCT_IDS  # type: ignore
+            obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+            if event_type == "invoice.payment_succeeded":
+                products = _invoice_product_ids(obj)
+                inv_id = str(obj.get("id") or "")
+                parent = obj.get("parent") if isinstance(obj.get("parent"), dict) else {}
+                sub_details = (
+                    parent.get("subscription_details")
+                    if isinstance(parent.get("subscription_details"), dict)
+                    else {}
+                )
+                sub_id = str(obj.get("subscription") or sub_details.get("subscription") or "")
+            else:
+                products = _subscription_product_ids(obj)
+                inv_id = ""
+                sub_id = str(obj.get("id") or "")
+            _cancel_pending_dunning(
+                str(email or ""),
+                cancelled_by=event_type,
+                rick_product=any(p in RICK_REAL_PRODUCT_IDS for p in products),
+                invoice_id=inv_id,
+                subscription_id=sub_id,
+            )
         rick_event = _RICK_EVENT_FOR_STRIPE.get(event_type)
         if not rick_event:
             return True, f"{event_type} (no mapping — skipped)"
