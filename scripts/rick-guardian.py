@@ -99,7 +99,17 @@ def _rick_env(name: str) -> str:
                 if line.startswith("export "):
                     line = line[len("export "):]
                 if line.startswith(name + "="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    val = line.split("=", 1)[1].strip()
+                    # 2026-07-17: drop trailing inline comment ("VALUE  # note")
+                    # the way shell sourcing does, so float()/flag checks get
+                    # the clean value.
+                    if val[:1] in ('"', "'"):
+                        closing = val.find(val[0], 1)
+                        if closing > 0:
+                            val = val[: closing + 1]
+                    else:
+                        val = re.split(r"\s+#", val, 1)[0]
+                    return val.strip().strip('"').strip("'")
         except Exception:
             continue
     return ""

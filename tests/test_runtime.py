@@ -271,6 +271,76 @@ class RuntimeWorkflowTests(unittest.TestCase):
             resolution = self.engine.resolve_approval(self.connection, approval_id, "denied", "drill cleanup", "iris")
         self.assertEqual(resolution["status"], "denied")
 
+    def test_final_step_approval_closes_workflow(self) -> None:
+        # WHY: on 2026-07-16 three LinguaLive churn-save workflows sat at
+        # active/approval-cleared for 7.5h after their final-step approvals
+        # were approved — nothing re-enters a workflow whose jobs are all done,
+        # so only the ghost reaper ever finalized them. Approval resolution on
+        # the last step must close the workflow itself; a mid-step approval
+        # must still leave it active for the queued next step.
+        ts = "2026-07-16T09:00:00"
+
+        def make_blocked(workflow_id: str, step_name: str, step_index: int) -> str:
+            job_id = f"job_{workflow_id}"
+            approval_id = f"apr_{workflow_id}"
+            self.connection.execute(
+                """
+                INSERT INTO workflows
+                  (id, kind, title, slug, project, status, stage, priority, owner, lane,
+                   telegram_target, openclaw_session_key, context_json, created_at, updated_at,
+                   started_at, finished_at)
+                VALUES (?, 'deal_close', ?, ?, 'deals', 'blocked', 'awaiting-approval', 15, 'rick',
+                        'customer-lane', '', '', '{}', ?, ?, NULL, NULL)
+                """,
+                (workflow_id, f"Close deal: {workflow_id}", workflow_id.replace("_", "-"), ts, ts),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO jobs
+                  (id, workflow_id, step_name, step_index, status, title, route, lane,
+                   payload_json, approval_id, created_at, updated_at, run_after)
+                VALUES (?, ?, ?, ?, 'blocked', ?, 'strategy', 'customer-lane', '{}', ?, ?, ?, ?)
+                """,
+                (job_id, workflow_id, step_name, step_index, step_name, approval_id, ts, ts, ts),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO approvals
+                  (id, workflow_id, job_id, status, area, request_text, impact_text,
+                   policy_basis, requested_by, created_at)
+                VALUES (?, ?, ?, 'open', 'sales', ?, '', '', 'rick', ?)
+                """,
+                (approval_id, workflow_id, job_id, f"[DRILL] send {step_name}", ts),
+            )
+            self.connection.commit()
+            return approval_id
+
+        # Final step (close_or_escalate is last in DEAL_CLOSE_STEPS) → terminal.
+        approval_final = make_blocked("wf_drill_final", "close_or_escalate", 5)
+        with patch.object(self.engine, "notify_operator", return_value=None):
+            self.engine.resolve_approval(self.connection, approval_final, "approved", "", "telegram")
+        row = self.connection.execute(
+            "SELECT status, stage, finished_at FROM workflows WHERE id = 'wf_drill_final'"
+        ).fetchone()
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["stage"], "completed")
+        self.assertIsNotNone(row["finished_at"])
+
+        # Mid step → next step queued, workflow stays open.
+        approval_mid = make_blocked("wf_drill_mid", "pitch_send", 3)
+        with patch.object(self.engine, "notify_operator", return_value=None):
+            self.engine.resolve_approval(self.connection, approval_mid, "approved", "", "telegram")
+        row = self.connection.execute(
+            "SELECT status, stage, finished_at FROM workflows WHERE id = 'wf_drill_mid'"
+        ).fetchone()
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["stage"], "approval-cleared")
+        self.assertIsNone(row["finished_at"])
+        queued = self.connection.execute(
+            "SELECT COUNT(*) AS c FROM jobs WHERE workflow_id = 'wf_drill_mid' AND status = 'queued'"
+        ).fetchone()
+        self.assertEqual(queued["c"], 1)
+
     def test_publish_bundle_marks_workflow_published(self) -> None:
         workflow_id = self.engine.queue_info_product_workflow(
             self.connection,
@@ -279,7 +349,21 @@ class RuntimeWorkflowTests(unittest.TestCase):
             product_type="guide",
         )
 
-        with patch.object(self.engine, "generate_text", side_effect=self.fake_generation), patch.object(
+        # Publish handlers gate on channel credentials before the (mocked)
+        # run_command send. Dummy creds keep this test hermetic — without them
+        # it only passed in shells that happened to source rick.env.
+        dummy_creds = {
+            "RESEND_API_KEY": "test-dummy",
+            "LINKEDIN_ACCESS_TOKEN": "test-dummy",
+            "LINKEDIN_PERSON_URN": "urn:li:person:test",
+            "X_API_KEY": "test-dummy",
+            "X_API_SECRET": "test-dummy",
+            "X_ACCESS_TOKEN": "test-dummy",
+            "X_ACCESS_SECRET": "test-dummy",
+        }
+        with patch.dict(os.environ, dummy_creds), patch.object(
+            self.engine, "generate_text", side_effect=self.fake_generation
+        ), patch.object(
             self.engine, "run_command", side_effect=self.fake_run_command
         ), patch.object(self.engine, "notify_operator", return_value=None):
             self.engine.work(self.connection, limit=20)
@@ -449,9 +533,14 @@ class RuntimeWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(customer_event_count, 2)
 
         self.assertTrue((self.data_root / "customers" / "buyer-at-example-com.md").exists())
-        self.assertTrue(
-            (self.data_root / "mailbox" / "outbox" / "buyer-at-example-com-customer-success-playbook-delivery.md").exists()
-        )
+        # 2026-07-13 fulfillment fix: delivery drafts are .json (the gated outbox
+        # sender consumes ONLY .json; a bare .md sat unsendable forever — the
+        # Simone bug). The draft must be pending so the gate decides the send.
+        delivery_json = self.data_root / "mailbox" / "outbox" / "buyer-at-example-com-customer-success-playbook-delivery.json"
+        self.assertTrue(delivery_json.exists())
+        delivery_msg = json.loads(delivery_json.read_text(encoding="utf-8"))
+        self.assertEqual(delivery_msg.get("status"), "pending")
+        self.assertEqual(delivery_msg.get("to"), "buyer@example.com")
         sequence_config_path = self.data_root / "mailbox" / "sequences" / "customer-success-playbook-post-purchase" / "sequence.json"
         self.assertTrue(sequence_config_path.exists())
         sequence_payload = json.loads(sequence_config_path.read_text(encoding="utf-8"))

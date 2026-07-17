@@ -5966,7 +5966,21 @@ def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision:
                 f"{workflow['title']} — {nxt[0].replace('_', ' ')}",
                 workflow_lane=workflow["lane"],
             )
-        update_workflow(connection, workflow["id"], status="active", stage="approval-cleared")
+        # Final-step close (2026-07-16): an approval on the LAST step left the
+        # workflow stranded at active/approval-cleared — nothing re-enters a
+        # workflow whose jobs are all done, so only the ghost reaper (hours
+        # later) ever finalized it (3 LinguaLive churn-saves sat 7.5h). If no
+        # runnable job remains after resolution, close here — same terminal
+        # write as reap_ghost_completed_workflows.
+        open_jobs = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE workflow_id = ?"
+            " AND status NOT IN ('done','cancelled','published','fulfilled')",
+            (workflow["id"],),
+        ).fetchone()[0]
+        if open_jobs:
+            update_workflow(connection, workflow["id"], status="active", stage="approval-cleared")
+        else:
+            update_workflow(connection, workflow["id"], status="done", stage="completed", finished_at=stamp)
         notify_operator(connection, f"Approval accepted for {workflow['title']} [{approval_id}]", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approval")
     else:
         mark_job(connection, job["id"], "cancelled", blocked_reason=note or "denied by founder")

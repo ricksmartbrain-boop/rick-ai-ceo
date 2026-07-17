@@ -10,6 +10,11 @@
       "name": "LinguaLive Subscription",
       "delivery_kind": "welcome_email",
       "delivery_url": "https://www.lingualive.ai"
+    },
+    "prod_U8mgNHBNVO9Zsy": {
+      "name": "Managed AI CEO — Monthly (meetrick.ai)",
+      "delivery_kind": "welcome_email",
+      "delivery_url": "https://meetrick.ai/managed/"
     }
   }
 }
