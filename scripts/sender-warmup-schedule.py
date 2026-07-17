@@ -142,6 +142,7 @@ def current_day_number(state: dict) -> int:
 def sends_today() -> int:
     today = _now_utc().date().isoformat()
     count = 0
+    seen_ids: set[str] = set()
     for path in (SENDS_FILE, SEQUENCE_SENDS_FILE):
         if not path.exists():
             continue
@@ -150,6 +151,25 @@ def sends_today() -> int:
                 r = json.loads(line)
                 ts = (r.get("ts") or r.get("timestamp") or "")[:10]
                 if ts == today and r.get("status") == "sent":
+                    # Newsletter/broadcast rows (opted-in subscribers; typed
+                    # by newsletter-send.sh via resend-safe-send.sh and by
+                    # newsletter-engine-run.py) are NOT outreach ramp volume
+                    # — one 134-recipient issue must not eat the 50/day cap.
+                    # VOLUME-only exclusion: the per-recipient readers
+                    # (kill_switches.last_send_ts 60m/7d caps, comm_history)
+                    # have no type filter and still see these rows, so
+                    # touch-level dedupe keeps protecting each recipient.
+                    if r.get("type") in ("newsletter", "newsletter_welcome"):
+                        continue
+                    # email-sequence-send.py logs every send to BOTH ledgers
+                    # with the same message_id — dedupe so one real send
+                    # counts once against the ramp cap. Rows without an id
+                    # still count individually (never under-count).
+                    mid = r.get("message_id") or r.get("resend_id") or ""
+                    if mid:
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
                     count += 1
             except (json.JSONDecodeError, TypeError):
                 pass

@@ -44,12 +44,16 @@ class ChannelPaused(Exception):
 # Transactional outbox item `type` values that must NOT wait for the 07:00
 # quiet-hours release (2026-07-16: russian@crushermail.com's paid access
 # email sat ~2h behind the quiet-hours gate; only luck it wasn't 8h).
-# Exemption is quiet-hours ONLY — master kill, channel pause/disable,
-# daily/per-minute caps, sender-warmup ramp, suppression and is_send_allowed
-# all still apply. Marketing-ish types (pitch/followup/nurture/cold/welcome/
-# win-back) deliberately keep quiet hours. Canonical list — import this,
-# don't scatter string literals. "dunning"/"dunning-reminder" are the two
-# payment-fix types stripe-poll's dunning machinery emits (day-0 + day-N).
+# 2026-07-17: the waiver also covers the daily-cap and sender-warmup VOLUME
+# clauses — delivery/dunning are 1-2 deduped mails per customer and must
+# never strand behind broadcast/outreach volume for the rest of a UTC day
+# (the 2026-07-14 stranded-access class). MASTER KILL SWITCH, channel
+# pause/disable and per-minute pacing remain ABSOLUTE — the panic button
+# stops everything; suppression and is_send_allowed still apply. Marketing
+# types (pitch/followup/nurture/cold/welcome/win-back) keep every clause.
+# Canonical list — import this, don't scatter string literals.
+# "dunning"/"dunning-reminder" are the two payment-fix types stripe-poll's
+# dunning machinery emits (day-0 + day-N).
 TRANSACTIONAL_EMAIL_TYPES = frozenset({"delivery", "dunning", "dunning-reminder"})
 
 
@@ -137,8 +141,11 @@ def _email_warmup_cap_status() -> tuple[int | None, int | None, str]:
 def assert_channel_active(conn: sqlite3.Connection, channel: str, *, transactional: bool = False) -> None:
     """Raise ChannelPaused if the channel can't send right now.
 
-    transactional=True (item type in TRANSACTIONAL_EMAIL_TYPES) waives ONLY
-    the quiet-hours clause; every other check below still applies.
+    transactional=True (item type in TRANSACTIONAL_EMAIL_TYPES) waives the
+    quiet-hours, daily-cap and sender-warmup clauses — delivery/dunning are
+    1-2 deduped mails per customer, never volume. Master kill, channel
+    pause/disable and per-minute pacing are ABSOLUTE and apply to
+    transactional too (the panic button must stop everything).
     """
     if os.getenv("RICK_OUTBOUND_ENABLED", "1") == "0":
         raise ChannelPaused(channel, "master kill: RICK_OUTBOUND_ENABLED=0")
@@ -172,22 +179,25 @@ def assert_channel_active(conn: sqlite3.Connection, channel: str, *, transaction
     if not transactional and _inside_quiet_hours(cfg):
         raise ChannelPaused(channel, "quiet hours")
 
-    # Daily cap check — we compare against updated_at date; if stale, reset counter.
+    # Daily cap check — we compare against updated_at date; if stale, reset
+    # counter. The stale-reset runs for transactional sends too, so a
+    # transactional first-send of a new day can't carry yesterday's count into
+    # today's marketing accounting. Only the cap raise is waived (see docstring).
     daily_cap = int(cfg.get("daily") or 0)
-    if daily_cap > 0:
-        last_send_at = row["last_send_at"]
-        if last_send_at and last_send_at[:10] != _today_str():
-            # Stale counter from yesterday → reset.
-            conn.execute(
-                "UPDATE channel_state SET sends_today=0, sends_this_minute=0, updated_at=? WHERE channel=?",
-                (_now().isoformat(timespec="seconds"), channel),
-            )
-            conn.commit()
-            row = _ensure_row(conn, channel)
-        if int(row["sends_today"] or 0) >= daily_cap:
-            raise ChannelPaused(channel, f"daily cap reached ({daily_cap})")
+    last_send_at = row["last_send_at"]
+    if last_send_at and last_send_at[:10] != _today_str():
+        # Stale counter from yesterday → reset.
+        conn.execute(
+            "UPDATE channel_state SET sends_today=0, sends_this_minute=0, updated_at=? WHERE channel=?",
+            (_now().isoformat(timespec="seconds"), channel),
+        )
+        conn.commit()
+        row = _ensure_row(conn, channel)
+    if daily_cap > 0 and not transactional and int(row["sends_today"] or 0) >= daily_cap:
+        raise ChannelPaused(channel, f"daily cap reached ({daily_cap})")
 
-    if channel == "email":
+    # Sender-warmup ramp — volume clause: waived for transactional too.
+    if channel == "email" and not transactional:
         warmup_cap, warmup_sent, warmup_reason = _email_warmup_cap_status()
         if warmup_cap is None:
             pass
@@ -493,9 +503,21 @@ def last_send_ts(email: str) -> datetime | None:
             if not isinstance(r, dict):
                 continue
             stage = str(r.get("stage") or "")
-            is_send = (
+            resend_id = str(r.get("resend_id") or "")
+            # Failed sends must NOT count as sends: follow-up-automation's
+            # log_followup stamps the *_sent stage and stuffs the block
+            # reason into resend_id ('channel_paused: ...', 'suppressed: ...',
+            # 'SEND_BLOCKED ...'), so those rows describe a send that never
+            # happened — counting them blocked the real re-touch for 7 days.
+            # Real provider ids are opaque tokens (never a space or colon).
+            # Only rows POSITIVELY marked failed are skipped; anything
+            # ambiguous still counts (double-send prevention wins — 07-14).
+            looks_failed = r.get("status") != "sent" and (
+                " " in resend_id or ":" in resend_id
+            )
+            is_send = not looks_failed and (
                 r.get("status") == "sent"
-                or bool(r.get("resend_id"))
+                or bool(resend_id)
                 or stage == "contacted"
                 or stage.endswith("_sent")
             )
