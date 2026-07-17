@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Aggregate daily revenue snapshots into a cumulative tracker."""
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 REVENUE_DIR = DATA_ROOT / "revenue"
@@ -33,7 +36,7 @@ def load_targets() -> dict:
     return DEFAULT_TARGETS.copy()
 
 
-def parse_snapshot(path: Path) -> dict | None:
+def parse_snapshot(path: Path) -> Optional[dict]:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:

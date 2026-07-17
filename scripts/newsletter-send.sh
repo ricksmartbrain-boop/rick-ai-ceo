@@ -19,6 +19,7 @@ source ~/clawd/config/rick.env 2>/dev/null || true
 RESEND_API_KEY="${RESEND_API_KEY:?ERROR: RESEND_API_KEY environment variable is not set}"
 FROM_EMAIL="rick@meetrick.ai"
 SUBSCRIBERS_FILE="${RICK_DATA_ROOT:-$HOME/rick-vault}/newsletter/subscribers.json"
+SUPPRESSION_FILE="${RICK_DATA_ROOT:-$HOME/rick-vault}/mailbox/suppression.txt"
 SENDS_LOG="${RICK_DATA_ROOT:-$HOME/rick-vault}/newsletter/sends-log.md"
 DRAFT_FILE="${RICK_DATA_ROOT:-$HOME/rick-vault}/newsletter/draft.html"
 WORKSPACE_ROOT="${RICK_WORKSPACE_ROOT:-$HOME/.openclaw/workspace}"
@@ -140,12 +141,56 @@ PY
 
 _dedup_check "$SUBJECT" "$META_FILE"
 
-# ── Load subscribers ───────────────────────────────────────────────────────────
-if command -v jq &>/dev/null; then
-  SUBSCRIBERS=$(jq -r '.[] | select(.status=="active") | .email' "$SUBSCRIBERS_FILE" 2>/dev/null || echo "")
-else
-  SUBSCRIBERS=$(grep -o '"email":"[^"]*"' "$SUBSCRIBERS_FILE" 2>/dev/null | sed 's/"email":"//;s/"//' || echo "")
-fi
+# ── Load eligible subscribers ─────────────────────────────────────────────────
+# Filter before the send loop so suppressed and reserved test records do not
+# appear as delivery failures or reach the provider at all.
+RECIPIENTS_FILE=$(mktemp "${TMPDIR:-/tmp}/newsletter-recipients.XXXXXX")
+trap 'rm -f "$RECIPIENTS_FILE"' EXIT
+
+FILTER_SUMMARY=$(python3 - "$SUBSCRIBERS_FILE" "$SUPPRESSION_FILE" "$RECIPIENTS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+subscribers_path = Path(sys.argv[1])
+suppression_path = Path(sys.argv[2])
+recipients_path = Path(sys.argv[3])
+
+subscribers = json.loads(subscribers_path.read_text(encoding="utf-8"))
+suppressed = set()
+if suppression_path.exists():
+    for raw_line in suppression_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        address = raw_line.split("#", 1)[0].strip().lower()
+        if address:
+            suppressed.add(address)
+
+active = {
+    str(item.get("email", "")).strip().lower()
+    for item in subscribers
+    if item.get("status") == "active" and str(item.get("email", "")).strip()
+}
+provenance_missing = {
+    str(item.get("email", "")).strip().lower()
+    for item in subscribers
+    if item.get("status") == "active"
+    and str(item.get("email", "")).strip()
+    and (not str(item.get("source", "")).strip() or not str(item.get("subscribed_at", "")).strip())
+}
+reserved = {
+    address
+    for address in active
+    if address.endswith("@example.com") or address.endswith("@test.com")
+}
+eligible = sorted(active - suppressed - reserved - provenance_missing)
+recipients_path.write_text("\n".join(eligible) + ("\n" if eligible else ""), encoding="utf-8")
+print(
+    f"eligible={len(eligible)} suppressed={len(active & suppressed)} "
+    f"reserved={len(reserved)} provenance_missing={len(provenance_missing)}"
+)
+PY
+)
+
+SUBSCRIBERS=$(cat "$RECIPIENTS_FILE")
 
 COUNT=$(echo "$SUBSCRIBERS" | grep -c '@' || true)
 
@@ -154,7 +199,7 @@ if [[ $COUNT -eq 0 ]]; then
   exit 0
 fi
 
-echo "Sending to $COUNT subscribers..."
+echo "Sending to $COUNT eligible subscribers ($FILTER_SUMMARY)..."
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 SUCCESS=0
@@ -184,7 +229,7 @@ while IFS= read -r EMAIL; do
 done <<< "$SUBSCRIBERS"
 
 # ── Log the send ───────────────────────────────────────────────────────────────
-LOG_ENTRY="## ${TIMESTAMP} — Newsletter Send\n- Subject: ${SUBJECT}\n- Recipients: ${COUNT} total | ${SUCCESS} sent | ${FAIL} failed\n- Body file: ${BODY_FILE}\n"
+LOG_ENTRY="## ${TIMESTAMP} — Newsletter Send\n- Subject: ${SUBJECT}\n- Recipients: ${COUNT} eligible | ${SUCCESS} sent | ${FAIL} failed\n- Eligibility: ${FILTER_SUMMARY}\n- Body file: ${BODY_FILE}\n"
 if [[ -n "$ERRORS" ]]; then
   LOG_ENTRY="${LOG_ENTRY}- Errors:${ERRORS}\n"
 fi

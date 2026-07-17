@@ -126,7 +126,9 @@ def overnight_actions_summary() -> str:
 
 
 def main() -> None:
-    brief_date = date.today() + timedelta(days=1)
+    # Brief is dated the day it is generated/read. The old `+ timedelta(days=1)`
+    # shifted every brief one day forward (2026-07-16 run wrote 2026-07-17.md).
+    brief_date = date.today()
     brief_dir = DATA_ROOT / "control" / "morning-briefs"
     brief_dir.mkdir(parents=True, exist_ok=True)
 

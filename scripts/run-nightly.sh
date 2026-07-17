@@ -13,6 +13,11 @@ fi
 
 export RICK_DATA_ROOT="${RICK_DATA_ROOT:-$HOME/rick-vault}"
 
+# python3 must be 3.10+: launchd/zsh -lc PATHs resolve to the 3.9 system
+# python, which chokes on `X | None` annotations in scripts missing
+# future-imports (2026-07-16: revenue-cumulative crashed every catch-up run).
+export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"
+
 mkdir -p "$RICK_DATA_ROOT/logs"
 : >> "$RICK_DATA_ROOT/logs/conversions.log"
 chmod +x "$RICK_DATA_ROOT/scripts/fetch-ga-conversions.py" "$RICK_DATA_ROOT/scripts/log-conversion.sh" 2>/dev/null || true
@@ -87,5 +92,11 @@ elif git -C "$SNAP_DIR" commit -m "nightly snapshot $(date +%F)" >/dev/null; the
 else
   echo "[error] nightly snapshot FAILED — workspace remains uncommitted; run 'git -C $SNAP_DIR status'" >&2
 fi
+
+# Completion marker — the daemon's catch-up rider checks this so a nightly
+# missed during Mac sleep (StartCalendarInterval never fires in DarkWake,
+# 2026-07-17: launchd runs=0) still happens after wake.
+mkdir -p "$RICK_DATA_ROOT/control"
+date '+%Y-%m-%dT%H:%M:%S' > "$RICK_DATA_ROOT/control/last-nightly-run"
 
 echo "Nightly run complete."

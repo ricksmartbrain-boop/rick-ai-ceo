@@ -5,7 +5,7 @@
       "enabled": true,
       "kind": "process",
       "match": "run-daemon.sh",
-      "restart_cmd": "bash \"$RICK_OPENCLAW_HOME/scripts/run-daemon.sh\"",
+      "restart_cmd": "bash \"${RICK_OPENCLAW_HOME:-$HOME/.openclaw/workspace}/scripts/run-daemon.sh\"",
       "cooldown_seconds": 180,
       "max_restarts_per_day": 24,
       "notes": "Always-on runtime loop."

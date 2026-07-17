@@ -303,6 +303,28 @@ def _gather_auto_drafts() -> list[Task]:
 
 def _auto_draft_is_actionable(path: Path, data: dict) -> bool:
     """Return true for real reply drafts that still need a human send/discard call."""
+    # Drill/synthetic exclusion — same narrow rules as runtime/engine.py
+    # is_synthetic_item(): @example.com recipient (RFC-reserved), explicit
+    # [DRILL] marker in subject/name fields, or drill-* filename/wf_id.
+    # Deliberately scoped to recipient + marker fields, never the body —
+    # a real thread that quotes a drill must NOT match.
+    recipient = str(
+        data.get("prospect_email")
+        or data.get("from_email")
+        or data.get("to")
+        or data.get("email")
+        or ""
+    ).strip().lower()
+    if recipient.endswith("@example.com"):
+        return False
+    marker_fields = " ".join(
+        str(data.get(k) or "")
+        for k in ("subject", "draft_subject", "from_name", "prospect_name")
+    ).lower()
+    if "[drill]" in marker_fields:
+        return False
+    if path.name.lower().startswith("drill-") or str(data.get("wf_id") or "").lower().startswith("drill-"):
+        return False
     haystack = " ".join(
         str(value or "")
         for value in (
@@ -583,11 +605,16 @@ def _gather_moltbook_dms() -> list[Task]:
         return tasks
 
     priority = "P0" if unread >= 50 else "P1" if unread >= 10 else "P2"
+    fetched_at = _now().strftime("%Y-%m-%dT%H:%M UTC")
     tasks.append(Task(
         section="INBOX",
         priority=priority,
-        label=f"{unread} unread Moltbook DM(s)",
-        detail="moltbook.com/messages — may include warm leads or agent-to-agent pings",
+        label=f"{unread} unread Moltbook notification(s)",
+        detail=(
+            "moltbook.com/messages — may include warm leads or agent-to-agent pings"
+            f"  |  source: live API notifications/unread-count @ {fetched_at}"
+            " (day-notes may show a different snapshot)"
+        ),
         est_mins=max(5, unread // 10),
         blocked="Warm leads or referrals going cold in DMs",
         overdue=False,

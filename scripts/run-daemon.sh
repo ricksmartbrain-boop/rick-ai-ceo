@@ -52,6 +52,34 @@ set +e
 while true; do
   rotate_log
 
+  # ── Nightly catch-up (2026-07-17) ──────────────────────────────────────────
+  # StartCalendarInterval never fires while the Mac is in DarkWake (ai.rick.
+  # nightly sat at runs=0 through an idle-sleeping 03:10), so the daemon rides
+  # shotgun: past 04:00, if no nightly COMPLETED in >26h and none was ATTEMPTED
+  # in >6h (bounds retry storms to ~4/day on persistent failure), run it here.
+  NIGHTLY_MARKER="$RICK_DATA_ROOT/control/last-nightly-run"
+  NIGHTLY_ATTEMPT="$RICK_DATA_ROOT/control/last-nightly-attempt"
+  NIGHTLY_LOCK="$RICK_DATA_ROOT/control/nightly-catchup.lock"
+  HOUR_NOW=$(date +%H | sed 's/^0//')
+  if (( HOUR_NOW >= 4 )); then
+    now_epoch=$(date +%s)
+    marker_age=$(( now_epoch - $(stat -f%m "$NIGHTLY_MARKER" 2>/dev/null || echo 0) ))
+    attempt_age=$(( now_epoch - $(stat -f%m "$NIGHTLY_ATTEMPT" 2>/dev/null || echo 0) ))
+    if (( marker_age > 93600 && attempt_age > 21600 )); then
+      if mkdir "$NIGHTLY_LOCK" 2>/dev/null; then
+        mkdir -p "$RICK_DATA_ROOT/control" "$RICK_DATA_ROOT/logs/cron"
+        touch "$NIGHTLY_ATTEMPT"
+        log "Nightly catch-up: last completion ${marker_age}s ago — running now"
+        if bash "$ROOT_DIR/scripts/run-nightly.sh" >> "$RICK_DATA_ROOT/logs/cron/nightly.log" 2>&1; then
+          log "Nightly catch-up: completed"
+        else
+          log "Nightly catch-up FAILED (see logs/cron/nightly.log) — retry in 6h"
+        fi
+        rmdir "$NIGHTLY_LOCK" 2>/dev/null
+      fi
+    fi
+  fi
+
   # Heartbeat stderr goes to its own file (truncated each loop) so a failure's
   # traceback can be embedded in the blocker notes; it is appended to the
   # daemon log right after so nothing is lost from the existing log stream.
