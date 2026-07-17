@@ -6,6 +6,9 @@ from the ai.rick.email-sequence LaunchAgent chain, gated on
 RICK_EMAIL_SEND_LIVE (dry-run otherwise). Wired 2026-07-14 after a paying
 customer's access email (send_after 07:00) sat stranded until 07:44 because
 nothing consumed deferred items.
+SINGLE scheduled drain since 2026-07-17: walk_json_outbox (the redundant
+second consumer in email-sequence-send.py, 07-14 double-send class) is
+retired; concurrent daemon sends are excluded by the atomic .sending claim.
 Usage: python3 email-send-outbox.py [--dry-run]
 """
 
@@ -137,6 +140,18 @@ def extract_subject(body_md: str) -> str:
     return "Message from Rick"
 
 
+def strip_subject_line(body_md: str) -> str:
+    """Drop the '**Subject:** ...' carrier line AFTER extract_subject ran —
+    it is routing metadata (the outbox item's only subject carrier), not
+    copy the recipient should see (2026-07-17 polish)."""
+    lines = body_md.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("**Subject:**"):
+            del lines[i]
+            return "\n".join(lines).lstrip("\n")
+    return body_md
+
+
 def process_outbox(dry_run: bool = False) -> dict:
     """Process all pending emails in the outbox."""
     if not OUTBOX_DIR.exists():
@@ -144,20 +159,31 @@ def process_outbox(dry_run: bool = False) -> dict:
     transactional_only = False
     if not dry_run:
         block_reason = email_channel_block_reason()
-        if block_reason == "quiet hours":
-            # Quiet hours defers marketing only. Transactional mail
-            # (TRANSACTIONAL_EMAIL_TYPES: paid access delivery, dunning) must
-            # go out now — re-check the gate with the quiet-hours clause
-            # waived; if anything ELSE blocks too, abort the whole run.
+        if block_reason:
+            # Quiet hours + the daily/warmup VOLUME caps defer marketing
+            # only. Transactional mail (TRANSACTIONAL_EMAIL_TYPES: paid
+            # access delivery, dunning) waives those clauses and must go out
+            # now — re-check the gate with the waiver; if anything ABSOLUTE
+            # blocks too (master kill, channel pause, per-minute pacing),
+            # abort the whole run.
             residual = email_channel_block_reason(transactional=True)
             if residual:
                 return {"status": "channel_paused", "reason": residual, "sent": 0, "errors": 0}
             transactional_only = True
-        elif block_reason:
-            return {"status": "channel_paused", "reason": block_reason, "sent": 0, "errors": 0}
 
     if not dry_run:
         SENT_DIR.mkdir(parents=True, exist_ok=True)
+        # Orphaned-claim sweep (2026-07-17): a crash mid-send strands a
+        # *.json.sending claim (see atomic claim below). After 60min — the
+        # recent-send-cap window, which blocks a true duplicate on retry —
+        # rename it back to *.json so the item is not silently lost.
+        for stale in OUTBOX_DIR.glob("*.json.sending"):
+            try:
+                if datetime.now().timestamp() - stale.stat().st_mtime > 3600:
+                    print(f"reclaiming orphaned claim {stale.name}", file=sys.stderr)
+                    stale.rename(stale.with_name(stale.name[: -len(".sending")]))
+            except OSError as exc:
+                print(f"orphan-claim sweep failed for {stale.name}: {exc}", file=sys.stderr)
     now = datetime.now().isoformat(timespec="seconds")
     sent = 0
     errors = 0
@@ -185,8 +211,9 @@ def process_outbox(dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
-        # Quiet hours: marketing waits for the 07:00 release; transactional
-        # (delivery/dunning) proceeds through the remaining gates below.
+        # Channel blocked for marketing (quiet hours / volume caps):
+        # transactional (delivery/dunning) proceeds through the remaining
+        # gates below; everything else waits for the release/reset.
         if transactional_only and str(msg.get("type") or "") not in transactional_email_types():
             skipped += 1
             continue
@@ -194,6 +221,35 @@ def process_outbox(dry_run: bool = False) -> dict:
         to_email = msg.get("to", "")
         if not to_email:
             continue
+
+        # Atomic claim (2026-07-17): same-dir rename BEFORE any further
+        # action — POSIX rename has exactly one winner, so a concurrent
+        # consumer (daemon phase1.handle_outbox_send) can never send the
+        # same file; the loser hits OSError and skips. The .sending suffix
+        # is invisible to every *.json scan. Dry-run stays fully read-only.
+        claim = f
+        if not dry_run:
+            claim = f.with_name(f.name + ".sending")
+            try:
+                f.rename(claim)
+                os.utime(claim)  # claim timestamp for the orphan sweep
+            except OSError:
+                continue  # another consumer claimed it first
+            # Re-read post-claim: the pre-claim copy can be stale (owner
+            # cancel or rewrite between the read above and the claim).
+            try:
+                msg = json.loads(claim.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                claim.rename(f)
+                continue
+            if msg.get("status") != "pending":
+                claim.rename(f)
+                continue
+            to_email = msg.get("to", "")  # refresh from the post-claim read
+            if not to_email:
+                claim.rename(f)
+                continue
+
         if to_email.strip().lower() in suppressions:
             if dry_run:
                 # Dry-run must be fully read-only: report, don't rewrite/move.
@@ -202,14 +258,15 @@ def process_outbox(dry_run: bool = False) -> dict:
                 continue
             msg["status"] = "suppressed"
             msg["suppressed_at"] = now
-            f.write_text(json.dumps(msg, indent=2), encoding="utf-8")
-            f.rename(SENT_DIR / f.name)
+            claim.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+            claim.rename(SENT_DIR / f.name)
             skipped += 1
             print(f"Suppressed {to_email}")
             continue
 
         body_md = msg.get("body_markdown", msg.get("pitch_markdown", ""))
         subject = extract_subject(body_md)
+        body_md = strip_subject_line(body_md)
 
         if dry_run:
             print(f"[DRY RUN] Would send to {to_email}: {subject}")
@@ -218,6 +275,7 @@ def process_outbox(dry_run: bool = False) -> dict:
 
         if not RESEND_API_KEY:
             print("RESEND_API_KEY not set — skipping send", file=sys.stderr)
+            claim.rename(f)  # release the claim before bailing out
             return {"status": "no_api_key", "sent": 0, "errors": 0}
 
         try:
@@ -231,16 +289,17 @@ def process_outbox(dry_run: bool = False) -> dict:
                 if str(blocked_reason).startswith("suppressed"):
                     msg["status"] = "blocked"
                     msg["error"] = f"SEND_BLOCKED reason={blocked_reason}"[:200]
-                    f.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+                    claim.write_text(json.dumps(msg, indent=2), encoding="utf-8")
                     errors += 1
                 else:
                     skipped += 1
+                claim.rename(f)  # release the claim; blocked parks, skipped retries
                 continue
             msg["status"] = "sent"
             msg["sent_at"] = now
             msg["resend_id"] = result.get("id", "")
-            f.write_text(json.dumps(msg, indent=2), encoding="utf-8")
-            f.rename(SENT_DIR / f.name)
+            claim.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+            claim.rename(SENT_DIR / f.name)
             sent += 1
             print(f"Sent to {to_email}: {subject}")
             # Bookkeeping mirrors phase1.handle_outbox_send — shielded, must
@@ -272,7 +331,8 @@ def process_outbox(dry_run: bool = False) -> dict:
             except Exception as exc:
                 print(f"send bookkeeping failed (send already out): {exc}", file=sys.stderr)
             # Ops send ledger — bounce-rate-guardian counts its denominator
-            # from this file; row shape matches campaign-engine.py.
+            # from this file; row shape matches campaign-engine.py plus the
+            # source attribution field carried over from walk_json_outbox.
             try:
                 SENDS_LOG.parent.mkdir(parents=True, exist_ok=True)
                 with SENDS_LOG.open("a") as handle:
@@ -280,6 +340,7 @@ def process_outbox(dry_run: bool = False) -> dict:
                         {"message_id": msg.get("resend_id", ""),
                          "status": "sent",
                          "to": to_email,
+                         "source": f"json-outbox-{msg.get('type', 'outbox')}",
                          "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
                         sort_keys=True) + "\n")
             except OSError as exc:
@@ -287,7 +348,8 @@ def process_outbox(dry_run: bool = False) -> dict:
         except Exception as exc:
             msg["status"] = "error"
             msg["error"] = str(exc)[:200]
-            f.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+            claim.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+            claim.rename(f)  # release the claim; status=error never retries
             errors += 1
             print(f"Error sending to {to_email}: {exc}", file=sys.stderr)
 

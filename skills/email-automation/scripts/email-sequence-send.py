@@ -224,25 +224,6 @@ def email_channel_block_reason(transactional: bool = False) -> str | None:
         return f"gate_unavailable: {type(exc).__name__}: {exc}"
 
 
-def transactional_email_types() -> frozenset[str]:
-    """Item `type` values exempt from quiet hours (delivery/dunning).
-
-    Canonical set lives in runtime.kill_switches.TRANSACTIONAL_EMAIL_TYPES.
-    Fail-safe: if the import breaks, return the empty set — nothing is
-    exempt and everything keeps the quiet-hours deferral (never the reverse).
-    """
-    try:
-        root = str(WORKSPACE_ROOT)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from runtime.kill_switches import TRANSACTIONAL_EMAIL_TYPES
-
-        return TRANSACTIONAL_EMAIL_TYPES
-    except Exception as exc:
-        print(f"transactional_email_types unavailable ({exc}); quiet hours apply to all", file=sys.stderr)
-        return frozenset()
-
-
 @lru_cache(maxsize=1)
 def _warmup_module():
     spec = importlib.util.spec_from_file_location("sender_warmup_schedule", WARMUP_SCRIPT)
@@ -486,144 +467,24 @@ def walk_outbox(*, dry_run: bool, suppressions: set[str], api_key: str | None, a
     return results
 
 
-def walk_json_outbox(*, dry_run: bool, api_key: str | None, transactional_only: bool = False) -> list[dict]:
-    """Consume due top-level outbox *.json messages (delivery emails,
-    founder drafts past their owner-veto window, quiet-hours deferrals).
-
-    RE-ADDED 2026-07-16: first shipped 2026-07-14 (a quiet-hours send_after
-    deferral had NO scheduled consumer — phase1.handle_outbox_send only runs
-    inside never-queued email_nurture workflows), then lost in the 07-16
-    ledger-parity rewrite of this file — which left the Jul-16 founder batch
-    stuck at status=pending past its send_after. Semantics mirror
-    handle_outbox_send: suppressed → status=blocked (permanent); other gate
-    block → left pending for a later run; sent → status=sent + ledger +
-    record_send. Capped at 20 per run; honors per-item cold flag.
-    """
-    results: list[dict] = []
-    if not OUTBOX_DIR.exists():
-        return results
-    due: list[tuple[Path, dict]] = []
-    now_local = now().isoformat(timespec="seconds")
-    for path in sorted(OUTBOX_DIR.glob("*.json")):
-        msg = load_json(path)
-        if msg.get("status") != "pending" or not msg.get("to"):
-            continue
-        send_after = str(msg.get("send_after") or "")
-        if send_after and send_after > now_local:
-            continue
-        # Quiet-hours pass (transactional_only): marketing items wait for
-        # the 07:00 release; only delivery/dunning proceed.
-        if transactional_only and str(msg.get("type") or "") not in transactional_email_types():
-            continue
-        due.append((path, msg))
-
-    conn = None
-    for path, msg in due[:20]:
-        to_email = str(msg.get("to", "")).strip()
-        body_md = msg.get("body_markdown", msg.get("pitch_markdown", ""))
-        subject = "Message from Rick"
-        for line in body_md.splitlines():
-            if line.startswith("**Subject:**"):
-                subject = line.replace("**Subject:**", "").strip()
-                break
-        event = {"file": str(path), "sequence": "json-outbox",
-                 "to": to_email, "subject": subject, "type": msg.get("type", "")}
-
-        if dry_run:
-            results.append({**event, "status": "would-send"})
-            continue
-        if not api_key:
-            results.append({**event, "status": "missing-resend-api-key"})
-            continue
-
-        try:
-            root = str(WORKSPACE_ROOT)
-            if root not in sys.path:
-                sys.path.insert(0, root)
-            from runtime.kill_switches import is_send_allowed
-
-            allowed, gate_reason = is_send_allowed(to_email, cold=bool(msg.get("cold", False)))
-        except Exception as exc:
-            allowed, gate_reason = False, f"gate_unavailable:{type(exc).__name__}:{exc}"
-        if not allowed:
-            print(f"SEND_BLOCKED reason={gate_reason} to={to_email}", file=sys.stderr)
-            if gate_reason.startswith("suppressed"):
-                msg["status"] = "blocked"
-                msg["error"] = f"SEND_BLOCKED reason={gate_reason}"[:200]
-                path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
-            results.append({**event, "status": "send-blocked", "reason": gate_reason})
-            continue
-
-        ok, info = send_via_resend(
-            to=to_email,
-            subject=subject,
-            html=markdown_to_html(body_md),
-            text=body_md,
-            from_addr=msg.get("from") or DEFAULT_FROM,
-            api_key=api_key,
-        )
-        if not ok:
-            results.append({**event, "status": "send-failed", "error": info})
-            continue
-
-        msg["status"] = "sent"
-        msg["sent_at"] = now().isoformat(timespec="seconds")
-        msg["message_id"] = info.get("id", "")
-        path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
-        results.append({**event, "status": "sent", "message_id": info.get("id")})
-
-        # Ops send ledger — bounce-rate-guardian denominator (same shape as
-        # the .md path above).
-        try:
-            ensure_parent(SENDS_LEDGER)
-            with SENDS_LEDGER.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(
-                    {"message_id": info.get("id") or "",
-                     "status": "sent",
-                     "to": to_email,
-                     "source": f"json-outbox-{msg.get('type', 'outbox')}",
-                     "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
-                    sort_keys=True) + "\n")
-        except OSError as exc:
-            print(f"email-sends.jsonl append failed (send already out): {exc}", file=sys.stderr)
-
-        # record_send for kill_switches channel counters — shielded, must
-        # never fail a send that already went out.
-        try:
-            from runtime.db import connect as _runtime_connect
-            from runtime.kill_switches import record_send
-
-            if conn is None:
-                conn = _runtime_connect()
-            record_send(conn, "email")
-            conn.commit()
-        except Exception:
-            pass
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    return results
+# walk_json_outbox RETIRED 2026-07-17 (deliberate, not lost this time): the
+# top-level outbox *.json drain lives SOLELY in email-nurture-machine/scripts/
+# email-send-outbox.py, which runs 60s earlier in the SAME ai.rick.email-sequence
+# launchd line with strictly stronger semantics (atomic claim, rename to sent/,
+# touch_log flip, ledger row, quiet-hours transactional pass). Its 07-16 re-add
+# docstring ("a send_after deferral had NO scheduled consumer") was stale — the
+# dual drain was the 2026-07-14 double-send class. Do NOT re-add a JSON
+# consumer here; this script now owns only sequence .md steps (walk_outbox).
 
 
 def command_send(dry_run: bool) -> int:
     suppressions = load_suppressions()
     api_key = os.getenv("RESEND_API_KEY")
-    transactional_only = False
     if not dry_run:
         block_reason = email_channel_block_reason()
-        if block_reason == "quiet hours":
-            # Quiet hours defers marketing only. Transactional mail
-            # (TRANSACTIONAL_EMAIL_TYPES: paid access delivery, dunning)
-            # must go out now — re-check the gate with the quiet-hours
-            # clause waived; if anything ELSE blocks too, abort as usual.
-            residual = email_channel_block_reason(transactional=True)
-            if residual:
-                block_reason = residual
-            else:
-                transactional_only = True
-                block_reason = None
+        # Quiet hours: sequence .md steps are nurture/marketing and keep the
+        # deferral; transactional mail rides email-send-outbox.py's own
+        # quiet-hours pass, not this script.
         if block_reason:
             events = [{"sequence": "all", "status": "channel-paused", "reason": block_reason}]
             append_log(events)
@@ -643,12 +504,7 @@ def command_send(dry_run: bool) -> int:
             return 0
     warmup = _warmup_module()
     attempt_limit = None if dry_run else max(0, int(warmup.get_today_cap()) - int(warmup.sends_today()))
-    if transactional_only:
-        # Sequence .md steps are nurture/marketing — they keep quiet hours.
-        events = []
-    else:
-        events = walk_outbox(dry_run=dry_run, suppressions=suppressions, api_key=api_key, attempt_limit=attempt_limit)
-    events.extend(walk_json_outbox(dry_run=dry_run, api_key=api_key, transactional_only=transactional_only))
+    events = walk_outbox(dry_run=dry_run, suppressions=suppressions, api_key=api_key, attempt_limit=attempt_limit)
     if not dry_run:
         append_log(events)
     sent = sum(1 for e in events if e.get("status") == "sent")

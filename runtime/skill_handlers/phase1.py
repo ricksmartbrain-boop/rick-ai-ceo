@@ -1556,32 +1556,67 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
             continue
         pending.append((f, msg))
 
+    sent_dir = DATA_ROOT / "mailbox" / "sent"
+    sent_dir.mkdir(parents=True, exist_ok=True)
+
     for f, msg in pending[:20]:  # Max 20 per batch
         to_email = msg.get("to", "")
         if not to_email:
             continue
 
+        # Atomic claim (2026-07-17): same-dir rename BEFORE the gates and the
+        # send — POSIX rename has exactly one winner, so the cron consumer
+        # (email-send-outbox.py) can never send the same file; the loser hits
+        # OSError and skips. The .sending suffix is invisible to every *.json
+        # scan; email-send-outbox.py sweeps claims orphaned by a crash.
+        claim = f.with_name(f.name + ".sending")
+        try:
+            f.rename(claim)
+            os.utime(claim)  # claim timestamp for the orphan sweep
+        except OSError:
+            continue  # another consumer claimed it first
+        # Re-read post-claim: the pre-scan copy can be stale (owner cancel or
+        # rewrite between the scan above and the claim).
+        try:
+            msg = json.loads(claim.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            claim.rename(f)
+            continue
+        if msg.get("status") != "pending":
+            claim.rename(f)
+            continue
+        to_email = msg.get("to", "")  # refresh from the post-claim read
+        if not to_email:
+            claim.rename(f)
+            continue
+
         try:
             try:
                 from runtime.kill_switches import TRANSACTIONAL_EMAIL_TYPES, ChannelPaused, assert_channel_active, record_send, is_send_allowed
-                # Transactional items (delivery/dunning) waive ONLY the
-                # quiet-hours clause; every other channel check still applies.
+                # Transactional items (delivery/dunning) waive the
+                # quiet-hours + daily/warmup volume clauses; master kill,
+                # channel pause and per-minute pacing still apply.
                 assert_channel_active(
                     connection, "email",
                     transactional=str(msg.get("type") or "") in TRANSACTIONAL_EMAIL_TYPES,
                 )
             except ChannelPaused as exc:
-                if exc.reason == "quiet hours":
-                    # Marketing item inside quiet hours: leave it pending for
-                    # the 07:00 release but keep walking — a transactional
-                    # item later in the batch must still go out now.
+                reason = str(exc.reason)
+                if reason == "quiet hours" or reason.startswith(("daily cap reached", "sender warmup cap reached")):
+                    # Marketing item behind quiet hours or a volume cap:
+                    # leave it pending for the release/reset but keep
+                    # walking — a transactional item later in the batch
+                    # waives those clauses and must still go out now.
+                    claim.rename(f)  # release the claim
                     continue
+                claim.rename(f)  # release the claim
                 return StepOutcome(
                     summary=f"Outbox send paused by email safety gate: {exc.reason}",
                     artifacts=[],
                     workflow_stage="outbox-paused",
                 )
             except Exception as exc:
+                claim.rename(f)  # release the claim
                 return StepOutcome(
                     summary=f"Outbox send refused because email safety gate is unavailable: {type(exc).__name__}: {exc}",
                     artifacts=[],
@@ -1607,18 +1642,24 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
                     msg["status"] = "blocked"
                     msg["error"] = f"SEND_BLOCKED reason={gate_reason}"[:200]
                     errors += 1
-                    write_file(f, json.dumps(msg, indent=2))
+                    write_file(claim, json.dumps(msg, indent=2))
                 # Non-permanent blocks (master kill / live flag / frequency
                 # cap) leave the file pending for a later run.
+                claim.rename(f)  # release the claim under the original name
                 continue
 
             import urllib.request
             body_md = msg.get("body_markdown", msg.get("pitch_markdown", ""))
             subject = "Message from Rick"
-            # Extract subject from markdown
-            for line in body_md.splitlines():
+            # Extract subject from markdown, then strip the carrier line —
+            # it is routing metadata, not copy the recipient should see
+            # (2026-07-17 polish; mirrors email-send-outbox.py).
+            body_lines = body_md.splitlines()
+            for i, line in enumerate(body_lines):
                 if line.startswith("**Subject:**"):
                     subject = line.replace("**Subject:**", "").strip()
+                    del body_lines[i]
+                    body_md = "\n".join(body_lines).lstrip("\n")
                     break
 
             send_payload = json.dumps({
@@ -1634,11 +1675,43 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
                 headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json", "User-Agent": "meetrick-rick/1.0"},
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=15)
+            response = urllib.request.urlopen(req, timeout=15)
             record_send(connection, "email")
             msg["status"] = "sent"
             msg["sent_at"] = now_iso()
             sent += 1
+            # Resend message id — shielded parse; the send is already out.
+            try:
+                resend_id = str(json.loads(response.read()).get("id") or "")
+            except Exception:
+                resend_id = ""
+            msg["resend_id"] = resend_id
+
+            # Ops send ledger (2026-07-17) — bounce-rate-guardian's
+            # denominator and the 60m/7d recipient caps (kill_switches
+            # SEND_LOG_FILES) read this file; without the row every
+            # daemon-path send is invisible to both. Row shape matches
+            # email-send-outbox.py. Shielded — the miss is surfaced via
+            # record_event, but bookkeeping never fails a sent email.
+            try:
+                sends_log = DATA_ROOT / "operations" / "email-sends.jsonl"
+                sends_log.parent.mkdir(parents=True, exist_ok=True)
+                with sends_log.open("a") as handle:
+                    handle.write(json.dumps(
+                        {"message_id": resend_id,
+                         "status": "sent",
+                         "to": to_email,
+                         "source": f"phase1-outbox-{msg.get('type', 'outbox')}",
+                         "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+                        sort_keys=True) + "\n")
+            except Exception as exc:
+                try:
+                    record_event(
+                        connection, workflow["id"], job["id"], "outbox_ledger_miss",
+                        {"summary": f"email-sends.jsonl append failed (send already out): {exc}"},
+                    )
+                except Exception:
+                    pass
 
             # WS-F (2026-07-13): flip the queued touch row to sent; if no
             # queued row exists for this outbox file (item queued before the
@@ -1664,14 +1737,15 @@ def handle_outbox_send(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
             msg["error"] = str(exc)[:200]
             errors += 1
 
-        write_file(f, json.dumps(msg, indent=2))
-
-    # Move sent files to sent/ directory
-    sent_dir = DATA_ROOT / "mailbox" / "sent"
-    sent_dir.mkdir(parents=True, exist_ok=True)
-    for f, msg in pending[:20]:
+        # Settle the claimed file in-loop (2026-07-17; formerly a deferred
+        # end-of-batch rename): sent → sent/ under the original name so
+        # mark_touch_sent(f.name) linkage holds; error → back to outbox/
+        # under the original name (terminal status, never retried).
+        write_file(claim, json.dumps(msg, indent=2))
         if msg.get("status") == "sent":
-            f.rename(sent_dir / f.name)
+            claim.rename(sent_dir / f.name)
+        else:
+            claim.rename(f)
 
     summary = f"Outbox processed: {sent} sent, {errors} errors, {len(pending) - sent - errors} remaining"
     if deferred:
