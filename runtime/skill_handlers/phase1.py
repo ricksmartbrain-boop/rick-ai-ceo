@@ -195,7 +195,7 @@ def handle_lead_intake(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "- intent: string (what they want)\n"
         "- urgency: low/medium/high\n"
         "- budget_signal: string (any price/budget mentions)\n"
-        "- best_product_match: string (one of: free-roast, rick-pro-29, managed-499)\n"
+        "- best_product_match: string (one of: free-roast, rick-pro-29, managed-499, setup-2500)\n"
         "- summary: 1-2 sentence lead summary\n"
         "Output ONLY valid JSON."
         f"{pattern_context}"
@@ -339,8 +339,8 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
-        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
-        "Managed is pilot-first via meetrick.ai/pilot),\n"
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499, setup-2500 — "
+        "Managed is pilot-first via meetrick.ai/pilot; setup-2500 = $2,500 one-time Done-For-You deploy),\n"
         "disqualify_reason: string explanation if total_score < 5 OR clear vendor pitch / spam / "
         "off-ICP, else null.\n"
         "Output ONLY valid JSON."
@@ -363,8 +363,8 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5),\n"
-        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
-        "Managed is pilot-first via meetrick.ai/pilot),\n"
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499, setup-2500 — "
+        "Managed is pilot-first via meetrick.ai/pilot; setup-2500 = $2,500 one-time Done-For-You deploy),\n"
         "disqualify_reason: string ONLY if vendor pitch / spam / explicit off-fit; otherwise null "
         "even when total_score < 5 (let the pitch stage decide).\n"
         "Output ONLY valid JSON."
@@ -386,8 +386,8 @@ def handle_lead_qualify(connection: sqlite3.Connection, workflow: sqlite3.Row, j
         "Output JSON with: intent_score, fit_score, budget_score, urgency_score, "
         "total_score (average rounded to 1 decimal),\n"
         "qualification: 'hot' (8+), 'warm' (5-7), or 'disqualified' (<5 — should be RARE in this mode),\n"
-        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499 — "
-        "Managed is pilot-first via meetrick.ai/pilot). Default to free-roast or rick-pro-29 unless clear "
+        "recommended_product: best product match (one of: free-roast, rick-pro-29, managed-499, setup-2500 — "
+        "Managed is pilot-first via meetrick.ai/pilot; setup-2500 = $2,500 one-time Done-For-You deploy). Default to free-roast or rick-pro-29 unless clear "
         "signal for higher tier.\n"
         "disqualify_reason: string ONLY for explicit disqualify signals (vendor / spam / abuse / "
         "explicit opt-out); null otherwise.\n"
@@ -541,6 +541,7 @@ def handle_pitch_draft(connection: sqlite3.Connection, workflow: sqlite3.Row, jo
         "free-roast": ("Free Roast (meetrick.ai/roast)", 0),
         "rick-pro-29": ("Rick Pro", 29),
         "managed-499": ("Managed AI CEO (pilot-first — meetrick.ai/pilot)", 499),
+        "setup-2500": ("AI CEO Setup — Done For You (meetrick.ai/products)", 2500),
     }
     product_name, price = product_prices.get(product, ("Rick Pro", 29))
 
@@ -716,10 +717,15 @@ def handle_pitch_send(connection: sqlite3.Connection, workflow: sqlite3.Row, job
     pitch = pitch_path.read_text(encoding="utf-8") if pitch_path.exists() else "Pitch not found."
 
     product = qualification.get("recommended_product", "rick-pro-29")
-    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499}.get(product, 29)
+    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499, "setup-2500": 2500}.get(product, 29)
 
-    # For $499+ deals, require founder approval
-    if price >= 499:
+    # For $499+ deals, require founder approval. On the post-approval re-run
+    # (engine.SELF_GATED_STEPS requeues this job), the granted approval row
+    # exists and the send proceeds.
+    if price >= 499 and connection.execute(
+        "SELECT 1 FROM approvals WHERE job_id = ? AND status = 'approved' LIMIT 1",
+        (job["id"],),
+    ).fetchone() is None:
         raise ApprovalRequired(
             area="irreversible-brand",
             request_text=f"Send ${price} pitch to {lead_id}",
@@ -920,7 +926,7 @@ def handle_close_or_escalate(connection: sqlite3.Connection, workflow: sqlite3.R
     qualification = deal_files.get("qualification.json", {})
     total_score = qualification.get("total_score", 5)
     product = qualification.get("recommended_product", "rick-pro-29")
-    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499}.get(product, 29)
+    price = {"free-roast": 0, "rick-pro-29": 29, "managed-499": 499, "setup-2500": 2500}.get(product, 29)
 
     # 2026-04-24: pattern READ side fanned to close_or_escalate. Strategy
     # route is opus-4-8 (smart) — pattern context helps Rick make better
