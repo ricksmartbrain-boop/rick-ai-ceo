@@ -8,7 +8,8 @@
 # - Theme = next slot in rotation (issue#5 -> contrarian-take, slot 5).
 # - Telegram-notify Vlad with draft path + theme + first-line preview.
 # - Smart-models invariant: writing route -> claude-sonnet-4-6.
-# - Newsletter Resend path is independent of outbound_dispatcher / kill_switches.
+# - Newsletter Resend sends route through resend-safe-send.sh: assert_channel_active
+#   + is_send_allowed(cold=False) + email-sends.jsonl ledger rows (2026-07-17).
 #
 # After 2 weeks of approved drafts, flip RICK_NEWSLETTER_AUTO_SEND=1 in env.
 #

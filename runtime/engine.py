@@ -3718,17 +3718,27 @@ def handle_publish_newsletter(connection: sqlite3.Connection, workflow: sqlite3.
 
     script = ROOT_DIR / "scripts" / "newsletter-send.sh"
     if not script.exists():
-        script = ROOT_DIR / "skills" / "newsletter" / "scripts" / "newsletter-send.sh"
+        # No fallback: the skills/ copy is the removed Beehiiv path (ungated).
+        raise DependencyBlocked("newsletter", "scripts/newsletter-send.sh missing")
     env = os.environ.copy()
     env["RESEND_API_KEY"] = resend_key
     result = run_command(["bash", str(script), subject, str(html_path)], env=env, cwd=ROOT_DIR)
     if result.returncode != 0:
         raise RuntimeErrorBase(result.stderr.strip() or result.stdout.strip() or "newsletter publish failed (Resend)")
     log_path = write_file(project_dir / "launch" / "newsletter-publish.log", result.stdout or "sent via Resend")
+    # Partial delivery is NOT full success: surface FAIL>0 from the script's
+    # NEWSLETTER_RESULT line so a 50/134 send never reads as a completed issue.
+    summary = "Sent newsletter via Resend."
+    notify = f"Rick sent newsletter for {workflow['title']} via Resend"
+    tally = re.search(r"^NEWSLETTER_RESULT sent=(\d+) failed=(\d+) total=(\d+)$", result.stdout or "", re.MULTILINE)
+    if tally and int(tally.group(2)) > 0:
+        sent, failed, total = tally.group(1), tally.group(2), tally.group(3)
+        summary = f"Newsletter PARTIAL delivery: {sent}/{total} sent via Resend, {failed} failed/blocked — see publish log."
+        notify = f"Rick newsletter for {workflow['title']}: PARTIAL — {sent}/{total} sent, {failed} failed/blocked"
     return StepOutcome(
-        summary="Sent newsletter via Resend.",
+        summary=summary,
         artifacts=[{"kind": "newsletter-publish-log", "title": "Newsletter Publish Log", "path": log_path, "metadata": {"provider": "resend"}}],
-        notify_text=f"Rick sent newsletter for {workflow['title']} via Resend",
+        notify_text=notify,
     )
 
 

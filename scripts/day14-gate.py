@@ -199,6 +199,11 @@ def outbound_counts():
         ts = row.get("ts") or ""
         if row.get("status") != "sent" or ts[:10] < WINDOW_START:
             continue
+        # Newsletter broadcast/welcome rows (typed 2026-07-17) are subscriber
+        # mail, not outreach touches — a 134-recipient issue must not read as
+        # a cold-founder surge here.
+        if row.get("type") in ("newsletter", "newsletter_welcome"):
+            continue
         raw += 1
         cat = categorize_send(row, cat_by_to)
         to = (row.get("to") or "").lower()

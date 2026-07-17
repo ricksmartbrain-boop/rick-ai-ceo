@@ -51,8 +51,12 @@ if [[ "$COMMA_COUNT" -gt 0 ]] || [[ "$SEMI_COUNT" -gt 0 ]] || [[ "$AT_COUNT" -gt
   exit 2
 fi
 
-# Shared email safety gate: bounce guardian, quiet hours, caps, and master kill.
-ROOT_DIR="$ROOT_DIR" python3 - <<'PYEOF'
+# Shared email safety gate: bounce guardian, quiet hours, caps, and master kill,
+# then the unified per-recipient gate (role-account, merged suppression/DNC
+# incl. '@domain' entries, 60m recent-send cap). Exit 6 = recipient blocked.
+# Exit 7 = per-minute throttle (transient — counter resets 60s after the last
+# send; callers may stall + retry, per channel-limits.json per_minute semantics).
+ROOT_DIR="$ROOT_DIR" TO_CHECK="$TO" python3 - <<'PYEOF'
 import os
 import sys
 
@@ -62,7 +66,7 @@ if root not in sys.path:
 
 try:
     from runtime.db import connect
-    from runtime.kill_switches import ChannelPaused, assert_channel_active
+    from runtime.kill_switches import ChannelPaused, assert_channel_active, is_send_allowed
 except Exception as exc:
     print(f"EMAIL SAFETY GATE UNAVAILABLE: {type(exc).__name__}: {exc}", file=sys.stderr)
     raise SystemExit(3)
@@ -71,10 +75,25 @@ conn = connect()
 try:
     assert_channel_active(conn, "email")
 except ChannelPaused as exc:
+    if str(exc.reason).startswith("per-minute cap reached"):
+        print(f"EMAIL THROTTLED: {exc.reason}", file=sys.stderr)
+        raise SystemExit(7)
     print(f"EMAIL CHANNEL PAUSED: {exc.reason}", file=sys.stderr)
     raise SystemExit(4)
 finally:
     conn.close()
+
+# Per-recipient gate. cold=False: recipients on this path are opted-in
+# subscribers / operator sends — the 7d cold frequency cap would break weekly
+# newsletters. RICK_EMAIL_SEND_LIVE gates the drip path, NOT this
+# operator-approved newsletter/broadcast path; force-pass ONLY that clause so
+# the remaining checks still run (master kill is enforced by the gate above).
+os.environ["RICK_EMAIL_SEND_LIVE"] = "1"
+to = os.environ["TO_CHECK"].strip()
+allowed, reason = is_send_allowed(to, cold=False)
+if not allowed:
+    print(f"SEND_BLOCKED reason={reason} to={to}", file=sys.stderr)
+    raise SystemExit(6)
 PYEOF
 
 # Local suppression gate: never send to bounced/unsubscribed addresses.
@@ -140,8 +159,51 @@ HTTP_STATUS=$(curl -s -X POST "https://api.resend.com/emails" \
 BODY=$(cat "$TMP_RESPONSE" 2>/dev/null || echo "")
 
 if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "201" ]]; then
-  EMAIL_ID=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
-  echo "✓ Sent to $TO (id: $EMAIL_ID)"
+  # Unparseable response => EMPTY id, never '?': warmup dedupe collapses any
+  # repeated non-empty id into one counted send, so '?' rows under-counted
+  # the cap (the unsafe direction); empty ids count per-row.
+  EMAIL_ID=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+  echo "✓ Sent to $TO (id: ${EMAIL_ID:-unparsed})"
+  # Ledger visibility: typed row so warmup counters and cross-sender 60m dedup
+  # see this volume. The row 'type' comes from RICK_LEDGER_TYPE (default
+  # 'manual' — this is also the manual operator utility); newsletter-send.sh
+  # exports 'newsletter', which day14-gate excludes from outreach counts.
+  # The email is already delivered — an append failure must NOT flip
+  # this send to FAIL (a re-run would double-send), so warn loud and exit 0.
+  ROOT_DIR="$ROOT_DIR" TO="$TO" SUBJECT="$SUBJECT" EMAIL_ID="$EMAIL_ID" RICK_LEDGER_TYPE="${RICK_LEDGER_TYPE:-manual}" python3 - <<'PYEOF' || echo "WARNING: ledger append/record_send FAILED for $TO — email-sends.jsonl undercounts this send" >&2
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = os.environ["ROOT_DIR"]
+if root not in sys.path:
+    sys.path.insert(0, root)
+
+ledger = Path(os.environ["RICK_DATA_ROOT"]) / "operations" / "email-sends.jsonl"
+ledger.parent.mkdir(parents=True, exist_ok=True)
+row = {
+    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "to": os.environ["TO"],
+    "subject": os.environ["SUBJECT"],
+    "status": "sent",
+    "type": os.environ["RICK_LEDGER_TYPE"],
+    "resend_id": os.environ["EMAIL_ID"],
+    "via": "resend-safe-send.sh",
+}
+with ledger.open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+from runtime.db import connect
+from runtime.kill_switches import record_send
+
+conn = connect()
+try:
+    record_send(conn, "email")
+finally:
+    conn.close()
+PYEOF
 else
   echo "✗ Failed: HTTP $HTTP_STATUS — $BODY" >&2
   exit 1

@@ -207,19 +207,40 @@ FAIL=0
 ERRORS=""
 
 # ── Send to each subscriber ────────────────────────────────────────────────────
+# Exit 7 from resend-safe-send.sh = per-minute cap (transient throttle; the
+# counter resets 60s after the last successful send). Per channel-limits.json
+# semantics ("dispatcher stalls + retries later") we stall past the window and
+# retry the SAME recipient instead of burning them as a permanent FAIL —
+# bounded, so a cap held by a concurrent sender cannot spin forever.
+MAX_ATTEMPTS=3
 while IFS= read -r EMAIL; do
   [[ -z "$EMAIL" ]] && continue
 
-  # Use resend-safe-send.sh — enforces one recipient per call (privacy guard)
+  # Use resend-safe-send.sh — enforces one recipient per call (privacy guard).
+  # RICK_LEDGER_TYPE=newsletter stamps the ledger row so warmup volume and
+  # day14-gate outreach counts exclude broadcast sends (wrapper default is
+  # 'manual' for operator use).
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if bash "$SCRIPT_DIR/resend-safe-send.sh" \
-      --to "$EMAIL" \
-      --subject "$SUBJECT" \
-      --html-file "$BODY_FILE"; then
+  ATTEMPT=1
+  RC=0
+  while :; do
+    RC=0
+    RICK_LEDGER_TYPE=newsletter bash "$SCRIPT_DIR/resend-safe-send.sh" \
+        --to "$EMAIL" \
+        --subject "$SUBJECT" \
+        --html-file "$BODY_FILE" || RC=$?
+    if [[ $RC -ne 7 || $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
+      break
+    fi
+    echo "  ⏸ per-minute cap — stalling 61s, then retrying $EMAIL (attempt $ATTEMPT/$MAX_ATTEMPTS)" >&2
+    sleep 61
+    (( ATTEMPT++ )) || true
+  done
+  if [[ $RC -eq 0 ]]; then
     (( SUCCESS++ )) || true
   else
-    echo "  ✗ Failed for $EMAIL" >&2
-    ERRORS="${ERRORS}\n  - ${EMAIL}: send failed"
+    echo "  ✗ Failed for $EMAIL (exit $RC)" >&2
+    ERRORS="${ERRORS}\n  - ${EMAIL}: send failed (exit $RC)"
     (( FAIL++ )) || true
   fi
 
@@ -237,6 +258,16 @@ printf "\n${LOG_ENTRY}\n" >> "$SENDS_LOG"
 
 echo ""
 echo "Done. $SUCCESS sent, $FAIL failed. Logged to $SENDS_LOG"
+# Machine-readable result line — the engine parses this to surface partial
+# delivery (FAIL>0) to the operator instead of reporting a full success.
+echo "NEWSLETTER_RESULT sent=$SUCCESS failed=$FAIL total=$COUNT"
+
+# Fail LOUD when nothing went out: a fully gate-blocked broadcast must surface
+# as a non-zero exit to the engine, never a quiet "Done. 0 sent".
+if [[ $SUCCESS -eq 0 && $FAIL -gt 0 ]]; then
+  echo "ERROR: 0 of $COUNT recipients sent — every send failed or was gate-blocked. See $SENDS_LOG." >&2
+  exit 1
+fi
 
 # ── Append to newsletter ledger (memory check input for next issue) ──────────
 # Only appends if --meta sidecar was provided and at least one send succeeded.

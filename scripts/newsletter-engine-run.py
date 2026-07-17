@@ -17,7 +17,6 @@ import fcntl
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 import subprocess
@@ -341,8 +340,6 @@ def send_email(
     subject: str,
     html: str | None = None,
     text: str | None = None,
-    *,
-    ignore_channel_pause: bool = False,
 ) -> tuple[bool, str]:
     # Unified fail-closed per-recipient gate (2026-07-13): master kill +
     # RICK_EMAIL_SEND_LIVE + merged suppression/DNC. cold=False — newsletter
@@ -361,7 +358,7 @@ def send_email(
         print(f"SEND_BLOCKED reason={gate_reason} to={to_email}", file=sys.stderr)
         return False, f"SEND_BLOCKED {gate_reason}"
     paused, reason = email_channel_paused()
-    if paused and not ignore_channel_pause:
+    if paused:
         return False, f"email-channel-paused: {reason}"
     payload: dict[str, Any] = {
         "from": FROM_EMAIL,
@@ -374,31 +371,71 @@ def send_email(
         payload["text"] = text
     status, data = request_json(RESEND_EMAILS, method="POST", payload=payload)
     if status in (200, 201) and data.get("id"):
+        _ledger_send(to_email, subject, str(data["id"]))
         return True, str(data["id"])
     return False, json.dumps(data, ensure_ascii=False)
+
+
+def _ledger_send(to_email: str, subject: str, resend_id: str) -> None:
+    """Typed email-sends.jsonl row + channel counters so warmup caps and
+    cross-sender 60m dedup see welcome sends (day14-gate excludes
+    type=newsletter_welcome from outreach counts). The email is already out —
+    an append failure must never flip the send to failed, so warn loud."""
+    try:
+        ledger = RICK_VAULT / "operations" / "email-sends.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": to_email,
+            "subject": subject,
+            "status": "sent",
+            "type": "newsletter_welcome",
+            "resend_id": resend_id,
+            "via": "newsletter-engine-run.py",
+        }
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        wsroot = str(Path(__file__).resolve().parents[1])
+        if wsroot not in sys.path:
+            sys.path.insert(0, wsroot)
+        from runtime.db import connect
+        from runtime.kill_switches import record_send
+
+        conn = connect()
+        try:
+            record_send(conn, "email")
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"LEDGER APPEND FAILED for {to_email}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def email_channel_paused() -> tuple[bool, str]:
     forced_pause = os.environ.get("RICK_EMAIL_CHANNEL_PAUSED", "").strip().lower()
     if forced_pause in {"1", "true", "yes", "paused"}:
         return True, os.environ.get("RICK_EMAIL_CHANNEL_PAUSE_REASON", "forced pause").strip()
-    db_path = Path(os.environ.get("RICK_RUNTIME_DB_FILE", str(RICK_VAULT / "runtime" / "rick-runtime.db"))).expanduser()
-    if not db_path.exists():
-        return False, ""
+    # Real channel gate (2026-07-17): master kill + pause + quiet hours +
+    # daily/per-minute caps + warmup ramp, fail CLOSED. The old hand-rolled
+    # status=='paused' check missed all of those and failed OPEN on errors.
     try:
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT status, paused_until, pause_reason FROM channel_state WHERE channel='email'").fetchone()
-        conn.close()
-        if not row or row[0] != "paused":
-            return False, ""
-        paused_until = row[1] or ""
-        if paused_until:
-            until = parse_dt(paused_until)
-            if datetime.now(timezone.utc) >= until:
-                return False, ""
-        return True, row[2] or f"paused until {paused_until}"
-    except Exception:
+        wsroot = str(Path(__file__).resolve().parents[1])
+        if wsroot not in sys.path:
+            sys.path.insert(0, wsroot)
+        from runtime.db import connect
+        from runtime.kill_switches import ChannelPaused, assert_channel_active
+    except Exception as exc:
+        return True, f"channel_gate_unavailable:{type(exc).__name__}: {exc}"
+    try:
+        conn = connect()
+        try:
+            assert_channel_active(conn, "email")
+        finally:
+            conn.close()
         return False, ""
+    except ChannelPaused as exc:
+        return True, exc.reason
+    except Exception as exc:
+        return True, f"channel_gate_error:{type(exc).__name__}: {exc}"
 
 
 def welcome_template(email: str) -> tuple[str, str]:
@@ -508,7 +545,7 @@ def main() -> int:
         if args.dry_run:
             ok, detail = True, "dry-run"
         else:
-            ok, detail = send_email(contact.email, subject, html=html, ignore_channel_pause=True)
+            ok, detail = send_email(contact.email, subject, html=html)
         if ok:
             welcomes_sent_now.append((contact.email, detail))
             lines.append(f"Welcome sent: {contact.email} -> {detail}")
