@@ -55,6 +55,9 @@ DB_FILE = DATA_ROOT / "runtime" / "rick-runtime.db"
 LOG_FILE = DATA_ROOT / "operations" / "rick-guardian.jsonl"
 ALERTS_FALLBACK = DATA_ROOT / "control" / "alerts-pending.jsonl"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
+# Dirs under outbox holding artifacts that must NEVER send (quarantined
+# duplicates, archives, drills) — excluded from the pending-queue count.
+OUTBOX_HELD_DIR_PREFIXES = ("quarantine-", "archive-", "held-", "drill-")
 EMAIL_SEND_LOGS = [
     DATA_ROOT / "operations" / "email-sends.jsonl",
     DATA_ROOT / "operations" / "email-sequence-send.jsonl",
@@ -357,8 +360,20 @@ def _tail_lines(path: Path) -> list[str]:
     except OSError:
         return []
 
+def _is_pending_draft(path: Path) -> bool:
+    """True for a real queued draft; False for docs / held artifacts."""
+    if path.name in ("README.md", "MANIFEST.md"):
+        return False
+    return not any(
+        part.startswith(OUTBOX_HELD_DIR_PREFIXES)
+        for part in path.relative_to(OUTBOX_DIR).parts
+    )
+
 def check_sender(alerts: list) -> dict:
-    pending = list(OUTBOX_DIR.rglob("*.md")) if OUTBOX_DIR.exists() else []
+    pending = (
+        [p for p in OUTBOX_DIR.rglob("*.md") if _is_pending_draft(p)]
+        if OUTBOX_DIR.exists() else []
+    )
     oldest_age_h = 0.0
     if pending:
         oldest = min(p.stat().st_mtime for p in pending)
