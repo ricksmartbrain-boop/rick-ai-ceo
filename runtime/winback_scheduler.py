@@ -129,7 +129,13 @@ def load_suppressions() -> set[str]:
 
 def cancel_reason_for(email: str, payload: dict) -> str:
     """Durable cancel reason if one exists: churn/cancel-reasons.jsonl first
-    (latest matching row wins), then the subscription event payload."""
+    (latest matching row wins), then the subscription event payload.
+
+    Both producers key the address as "customer" (stripe-poll harvest +
+    reply-triage capture, cd53425). Quote material in preference order:
+    verbatim_text (the customer's own reply) > comment > feedback (Stripe
+    survey). Machine placeholders/enums ('none', reason codes like
+    cancellation_requested) are never quoted back at a customer."""
     reason = ""
     if CANCEL_REASONS.exists():
         for raw in CANCEL_REASONS.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -137,8 +143,14 @@ def cancel_reason_for(email: str, payload: dict) -> str:
                 row = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if str(row.get("email", "")).strip().lower() == email.lower():
-                reason = str(row.get("reason") or row.get("cancel_reason") or "").strip() or reason
+            addr = str(row.get("customer") or row.get("email") or "").strip().lower()
+            if addr != email.lower():
+                continue
+            for key in ("verbatim_text", "comment", "feedback"):
+                val = str(row.get(key) or "").strip()
+                if val and val.lower() != "none":
+                    reason = val
+                    break
     if not reason:
         reason = str(payload.get("cancel_reason") or payload.get("feedback") or "").strip()
     return " ".join(reason.split())[:200]
@@ -229,7 +241,10 @@ def build_item(cand: dict) -> dict:
     amount = metadata.get("amount_usd") or metadata.get("first_purchase_amount_usd") or ""
     name = cand["name"].strip()
     first_name = name.split()[0] if name else email.split("@")[0]
-    cancel_date = str(payload.get("canceled_at") or "")[:10]
+    # subscription_status_changed payloads carry no canceled_at — the customers
+    # metadata row does (e.g. russian@'s Nat-pattern sync). Payload kept as
+    # fallback in case a future producer adds it.
+    cancel_date = str(metadata.get("canceled_at") or payload.get("canceled_at") or "")[:10]
     reason = cancel_reason_for(email, payload)
 
     if "lingualive" in product.lower():
