@@ -7,6 +7,7 @@ import argparse
 import calendar
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 DATA_ROOT = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 SEQUENCES_DIR = DATA_ROOT / "mailbox" / "sequences"
 OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
+SENT_DIR = DATA_ROOT / "mailbox" / "sent"
 LOG_FILE = DATA_ROOT / "operations" / "email-sequence-dispatch.jsonl"
 RUNTIME_DB = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
 
@@ -99,13 +101,51 @@ def renewal_block_reason(enrollment: dict) -> str | None:
     try:
         connection = sqlite3.connect(f"file:{RUNTIME_DB}?mode=ro", uri=True, timeout=5)
         try:
-            row = connection.execute("SELECT status FROM customers WHERE email = ?", (email,)).fetchone()
+            # lower(email) mirrors stripe-poll's lookup — engine normalizes
+            # inserts today, but a backfilled/imported row must still match.
+            row = connection.execute("SELECT status FROM customers WHERE lower(email) = lower(?)", (email,)).fetchone()
         finally:
             connection.close()
     except sqlite3.Error as err:
         return f"customers-lookup-failed:{err}"
-    if row is not None and str(row[0]) in ("canceling", "canceled"):
+    if row is None:
+        # Fail closed: no customers row means the "renews on X, access
+        # continues" claim cannot be verified — withhold. Transient reason
+        # (deliberately NOT prefixed "customer-") so the enrollment stays
+        # open; the step retries once the row is backfilled.
+        return "no-customer-row"
+    if str(row[0]) in ("canceling", "canceled"):
         return f"customer-{row[0]}"
+    return None
+
+
+_STAMP_RE = re.compile(r"\d{8}-\d{6}")
+
+
+def existing_step_draft(sequence_name: str, email_slug: str, step_num: int, enrollment: dict) -> Path | None:
+    """Prior draft for this (enrollee, step) from THIS enrollment — in the
+    outbox (queued, unsent) or sent dir (already delivered).
+
+    Filenames embed the run timestamp, so a crash after the draft write but
+    before the sequence.json write re-renders the step under a NEW name on
+    the next cycle and the sender eventually delivers both. This claim check
+    makes the re-run idempotent. Scoped by filename stamp >= enrolled_at so
+    a future re-purchase that re-enrolls the same address is not deduped
+    against last cycle's files."""
+    enrolled_at = parse_timestamp(str(enrollment.get("enrolled_at", "")))
+    # Unparseable enrolled_at -> match any stamp (withhold-leaning, never a resend).
+    min_stamp = enrolled_at.strftime("%Y%m%d-%H%M%S") if enrolled_at else "00000000-000000"
+    suffix = f"-{email_slug}-step{step_num}.md"
+    for directory in (OUTBOX_DIR / sequence_name, SENT_DIR / sequence_name):
+        if not directory.exists():
+            continue
+        for candidate in sorted(directory.iterdir()):
+            name = candidate.name
+            if not name.endswith(suffix):
+                continue
+            stamp = name[: -len(suffix)]
+            if _STAMP_RE.fullmatch(stamp) and stamp >= min_stamp:
+                return candidate
     return None
 
 
@@ -181,29 +221,40 @@ def dispatch_sequence(config_path: Path, *, current_time: datetime, dry_run: boo
             )
             continue
 
-        rendered = render_template(template_path.read_text(encoding="utf-8"), enrollment)
         stamp = current_time.strftime("%Y%m%d-%H%M%S")
         email_slug = str(enrollment.get("email", "unknown")).replace("@", "-at-").replace(".", "-")
-        outbox_path = sequence_outbox / f"{stamp}-{email_slug}-step{int(step.get('step', 0) or 0)}.md"
+        step_num = int(step.get("step", 0) or 0)
+
+        # Crash-recovery claim: if a prior run already wrote this step's
+        # draft but died before persisting sequence.json, do NOT render a
+        # second file — repair the state row and log it loudly instead.
+        existing = existing_step_draft(sequence_name, email_slug, step_num, enrollment)
+        outbox_path = existing or (sequence_outbox / f"{stamp}-{email_slug}-step{step_num}.md")
 
         if not dry_run:
-            outbox_path.write_text(rendered.rstrip() + "\n", encoding="utf-8")
-            enrollment["current_step"] = int(step.get("step", 0) or 0)
+            if existing is None:
+                rendered = render_template(template_path.read_text(encoding="utf-8"), enrollment)
+                outbox_path.write_text(rendered.rstrip() + "\n", encoding="utf-8")
+            enrollment["current_step"] = step_num
             enrollment["last_sent_at"] = current_time.isoformat(timespec="seconds")
             sent_steps = enrollment.get("sent_steps", [])
             if not isinstance(sent_steps, list):
                 sent_steps = []
-            sent_steps.append(int(step.get("step", 0) or 0))
+            sent_steps.append(step_num)
             enrollment["sent_steps"] = sorted(set(sent_steps))
             if enrollment["current_step"] >= max(int(item.get("step", 0) or 0) for item in payload.get("steps", []) if isinstance(item, dict)):
                 enrollment["status"] = "completed"
 
+        if existing is not None:
+            status = "already-drafted"
+        else:
+            status = "drafted" if not dry_run else "due"
         dispatched.append(
             {
                 "sequence": sequence_name,
                 "email": enrollment.get("email", ""),
-                "step": int(step.get("step", 0) or 0),
-                "status": "drafted" if not dry_run else "due",
+                "step": step_num,
+                "status": status,
                 "outbox_path": str(outbox_path),
             }
         )
