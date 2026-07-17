@@ -5919,6 +5919,13 @@ def guard_non_owner_mutation(
     return reason
 
 
+# Steps whose handler raises ApprovalRequired INSIDE the step that performs
+# the gated action (see the two-pattern note in resolve_approval). Any new
+# handler that gates mid-step MUST be listed here or its approval resolves
+# to a silent no-op.
+SELF_GATED_STEPS = frozenset({"pitch_send"})
+
+
 def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision: str, note: str, actor: str) -> dict[str, Any]:
     approval = connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
     if approval is None:
@@ -5968,6 +5975,20 @@ def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision:
         return {"approval_id": approval_id, "status": decision}
 
     if decision == "approved":
+        # Two approval patterns exist. Dedicated approval-gate steps (launch,
+        # fiverr publish/delivery, upwork proposal/delivery) do their gated
+        # action in the NEXT step, so approved = done + advance. Self-gated
+        # steps raise ApprovalRequired inside the step that performs the
+        # action itself — marking those done would skip the action entirely
+        # (approved $499+ pitches silently never sent, found 2026-07-17).
+        # These get re-queued; their handler checks the granted approval row
+        # and proceeds past its gate on the re-run.
+        if job["step_name"] in SELF_GATED_STEPS:
+            mark_job(connection, job["id"], "queued")
+            update_workflow(connection, workflow["id"], status="active", stage="approval-cleared")
+            notify_operator(connection, f"Approval accepted for {workflow['title']} [{approval_id}] — executing now", workflow_id=workflow["id"], lane=workflow["lane"], purpose="approval")
+            connection.commit()
+            return {"approval_id": approval_id, "status": decision, "requeued_job": job["id"]}
         mark_job(connection, job["id"], "done")
         nxt = next_step(workflow["kind"], job["step_name"])
         if nxt is not None:

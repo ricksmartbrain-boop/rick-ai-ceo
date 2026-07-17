@@ -326,8 +326,9 @@ class RuntimeWorkflowTests(unittest.TestCase):
         self.assertEqual(row["stage"], "completed")
         self.assertIsNotNone(row["finished_at"])
 
-        # Mid step → next step queued, workflow stays open.
-        approval_mid = make_blocked("wf_drill_mid", "pitch_send", 3)
+        # Mid step (gate pattern: action lives in the NEXT step) → next step
+        # queued, workflow stays open.
+        approval_mid = make_blocked("wf_drill_mid", "followup_sequence", 4)
         with patch.object(self.engine, "notify_operator", return_value=None):
             self.engine.resolve_approval(self.connection, approval_mid, "approved", "", "telegram")
         row = self.connection.execute(
@@ -337,9 +338,83 @@ class RuntimeWorkflowTests(unittest.TestCase):
         self.assertEqual(row["stage"], "approval-cleared")
         self.assertIsNone(row["finished_at"])
         queued = self.connection.execute(
-            "SELECT COUNT(*) AS c FROM jobs WHERE workflow_id = 'wf_drill_mid' AND status = 'queued'"
+            "SELECT step_name FROM jobs WHERE workflow_id = 'wf_drill_mid' AND status = 'queued'"
+        ).fetchall()
+        self.assertEqual([r["step_name"] for r in queued], ["close_or_escalate"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM jobs WHERE id = 'job_wf_drill_mid'"
+            ).fetchone()["status"],
+            "done",
+        )
+
+    def test_approved_self_gated_step_requeues_same_job(self) -> None:
+        # pitch_send raises ApprovalRequired INSIDE the step that performs the
+        # send. Marking it done on approval would skip the send entirely —
+        # Vlad approves a $499+/$2,500 pitch and nothing ever reaches the
+        # prospect (silent no-op, found 2026-07-17). Approval must re-run the
+        # SAME job; the handler's granted-approval guard lets the re-run pass
+        # its gate. If this test fails, approved high-value pitches are
+        # silently evaporating again.
+        ts = "2026-07-17T09:00:00"
+        self.connection.execute(
+            """
+            INSERT INTO workflows
+              (id, kind, title, slug, project, status, stage, priority, owner, lane,
+               telegram_target, openclaw_session_key, context_json, created_at, updated_at,
+               started_at, finished_at)
+            VALUES ('wf_selfgate', 'deal_close', 'Close deal: selfgate', 'wf-selfgate', 'deals',
+                    'blocked', 'awaiting-approval', 15, 'rick', 'customer-lane', '', '', '{}',
+                    ?, ?, NULL, NULL)
+            """,
+            (ts, ts),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO jobs
+              (id, workflow_id, step_name, step_index, status, title, route, lane,
+               payload_json, approval_id, created_at, updated_at, run_after)
+            VALUES ('job_selfgate', 'wf_selfgate', 'pitch_send', 3, 'blocked', 'pitch_send',
+                    'writing', 'customer-lane', '{}', 'apr_selfgate', ?, ?, ?)
+            """,
+            (ts, ts, ts),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO approvals
+              (id, workflow_id, job_id, status, area, request_text, impact_text,
+               policy_basis, requested_by, created_at)
+            VALUES ('apr_selfgate', 'wf_selfgate', 'job_selfgate', 'open', 'irreversible-brand',
+                    'Send $2500 pitch to lead', '', '', 'rick', ?)
+            """,
+            (ts,),
+        )
+        self.connection.commit()
+        self.assertIn("pitch_send", self.engine.SELF_GATED_STEPS)
+        with patch.object(self.engine, "notify_operator", return_value=None):
+            self.engine.resolve_approval(self.connection, "apr_selfgate", "approved", "", "telegram")
+        job = self.connection.execute(
+            "SELECT status FROM jobs WHERE id = 'job_selfgate'"
         ).fetchone()
-        self.assertEqual(queued["c"], 1)
+        self.assertEqual(job["status"], "queued")
+        wf = self.connection.execute(
+            "SELECT status, stage, finished_at FROM workflows WHERE id = 'wf_selfgate'"
+        ).fetchone()
+        self.assertEqual(wf["status"], "active")
+        self.assertEqual(wf["stage"], "approval-cleared")
+        self.assertIsNone(wf["finished_at"])
+        # No NEXT step was queued — the re-run of pitch_send itself advances
+        # the workflow when it completes.
+        others = self.connection.execute(
+            "SELECT COUNT(*) AS c FROM jobs WHERE workflow_id = 'wf_selfgate' AND id != 'job_selfgate'"
+        ).fetchone()
+        self.assertEqual(others["c"], 0)
+        # The approval row is now 'approved' — exactly what the handler's
+        # guard reads to pass its gate on the re-run.
+        apr = self.connection.execute(
+            "SELECT status FROM approvals WHERE id = 'apr_selfgate'"
+        ).fetchone()
+        self.assertEqual(apr["status"], "approved")
 
     def test_publish_bundle_marks_workflow_published(self) -> None:
         workflow_id = self.engine.queue_info_product_workflow(
