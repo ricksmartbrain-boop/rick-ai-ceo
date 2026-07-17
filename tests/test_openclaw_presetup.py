@@ -119,6 +119,30 @@ class OpenClawPreSetupTests(unittest.TestCase):
         )
         self.assertNotIn("thread mode enabled but session policy file is missing", after.stdout)
 
+    def test_guardrails_audit_founder_gating_reads_openclaw_allowlist(self) -> None:
+        # Real Telegram gating is the openclaw.json allowlist, not legacy env vars:
+        # the audit must pass on a restrictive config and fail closed otherwise.
+        config_path = self.temp_path / "openclaw.json"
+        self.base_env["RICK_OPENCLAW_CONFIG_FILE"] = str(config_path)
+
+        config_path.write_text(
+            json.dumps({"channels": {"telegram": {"dmPolicy": "allowlist", "allowFrom": [203132131], "groupPolicy": "allowlist"}}}),
+            encoding="utf-8",
+        )
+        restrictive = self.run_script("scripts/guardrails-audit.sh")
+        self.assertIn("| Founder control gating | pass |", restrictive.stdout)
+
+        config_path.write_text(
+            json.dumps({"channels": {"telegram": {"dmPolicy": "allowlist", "allowFrom": [], "groupPolicy": "allowlist"}}}),
+            encoding="utf-8",
+        )
+        empty_allowlist = self.run_script("scripts/guardrails-audit.sh")
+        self.assertIn("| Founder control gating | fail |", empty_allowlist.stdout)
+
+        config_path.unlink()
+        missing = self.run_script("scripts/guardrails-audit.sh")
+        self.assertIn("| Founder control gating | fail |", missing.stdout)
+
     def test_docs_capture_single_agent_now_and_four_agent_later(self) -> None:
         readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
         setup_doc = (ROOT_DIR / "OPENCLAW_SETUP.md").read_text(encoding="utf-8")
