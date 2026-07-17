@@ -152,8 +152,23 @@ def send_telegram_alert(text: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Dedupe via notification_dedupe (pattern from engine.notify_operator_deduped)
 # ---------------------------------------------------------------------------
+# Volatile fragments must not evade dedup: churn countdowns ("lapses in 1.9
+# day(s)" -> 1.8 -> ...) re-fired the same alert every cycle (2026-07-17).
+# Guardian kinds are fully parameterized identities (guardian:churn:{cid}),
+# so hashing with all numbers stripped is safe.
+_DEDUP_NORMALIZE_PATTERNS = [
+    re.compile(r"\(suppressed x\d+ in last \d+h\)"),
+    re.compile(r"\b[a-z]+_[0-9a-f]{6,}\b"),                      # ULIDs / hex IDs
+    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"),  # ISO ts
+    re.compile(r"\b\d+(\.\d+)?\b"),                              # bare numbers / countdowns
+]
+
+
 def _dedup_hash(text: str, kind: str) -> str:
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    normalized = (text or "").strip()
+    for pat in _DEDUP_NORMALIZE_PATTERNS:
+        normalized = pat.sub("", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
     return hashlib.sha1(f"{kind}|{normalized}".encode("utf-8")).hexdigest()[:16]
 
 def _dedup_allowed(kind: str, text: str, window_hours: int) -> bool:

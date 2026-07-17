@@ -1606,6 +1606,7 @@ _DEDUP_NORMALIZE_PATTERNS = [
     re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"),  # ISO ts
     re.compile(r"\b\d+\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b", re.I),  # durations
     re.compile(r"\bworkflow [a-z0-9_-]{4,}\b", re.I),            # workflow IDs
+    re.compile(r"\b\d+(\.\d+)?\b"),  # bare numbers — countdowns/counts must not evade dedup (2026-07-17)
 ]
 
 
@@ -1641,9 +1642,12 @@ def notify_operator_deduped(
     URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
     is_urgent = (purpose or "").lower() in URGENT_PURPOSES or any(kw in text for kw in URGENT_KEYWORDS)
     if is_urgent:
-        notify_operator(connection, text, workflow_id=workflow_id, lane=lane,
-                        purpose=purpose, chat_id=chat_id, thread_id=thread_id)
-        return "sent_first"
+        # Urgent means jump the queue, NOT exempt from idempotence: the old
+        # full bypass re-sent identical CHURN/🚨 alerts every cycle
+        # (2026-07-17 ops-chat spam). First occurrence still sends instantly
+        # via the normal path below; identical repeats re-ping at most
+        # every 4h instead of every 24h.
+        dedup_window_hours = min(dedup_window_hours, 4)
 
     try:
         h = _dedup_hash(text, kind)
