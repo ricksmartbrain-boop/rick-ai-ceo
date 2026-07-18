@@ -996,12 +996,30 @@ def sync_subscription_statuses(api_key: str, conn, state: dict, *, dry_run: bool
             (email,),
         ).fetchone()
         if row is None:
-            # Record in known deliberately: a missing customers row needs a
-            # manual backfill; repeating the ERROR every poll would be spam.
+            # Auto-backfill (2026-07-18): the webhook path can fulfill+enroll
+            # before any customers row exists (vojta), and the old ERROR line
+            # left the sale invisible to the churn guard, renewal gates, and
+            # the day-14 scoreboard — with nothing ever retrying. Everything
+            # a row needs is in hand; create it loudly.
+            stamp = datetime.now().isoformat(timespec="seconds")
+            backfill_id = f"cus_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                "INSERT INTO customers (id, email, name, source, latest_workflow_id, status, "
+                "tags_json, metadata_json, created_at, updated_at, last_seen_at) "
+                "VALUES (?, ?, '', 'stripe-poll-backfill', NULL, ?, '[]', ?, ?, ?, ?)",
+                (
+                    backfill_id,
+                    email.strip().lower(),
+                    effective,
+                    json.dumps({"subscription_id": sub_id, "end_date": end_date or "", "backfilled_at": stamp}),
+                    stamp, stamp, stamp,
+                ),
+            )
+            conn.commit()
             known[sub_id] = effective
             print(
-                f"ERROR: {email} ({sub_id}, {effective}) has no row in customers — "
-                f"local DB out of sync, backfill needed.",
+                f"BACKFILLED: customers row {backfill_id} created for {email} "
+                f"({sub_id}, {effective}) — row was missing, sale was invisible locally.",
                 file=sys.stderr,
             )
             continue
