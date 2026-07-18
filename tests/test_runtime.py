@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from datetime import datetime, timedelta
 import os
 import subprocess
 import sys
@@ -714,16 +715,31 @@ class RuntimeWorkflowTests(unittest.TestCase):
             "email_sequence_dispatch",
             ROOT_DIR / "skills" / "email-automation" / "scripts" / "email-sequence-dispatch.py",
         )
+        seq_path = self.data_root / "mailbox" / "sequences" / "dispatchable-product-post-purchase" / "sequence.json"
+
+        # Fresh enrollment: step 1 is born satisfied (the delivery_email job
+        # already sent access — dispatching step 1 would duplicate it, the
+        # 2026-07-18 vojta near-dup), so dispatch must find NOTHING due today.
         result = dispatcher.command_dispatch(dry_run=False)
         self.assertEqual(result, 0)
-
         outbox_dir = self.data_root / "mailbox" / "outbox" / "dispatchable-product-post-purchase"
+        self.assertEqual(list(outbox_dir.glob("*.md")), [])
+        sequence_payload = json.loads(seq_path.read_text(encoding="utf-8"))
+        self.assertEqual(sequence_payload["enrollments"][0]["sent_steps"], [1])
+
+        # Age the enrollment 3 days: step 2 (delay 2d) becomes the FIRST step
+        # the dispatcher ever renders for a buyer.
+        aged = (datetime.now() - timedelta(days=3)).isoformat(timespec="seconds")
+        sequence_payload["enrollments"][0]["enrolled_at"] = aged
+        sequence_payload["enrollments"][0]["last_sent_at"] = aged
+        seq_path.write_text(json.dumps(sequence_payload, indent=2) + "\n", encoding="utf-8")
+
+        result = dispatcher.command_dispatch(dry_run=False)
+        self.assertEqual(result, 0)
         drafts = list(outbox_dir.glob("*.md"))
         self.assertEqual(len(drafts), 1)
-        sequence_payload = json.loads(
-            (self.data_root / "mailbox" / "sequences" / "dispatchable-product-post-purchase" / "sequence.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(sequence_payload["enrollments"][0]["current_step"], 1)
+        sequence_payload = json.loads(seq_path.read_text(encoding="utf-8"))
+        self.assertEqual(sequence_payload["enrollments"][0]["current_step"], 2)
 
     def test_dispatch_withholds_renewal_notice_from_canceled_customers(self) -> None:
         # WHY: stripe-poll flips customers.status on cancel but nothing closes

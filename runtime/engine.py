@@ -2959,6 +2959,11 @@ def enroll_post_purchase_sequence(
             return enrollment
 
     first_name = (customer_name.strip().split()[0] if customer_name.strip() else "").strip() or "there"
+    # Step 1 (welcome-1-delivery) starts satisfied: the post-purchase
+    # workflow's delivery_email job has already sent access by the time
+    # sequence_enroll runs, so dispatching step 1 would send a near-duplicate
+    # welcome — only the 7-day frequency cap blocked one for vojta on
+    # 2026-07-18, and it would have shipped stale when the cap aged out.
     record = {
         "email": normalized_email,
         "first_name": first_name,
@@ -2966,10 +2971,11 @@ def enroll_post_purchase_sequence(
         "delivery_url": delivery_url,
         "workflow_id": workflow_id,
         "enrolled_at": now_iso(),
-        "current_step": 0,
+        "current_step": 1,
         "status": "active",
-        "last_sent_at": "",
-        "sent_steps": [],
+        "last_sent_at": now_iso(),
+        "sent_steps": [1],
+        "step1_note": "satisfied by post-purchase delivery_email; sequence starts at step 2",
     }
     if is_subscription_product(product_name):
         # Billing anchor approximated by enrollment time (fulfillment now
