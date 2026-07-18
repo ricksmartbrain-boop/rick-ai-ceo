@@ -551,10 +551,12 @@ def is_send_allowed(email: str, *, cold: bool = True) -> tuple[bool, str]:
         if _env_flag("RICK_EMAIL_SEND_LIVE", "0") != "1":
             return False, "not_live:RICK_EMAIL_SEND_LIVE!=1"
         try:
-            from runtime.email_validator import is_role_account
+            from runtime.email_validator import is_placeholder_domain, is_role_account
 
             if is_role_account(target):
                 return False, f"role_account:{target.split('@', 1)[0]}"
+            if is_placeholder_domain(target):
+                return False, f"placeholder_domain:{target.rsplit('@', 1)[-1]}"
         except Exception as exc:
             return False, f"validator_error:{type(exc).__name__}:{exc}"
         merged = load_merged_suppression()

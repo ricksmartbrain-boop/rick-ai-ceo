@@ -174,6 +174,30 @@ def is_disposable_domain(email: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Placeholder / example-domain check
+# ---------------------------------------------------------------------------
+# Domains that appear in docs, demos, and templates but never belong to a
+# real prospect. A sourced contact at one of these is a scrape artifact —
+# sam@acme.com went out to keyline.sh's "founder" on 2026-07-18 because
+# nothing rejected it.
+_PLACEHOLDER_DOMAINS: frozenset[str] = frozenset({
+    "acme.com", "example.com", "example.org", "example.net", "example.co",
+    "test.com", "sample.com", "domain.com", "yourdomain.com",
+    "yourcompany.com", "mycompany.com", "company.com", "email.com",
+    "foo.com", "bar.com", "foobar.com", "placeholder.com",
+})
+
+
+def is_placeholder_domain(email: str) -> bool:
+    """Return True if the domain is a docs/demo placeholder (acme.com, example.com, …)."""
+    try:
+        _, domain = _parse_parts(email)
+    except ValueError:
+        return False
+    return domain in _PLACEHOLDER_DOMAINS
+
+
+# ---------------------------------------------------------------------------
 # Role account check
 # ---------------------------------------------------------------------------
 

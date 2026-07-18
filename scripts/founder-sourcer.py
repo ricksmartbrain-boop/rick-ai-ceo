@@ -896,10 +896,16 @@ def main() -> int:
             # 2026-07-16: the send gate (kill_switches → email_validator
             # is_role_account) permanently blocks role inboxes — drafting
             # them just strands outbox items. Same check, at source.
-            from runtime.email_validator import is_role_account
+            from runtime.email_validator import is_placeholder_domain, is_role_account
             if is_role_account(email):
                 counts["disqualified"] += 1
                 _log("qualify.skip_role_account", domain=domain)
+                continue
+            # 2026-07-18: sam@acme.com shipped for keyline.sh — scraped
+            # placeholder contacts must die at source too.
+            if is_placeholder_domain(email):
+                counts["disqualified"] += 1
+                _log("qualify.skip_placeholder_domain", domain=domain)
                 continue
             if email in known_emails or is_suppressed_address(email):
                 counts["deduped"] += 1

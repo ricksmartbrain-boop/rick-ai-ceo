@@ -565,7 +565,7 @@ class EmailSendSafetyTests(unittest.TestCase):
             (data_root / "operations").mkdir(parents=True)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             (data_root / "operations" / "email-sends.jsonl").write_text(
-                json.dumps({"status": "sent", "to": "founder@example.com", "ts": now}) + "\n",
+                json.dumps({"status": "sent", "to": "founder@example.test", "ts": now}) + "\n",
                 encoding="utf-8",
             )
             with patch.dict(
@@ -578,7 +578,7 @@ class EmailSendSafetyTests(unittest.TestCase):
                 clear=False,
             ):
                 kill_switches = self.reload_kill_switches()
-                allowed, reason = kill_switches.is_send_allowed("founder@example.com", cold=False)
+                allowed, reason = kill_switches.is_send_allowed("founder@example.test", cold=False)
                 self.assertFalse(allowed)
                 self.assertIn("recent_send_cap_60m", reason)
             self.reload_kill_switches()
@@ -596,13 +596,13 @@ class EmailSendSafetyTests(unittest.TestCase):
                 {
                     "ts": now,
                     "stage": "followup_day5_sent",
-                    "email": "blockedlead@example.com",
+                    "email": "blockedlead@example.test",
                     "resend_id": "channel_paused: sender warmup cap reached (0); ok",
                 },
                 {
                     "ts": now,
                     "stage": "followup_day5_sent",
-                    "email": "reallead@example.com",
+                    "email": "reallead@example.test",
                     "resend_id": "f88e6ee3-34e2-4e93-b777-e463cf2bed01",
                 },
             ]
@@ -620,10 +620,10 @@ class EmailSendSafetyTests(unittest.TestCase):
                 clear=False,
             ):
                 kill_switches = self.reload_kill_switches()
-                self.assertIsNone(kill_switches.last_send_ts("blockedlead@example.com"))
-                allowed, reason = kill_switches.is_send_allowed("blockedlead@example.com", cold=True)
+                self.assertIsNone(kill_switches.last_send_ts("blockedlead@example.test"))
+                allowed, reason = kill_switches.is_send_allowed("blockedlead@example.test", cold=True)
                 self.assertTrue(allowed, f"phantom send must not block re-touch: {reason}")
-                allowed, reason = kill_switches.is_send_allowed("reallead@example.com", cold=True)
+                allowed, reason = kill_switches.is_send_allowed("reallead@example.test", cold=True)
                 self.assertFalse(allowed)
                 self.assertIn("recent_send_cap_60m", reason)
             self.reload_kill_switches()
@@ -1270,6 +1270,75 @@ class DunningHardeningTests(unittest.TestCase):
             )
         self.assertEqual(n, 1)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "cancelled")
+
+
+class PlaceholderDomainTests(unittest.TestCase):
+    """sam@acme.com went out to keyline.sh's 'founder' on 2026-07-18 — a
+    scraped docs-placeholder contact that nothing rejected. The gate must
+    treat placeholder domains like role accounts: permanently unsendable."""
+
+    def reload_kill_switches(self):
+        import importlib
+        import runtime.kill_switches as ks
+        return importlib.reload(ks)
+
+    def test_validator_flags_placeholder_domains_only(self) -> None:
+        from runtime.email_validator import is_placeholder_domain
+        self.assertTrue(is_placeholder_domain("sam@acme.com"))
+        self.assertTrue(is_placeholder_domain("ceo@example.com"))
+        self.assertFalse(is_placeholder_domain("founder@keyline.sh"))
+        self.assertFalse(is_placeholder_domain("reader@example.test"))
+
+    def test_unified_send_gate_blocks_placeholder_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "RICK_DATA_ROOT": tmp,
+                    "RICK_EMAIL_SEND_LIVE": "1",
+                    "RICK_OUTBOUND_ENABLED": "1",
+                },
+                clear=False,
+            ):
+                kill_switches = self.reload_kill_switches()
+                allowed, reason = kill_switches.is_send_allowed("sam@acme.com", cold=True)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "placeholder_domain:acme.com")
+            self.reload_kill_switches()
+
+
+class SequenceEnrollStartsPastWelcomeTests(unittest.TestCase):
+    """The post-purchase delivery_email already sends access before
+    sequence_enroll runs, so a fresh enrollment dispatching step 1 sends a
+    near-duplicate welcome (vojta, 2026-07-18 — only the 7-day cap blocked
+    it, and it would have shipped stale when the cap aged out). Enrollment
+    must start with step 1 already satisfied."""
+
+    def test_new_enrollment_marks_step1_satisfied(self) -> None:
+        import runtime.engine as engine
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "sequence.json"
+            cfg.write_text(json.dumps({
+                "name": "x-post-purchase",
+                "steps": [
+                    {"step": 1, "delay_days": 0, "template": "welcome-1-delivery.md"},
+                    {"step": 2, "delay_days": 2, "template": "welcome-2-quick-win.md"},
+                ],
+                "enrollments": [],
+            }), encoding="utf-8")
+            record = engine.enroll_post_purchase_sequence(
+                sequence_config_path=cfg,
+                email="Buyer@Example.Test",
+                customer_name="",
+                delivery_url="https://example.test/app",
+                product_name="X Subscription",
+                workflow_id="wf_test",
+            )
+            self.assertEqual(record["sent_steps"], [1])
+            self.assertEqual(record["current_step"], 1)
+            self.assertTrue(record["last_sent_at"])
+            on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["enrollments"][0]["sent_steps"], [1])
 
 
 class FollowupSequenceParseTests(unittest.TestCase):
