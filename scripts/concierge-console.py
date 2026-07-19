@@ -21,8 +21,16 @@ published, never shared.
 Deterministic parsing, zero rewriting of draft content, stdlib only, no LLM.
 Fails loud (nonzero exit) if any draft is missing or fails to parse.
 
+D3/D2 additions (2026-07-19 spec): renders the NN-dossier.md files and
+hn-cards.json that scripts/concierge-dossier.py generates — ALL LLM work is
+isolated in that script; this one only renders what is on disk. Per-card
+collapsible dossier block ('SITE DIFFERS' dossiers open by default), cards
+ordered by expected value (warmest signal / most verified facts first; HN
+cards freshest thread first), CONCIERGE_BOOKING_URL rendered only when the
+env var is set (cal.com drops in later, zero code change).
+
 Usage: python3 scripts/concierge-console.py
-Re-run after any draft or CHECKLIST edit — the page is a snapshot.
+Re-run after any draft, dossier, or CHECKLIST edit — the page is a snapshot.
 """
 import datetime
 import html
@@ -41,6 +49,12 @@ EXPECTED_DRAFTS = 21
 # Practical mailto URL limit: above this many URL-encoded body chars the
 # mailto carries subject only and the row directs to the copy button.
 MAILTO_BODY_LIMIT = 1800
+# D2 Phase-1 cards written by scripts/concierge-dossier.py (never by hand).
+HN_CARDS_JSON = os.path.join(BATCH_DIR, "hn-cards.json")
+# cal.com lands later with ZERO code change: link renders only when set.
+BOOKING_URL = os.environ.get("CONCIERGE_BOOKING_URL", "").strip()
+# Marker string the dossier generator emits on re-fetch drift (Rule 7).
+DIFFERS_MARKER = "SITE DIFFERS FROM DRAFT ASSUMPTIONS"
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # Bare domains / URLs in the To/Channel lines (not preceded by @ = handles,
@@ -138,7 +152,24 @@ def extract_section(checklist_text, header_prefix):
     return "\n".join(lines[start:]).strip("\n") if start is not None else ""
 
 
-def build_rows(drafts, ticks):
+def load_dossiers():
+    """num -> {text, facts, differs} from the NN-dossier.md files that
+    scripts/concierge-dossier.py wrote. Facts count = verified-quote lines
+    (deterministic marker), used only for expected-value ordering."""
+    out = {}
+    for fname in sorted(os.listdir(BATCH_DIR)):
+        m = re.match(r"^(\d{2})-dossier\.md$", fname)
+        if not m:
+            continue
+        with open(os.path.join(BATCH_DIR, fname), encoding="utf-8") as f:
+            text = f.read()
+        out[m.group(1)] = {"text": text,
+                           "facts": text.count("> SOURCE QUOTE:"),
+                           "differs": DIFFERS_MARKER in text}
+    return out
+
+
+def build_rows(drafts, ticks, dossiers):
     """Per-draft render/JS data. Order: prefilled first, then 01-10, 11-19,
     with DO-NOT-SEND rows split out (rendered dead, never pinned)."""
     rows = []
@@ -166,7 +197,7 @@ def build_rows(drafts, ticks):
             "subject": d["subject"], "body": d["body"], "query": query,
             "prefilled": prefilled, "mailto_too_long": too_long,
             "ticked": tick["ticked"], "do_not_send": tick["do_not_send"],
-            "dns_note": tick["note"],
+            "dns_note": tick["note"], "dossier": dossiers.get(num),
         })
     # Pinned: prefilled-address rows — zero-friction. NEVER a DO-NOT-SEND
     # row: those render dead (no mailto, no buttons, no JS data).
@@ -183,6 +214,26 @@ def render_row(r):
     state = ('<span class="state sent-badge">SENT — ticked in CHECKLIST.md</span>'
              if r["ticked"] else
              '<span class="state unsent-badge">unsent</span>')
+    if r["dossier"] and r["dossier"]["differs"]:
+        # Drift is surfaced on the collapsed card, never buried (Rule 7).
+        state += ('<span class="state differs-badge">⚠️ SITE DIFFERS — '
+                  'read dossier before sending</span>')
+    if r["dossier"]:
+        dossier_html = (
+            '<details class="dossier"%s><summary>reply-moment dossier '
+            '(%d verified site fact%s)%s</summary><pre class="full">%s</pre>'
+            '</details>'
+            % (" open" if r["dossier"]["differs"] else "",
+               r["dossier"]["facts"],
+               "" if r["dossier"]["facts"] == 1 else "s",
+               " — ⚠️ SITE DIFFERS" if r["dossier"]["differs"] else "",
+               e(r["dossier"]["text"])))
+    else:
+        dossier_html = ('<div class="note">No dossier on disk yet — run '
+                        '<code>python3 scripts/concierge-dossier.py</code> '
+                        'then regenerate this page.</div>')
+    booking_btn = ('<button onclick="copyText(B,this)">Copy booking link'
+                   '</button>' if BOOKING_URL else "")
     preview = "\n".join(
         [ln for ln in r["body"].split("\n") if ln.strip()][:2])
     addr_bits = ""
@@ -219,10 +270,12 @@ def render_row(r):
   <pre class="preview">%s</pre>
   <details><summary>full body</summary><pre class="full">%s</pre></details>
   %s
+  %s
   <div class="btns">
     <button class="primary" onclick="openMail('%s')">Open email (mailto)</button>
     <button onclick="copyText(D['%s'].subject,this)">Copy subject</button>
     <button onclick="copyText(D['%s'].body,this)">Copy body</button>
+    %s
     %s
     <button onclick="copySuppression('%s',this)">Copy suppression check</button>
     <button onclick="copyText(D['%s'].tick,this)">Copy tick command</button>
@@ -234,8 +287,8 @@ def render_row(r):
         classes, num, num, num, "disabled checked" if r["ticked"] else "",
         num, e(r["title"]), e(r["badge"]), state,
         linkify(e(r["to"])), linkify(e(r["channel"])), addr_bits,
-        e(r["subject"]), e(preview), e(r["body"]), mailto_note,
-        num, num, num, dm_btn, num, num, e(r["file"]))
+        e(r["subject"]), e(preview), e(r["body"]), dossier_html, mailto_note,
+        num, num, num, dm_btn, booking_btn, num, num, e(r["file"]))
 
 
 def render_dns_row(r):
@@ -258,6 +311,44 @@ def render_dns_row(r):
              e(r["dns_note"]))
 
 
+def render_hn_card(c, i):
+    """D2 Phase-1 card: value-only HN feedback comment, hand-pasted from
+    Vlad's PERSONAL account. Zero links / zero product mention were enforced
+    mechanically at generation time (concierge-dossier.py) — this renderer
+    adds nothing to the text."""
+    e = html.escape
+    stats = []
+    if c.get("age_days") is not None:
+        stats.append("thread age %.1fd%s" % (
+            c["age_days"],
+            "" if c.get("age_source") == "hn_api" else " (from sourcing date)"))
+    if c.get("hn_points") is not None:
+        stats.append("%s points" % c["hn_points"])
+    if c.get("hn_comments") is not None:
+        stats.append("%s comments" % c["hn_comments"])
+    return """
+<div class="row hn" id="hn-%d">
+  <div class="rowhead"><b>HN-%d</b> %s
+    <span class="badge">HN reply</span>
+    <span class="state">%s</span></div>
+  <div class="meta">Thread: <a href="%s" target="_blank">%s</a> ·
+    product: %s</div>
+  <pre class="preview">%s</pre>
+  <div class="btns">
+    <button class="primary" onclick="copyText(H['%d'].text,this)">Copy
+    comment</button>
+    <button onclick="copyText(H['%d'].tick,this)">Copy tick-append
+    command</button>
+  </div>
+  <div class="note">Paste from your PERSONAL HN account, on-thread. After
+  posting, run the tick-append command — the appended <code>[x]</code> line
+  in CHECKLIST.md is the only record (same ledger as the emails).</div>
+</div>""" % (c["story_id"], i, e(c.get("story_title", "")),
+             e(" · ".join(stats)),
+             e(c["hn_thread_url"]), e(c["hn_thread_url"]), e(c["domain"]),
+             e(c["comment_text"]), c["story_id"], c["story_id"])
+
+
 def main():
     if not os.path.isdir(BATCH_DIR):
         sys.exit("FATAL: batch dir missing: %s" % BATCH_DIR)
@@ -271,6 +362,8 @@ def main():
     for fname in sorted(os.listdir(BATCH_DIR)):
         if not re.match(r"^\d{2}-.*\.md$", fname):
             continue
+        if fname.endswith("-dossier.md"):
+            continue  # dossier files are NOT drafts (concierge-dossier.py)
         with open(os.path.join(BATCH_DIR, fname), encoding="utf-8") as f:
             try:
                 drafts[fname] = parse_draft(f.read(), fname)
@@ -285,9 +378,24 @@ def main():
         if fname not in ticks:
             sys.exit("FATAL: %s has no tick line in CHECKLIST.md" % fname)
 
-    pinned, rest, dns = build_rows(drafts, ticks)
+    dossiers = load_dossiers()
+    pinned, rest, dns = build_rows(drafts, ticks, dossiers)
     day1 = [r for r in rest if r["num"] <= "10"]
     day2 = [r for r in rest if r["num"] > "10"]
+    # Expected-value ordering (attacks activation energy): within each day
+    # block, warmest signal first = most verified dossier facts (least work
+    # at the send moment), then draft number. Pinned rows are already the
+    # warmest (address on file).
+    ev = lambda r: (-(r["dossier"]["facts"] if r["dossier"] else 0), r["num"])
+    day1.sort(key=ev)
+    day2.sort(key=ev)
+
+    # D2 Phase-1 HN cards (freshest thread first — see-rate decays weekly).
+    hn_cards = []
+    if os.path.exists(HN_CARDS_JSON):
+        with open(HN_CARDS_JSON, encoding="utf-8") as f:
+            hn_cards = json.load(f).get("cards", [])
+        hn_cards.sort(key=lambda c: c.get("age_days") or 99)
 
     # JS data: raw strings for clipboard + precomputed mailto query + the
     # BSD-sed tick one-liner (darwin sed -i ''), dots escaped in the pattern.
@@ -305,6 +413,19 @@ def main():
             "prefilled": r["prefilled"], "tick": tick_cmd,
         }
 
+    # HN card JS data: comment text + the CHECKLIST append (targets 21+
+    # convention documented in the CHECKLIST header — appended [x] lines are
+    # counted by day14-gate.py exactly like draft ticks).
+    hn_js = {}
+    for c in hn_cards:
+        target = "hn-%d-%s" % (c["story_id"], c["domain"])
+        hn_js[str(c["story_id"])] = {
+            "text": c["comment_text"],
+            "tick": ('echo "- [x] %s — HN feedback comment hand-posted" >> '
+                     "~/rick-vault/go-to-market/concierge-batch-2026-07-14/"
+                     "CHECKLIST.md" % target),
+        }
+
     review_note = extract_section(checklist_text, "## ⚠️ Review note")
     gen_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sent_count = sum(1 for v in ticks.values() if v["ticked"])
@@ -317,11 +438,27 @@ def main():
     sections.extend(render_row(r) for r in day1)
     sections.append("<h2>Day 2 block (11–19)</h2>")
     sections.extend(render_row(r) for r in day2)
+    sections.append(
+        '<h2>HN feedback cards (D2 Phase-1) — ONLY after the 20 concierge '
+        'sends</h2>\n<div class="banner"><b>Rules:</b> post from your '
+        'PERSONAL aged HN account, 1–2/day max. The comments are value-only '
+        'by construction — zero links, zero product mention (verified '
+        'mechanically at generation). <b>STOP RULE:</b> any comment '
+        'flagged or downvoted-dead ends the experiment immediately.</div>')
+    if hn_cards:
+        sections.extend(render_hn_card(c, i + 1)
+                        for i, c in enumerate(hn_cards))
+    else:
+        sections.append('<div class="note">No HN cards on disk — run '
+                        '<code>python3 scripts/concierge-dossier.py</code> '
+                        'then regenerate this page.</div>')
     if dns:
         sections.append("<h2>⛔ DO NOT SEND — synthetic test data, audit only</h2>")
         sections.extend(render_dns_row(r) for r in dns)
 
     page = """<!DOCTYPE html>
+<!-- LOCAL ONLY — real prospect emails inside. Never publish, never
+     Artifact, never push. (demand-systems spec 2026-07-19, D3 guardrail) -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -342,6 +479,10 @@ def main():
   .state { font-size: .85em; margin-left: .5em; }
   .sent-badge { color: #060; font-weight: bold; }
   .unsent-badge { color: #b60; }
+  .differs-badge { color: #b00; font-weight: bold; }
+  .row.hn { border-left: 4px solid #47c; }
+  details.dossier summary { cursor: pointer; color: #247; font-size: .92em; }
+  details.dossier { margin: .4em 0; }
   .meta { font-size: .92em; margin: .15em 0; }
   .preview { background: #f6f6f6; border-left: 3px solid #ccc; padding: .4em .7em; white-space: pre-wrap; margin: .4em 0; }
   .full { background: #f6f6f6; padding: .5em .7em; white-space: pre-wrap; }
@@ -385,8 +526,11 @@ CHECKLIST.md):</b>
 
 %s</div>
 %s
+%s
 <script>
 var D = %s;
+var B = %s;
+var H = %s;
 var NS = "cc-2026-07-14:";
 function copyText(t, btn) {
   function ok() { if (btn) { btn.classList.add("copied");
@@ -436,14 +580,24 @@ Object.keys(D).forEach(function(n) {
 </html>
 """ % (html.escape(gen_ts), sent_count, EXPECTED_DRAFTS, len(dns),
        html.escape(review_note),
+       ('<div class="infobox"><b>Booking link (CONCIERGE_BOOKING_URL):</b> '
+        '<a href="%s" target="_blank">%s</a> — every card has a copy '
+        'button; paste it into replies.</div>'
+        % (html.escape(BOOKING_URL, quote=True), html.escape(BOOKING_URL))
+        if BOOKING_URL else ""),
        "\n".join(sections),
-       json.dumps(js_data, ensure_ascii=True).replace("</", "<\\/"))
+       json.dumps(js_data, ensure_ascii=True).replace("</", "<\\/"),
+       json.dumps(BOOKING_URL, ensure_ascii=True),
+       json.dumps(hn_js, ensure_ascii=True).replace("</", "<\\/"))
 
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(page)
     print("wrote %s — %d drafts (%d ticked sent), %d pinned send-ready, "
-          "%d DO-NOT-SEND"
-          % (OUT_HTML, len(drafts), sent_count, len(pinned), len(dns)))
+          "%d DO-NOT-SEND, %d dossiers rendered, %d HN cards, booking link "
+          "%s"
+          % (OUT_HTML, len(drafts), sent_count, len(pinned), len(dns),
+             len(dossiers), len(hn_cards),
+             "SET" if BOOKING_URL else "unset (env CONCIERGE_BOOKING_URL)"))
 
 
 if __name__ == "__main__":

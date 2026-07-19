@@ -8,7 +8,7 @@ to the most recent Mon 09:00 PT, identical input → identical output.
 Usage: python3 scripts/this-week-page.py [--out PATH] [--now ISO]
 """
 from __future__ import annotations
-import argparse, json, re, subprocess, sys, urllib.parse
+import argparse, email.utils, json, re, subprocess, sys, urllib.parse
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -23,6 +23,16 @@ DEFAULT_OUT = HOME / "meetrick-site" / "this-week.html"
 # during 30-day post-suspension cooldown; see docs/x-funnel-integration-2026-05-06.md).
 X_DRAFTS_DIR = HOME / "rick-vault" / "projects" / "x-drafts"
 VELOCITY = HOME / "rick-vault" / "revenue" / "velocity.json"
+MAILBOX_TRIAGE = HOME / "rick-vault" / "mailbox" / "triage"
+# Fulfillment-receipt-reconciler read model (fulfillment-receipt.v1). If this
+# ledger is absent the metric renders "not enough data" — NEVER fall back to
+# loose timestamp correlation (shared-Stripe mis-attribution precedent, 2026-07-13).
+RECEIPTS_LEDGER = HOME / "rick-vault" / "control" / "ledgers" / "fulfillment-receipts.jsonl"
+# One-line postmortem notes for known outages, keyed by UTC date the gap spans.
+KNOWN_INCIDENTS = {
+    "2026-07-14": "Jul 14: Mac hard-down ~17.5h (launchd autorestart was off). "
+                  "Fixed same day; keep-alive guard added.",
+}
 PT = timezone(timedelta(hours=-7))
 
 
@@ -62,6 +72,155 @@ def clean_title(t):
     t = (t or "").replace("Workflow created:", "").strip()
     m = re.search(r"'title':\s*'([^']+)'", t)
     return m.group(1).strip() if m else re.sub(r"^Initiative:\s*", "", t).strip()
+
+
+def fmt_dur(s):
+    s = int(round(s))
+    if s < 60: return f"{s}s"
+    if s < 3600: return f"{s // 60}m {s % 60:02d}s"
+    return f"{s / 3600:.1f}h"
+
+
+def metric_reply_sla(since, until):
+    """Reply SLA: received_at → router ran_at, per routed human reply.
+    reply-router ran_at is naive PT; received_at comes from the matching
+    mailbox/triage/<file> record via a deterministic join on
+    (from == email, router_ran_at == ran_at) — no fuzzy matching.
+    Excludes automated_notification and @example.com drill addresses.
+    Returns None only if the reply-router log itself is missing."""
+    path = VAULT / "reply-router.jsonl"
+    if not path.exists():
+        return None
+    deltas, unmatched, n = [], 0, 0
+    triage_cache = {}
+    for d in iter_jsonl(path):
+        if "email" not in d or "action" not in d:  # secondary rows (auto_draft etc.)
+            continue
+        if d.get("label") == "automated_notification":
+            continue
+        addr = d.get("email", "")
+        if addr.endswith("@example.com"):  # test drills are not customers
+            continue
+        try:
+            ran = datetime.fromisoformat(d["ran_at"]).replace(tzinfo=PT)
+        except Exception:
+            continue
+        if not in_window(ran, since, until):
+            continue
+        n += 1
+        fname = d.get("file", "")
+        if fname not in triage_cache:
+            triage_cache[fname] = list(iter_jsonl(MAILBOX_TRIAGE / fname)) if fname else []
+        rec = next((r for r in triage_cache[fname]
+                    if r.get("from") == addr and r.get("router_ran_at") == d.get("ran_at")), None)
+        recv = None
+        if rec and rec.get("received_at"):
+            try:
+                recv = email.utils.parsedate_to_datetime(rec["received_at"])
+            except Exception:
+                recv = None
+        if recv is None or recv.tzinfo is None:
+            unmatched += 1
+            continue
+        delta = (ran - recv).total_seconds()
+        if delta < 0:  # clock skew — drop rather than fake
+            unmatched += 1
+            continue
+        deltas.append(delta)
+    return {"n": n, "deltas": sorted(deltas), "unmatched": unmatched}
+
+
+def metric_fulfillment_latency(since, until):
+    """Purchase → delivery-email latency via the fulfillment-receipt-reconciler
+    read model, joined by idempotency key ONLY (child keys are
+    {root}:delivery-email etc. — normalize to root before joining).
+    Missing ledger → None (renders 'not enough data'), never a guessed number."""
+    if not RECEIPTS_LEDGER.exists():
+        return None
+    suffixes = (":customer-memory", ":delivery-email", ":sequence-enrollment")
+    by_key = {}
+    for r in iter_jsonl(RECEIPTS_LEDGER):
+        if r.get("schema_version") != "fulfillment-receipt.v1": continue
+        if r.get("status") != "completed": continue
+        key, st, t = r.get("idempotency_key"), r.get("step_type"), parse_ts(r.get("occurred_at"))
+        if not (key and st and t): continue
+        for suf in suffixes:
+            if key.endswith(suf):
+                key = key[:-len(suf)]
+                break
+        slot = by_key.setdefault(key, {})
+        if st not in slot or t < slot[st]:
+            slot[st] = t
+    lat = []
+    for stages in by_key.values():
+        p, dl = stages.get("purchase"), stages.get("delivery-email")
+        if p and dl and in_window(dl, since, until) and dl >= p:
+            lat.append((dl - p).total_seconds())
+    return {"n": len(lat), "latencies": sorted(lat)}
+
+
+def metric_uptime(since, until):
+    """Uptime from system-health.jsonl sample GAPS — absence of logs counts as
+    downtime. Nominal cadence = median in-window sample interval; any gap over
+    2x nominal contributes (gap - nominal) downtime, clipped to the window.
+    Trailing silence up to `until` counts too. Returns None below 5 samples."""
+    path = VAULT / "system-health.jsonl"
+    if not path.exists():
+        return None
+    lookback = since - timedelta(hours=36)
+    ts = sorted(t for d in iter_jsonl(path)
+                if (t := parse_ts(d.get("ts"))) and lookback <= t <= until)
+    inw = [t for t in ts if t >= since]
+    if len(inw) < 5:
+        return None
+    steps = sorted((b - a).total_seconds() for a, b in zip(inw, inw[1:]))
+    med = steps[len(steps) // 2]
+    grace = max(2 * med, 600)
+    down, gaps = 0.0, []
+    for a, b in zip(ts, ts[1:]):
+        if (b - a).total_seconds() <= grace: continue
+        seg = (min(b, until) - max(a, since)).total_seconds() - med
+        if seg > 0:
+            down += seg
+            gaps.append((max(a, since), min(b, until), seg))
+    tail = (until - ts[-1]).total_seconds()
+    if tail > grace:
+        down += tail - med
+        gaps.append((ts[-1], until, tail - med))
+    window_s = (until - since).total_seconds()
+    incidents = []
+    for s, e, seg in gaps:
+        if seg < 4 * 3600: continue
+        note = next((KNOWN_INCIDENTS[k] for k in KNOWN_INCIDENTS
+                     if s.date().isoformat() <= k <= e.date().isoformat()), None)
+        incidents.append(note or f"{fmt_dur(seg)} with no health samples starting "
+                                 f"{s.astimezone(PT).strftime('%b %d %H:%M PT')} — cause not yet logged")
+    return {"pct": 100.0 * max(0.0, 1.0 - down / window_s), "down_s": down,
+            "samples": len(inw), "gap_count": len(gaps), "incidents": incidents}
+
+
+def metric_saves(since, until):
+    """Saves attempted — Rick-attributable events only: winback emails actually
+    queued + real (non-wf_test) critical replies caught. Scans that found
+    nothing are context, not saves. None if neither monitor logged in-window."""
+    inw = lambda t: in_window(t, since, until)
+    wb_scans = wb_queued = 0
+    for d in iter_jsonl(VAULT / "winback-scheduler.jsonl"):
+        if d.get("event") == "scan_complete" and inw(parse_ts(d.get("ts"))):
+            wb_scans += 1
+            wb_queued += int(d.get("queued") or 0)
+    cw_runs = cw_detected = 0
+    for d in iter_jsonl(VAULT / "critical-window-monitor.jsonl"):
+        if not inw(parse_ts(d.get("ts"))): continue
+        cw_runs += 1
+        if d.get("event") == "critical_reply_detected" \
+                and not str(d.get("wf_id", "")).startswith("wf_test"):
+            cw_detected += 1
+    if wb_scans == 0 and cw_runs == 0:
+        return None
+    return {"attempted": wb_queued + cw_detected, "winback_queued": wb_queued,
+            "winback_scans": wb_scans, "critical_detected": cw_detected,
+            "monitor_runs": cw_runs}
 
 
 def gather(since, until):
@@ -138,7 +297,129 @@ def gather(since, until):
 
     return dict(newsletters=newsletters, sends_total=sends_total,
                 recipients=len(recipients), replies=replies, seq=seq,
-                decisions=decisions, planned=planned, commits=commits, posts=posts)
+                decisions=decisions, planned=planned, commits=commits, posts=posts,
+                reply_sla=metric_reply_sla(since, until),
+                fulfillment=metric_fulfillment_latency(since, until),
+                uptime=metric_uptime(since, until),
+                saves=metric_saves(since, until))
+
+
+NOT_ENOUGH = "not enough data this week"
+
+
+def machine_lines(g):
+    """Render the four machine metrics as (name, value, basis) plain-text
+    triples — shared by build_html() and build_x_thread_draft() so the page and
+    the thread can never drift apart. Honesty rules baked in: every value
+    carries its n; below n=3 raw values are shown, never an implied average;
+    a missing source renders 'not enough data this week', never a stale number."""
+    lines = []
+
+    m = g["reply_sla"]
+    if m is None:
+        lines.append(("reply SLA", NOT_ENOUGH, "reply-router log unavailable"))
+    elif m["n"] == 0:
+        lines.append(("reply SLA", "0 human replies this week (n=0)",
+                      "automated notifications and drill addresses excluded"))
+    elif not m["deltas"]:
+        lines.append(("reply SLA", NOT_ENOUGH,
+                      f"{m['n']} replies routed but no receipt timestamps matched (n={m['n']})"))
+    elif len(m["deltas"]) < 3:
+        vals = ", ".join(fmt_dur(x) for x in m["deltas"])
+        lines.append(("reply SLA",
+                      f"{len(m['deltas'])} human repl{'ies' if len(m['deltas']) != 1 else 'y'} "
+                      f"this week: routed in {vals} (n={len(m['deltas'])})",
+                      "received → classified+routed, per reply — raw values, sample too small to average"))
+    else:
+        d = m["deltas"]
+        med = d[len(d) // 2]
+        extra = f"; {m['unmatched']} unmatched dropped" if m["unmatched"] else ""
+        lines.append(("reply SLA",
+                      f"median {fmt_dur(med)} received → routed (n={len(d)} human replies, "
+                      f"worst {fmt_dur(d[-1])})",
+                      f"deterministic join of reply-router to inbound receipt timestamps{extra}"))
+
+    m = g["fulfillment"]
+    if m is None:
+        lines.append(("fulfillment latency", NOT_ENOUGH,
+                      "receipt ledger not deployed — idempotency-key join only, no timestamp guessing"))
+    elif m["n"] == 0:
+        lines.append(("fulfillment latency", NOT_ENOUGH + " (n=0)",
+                      "0 joined purchase→delivery receipt pairs — idempotency-key join only"))
+    elif m["n"] < 3:
+        vals = ", ".join(fmt_dur(x) for x in m["latencies"])
+        lines.append(("fulfillment latency",
+                      f"{m['n']} fulfillment event{'s' if m['n'] != 1 else ''} this week: {vals} "
+                      f"(n={m['n']})",
+                      "purchase receipt → delivery receipt, same idempotency key — raw values"))
+    else:
+        lat = m["latencies"]
+        lines.append(("fulfillment latency",
+                      f"median {fmt_dur(lat[len(lat) // 2])} purchase → delivery "
+                      f"(n={m['n']}, worst {fmt_dur(lat[-1])})",
+                      "joined by idempotency key from the fulfillment receipt ledger"))
+
+    m = g["uptime"]
+    if m is None:
+        lines.append(("uptime", NOT_ENOUGH, "system-health log missing or under 5 samples in window"))
+    else:
+        val = f"{m['pct']:.1f}% over the 7-day window (downtime {fmt_dur(m['down_s'])}, n={m['samples']} samples)"
+        basis = ("measured from gaps in system-health.jsonl — silence counts as downtime"
+                 + (f"; {m['gap_count']} gap{'s' if m['gap_count'] != 1 else ''} found" if m["gap_count"] else "; no gaps"))
+        lines.append(("uptime", val, basis))
+        for note in m["incidents"]:
+            lines.append(("uptime incident", note, ""))
+
+    m = g["saves"]
+    if m is None:
+        lines.append(("saves attempted", NOT_ENOUGH, "no winback or critical-window monitor entries in window"))
+    else:
+        val = (f"{m['attempted']} save{'s' if m['attempted'] != 1 else ''} attempted "
+               f"(winback queued: {m['winback_queued']}, critical replies caught: {m['critical_detected']})")
+        basis = (f"Rick-attributable events only; {m['winback_scans']} winback scans + "
+                 f"{m['monitor_runs']} critical-window monitor entries ran this week")
+        lines.append(("saves attempted", val, basis))
+
+    return lines
+
+
+def machine_tweet_lines(g):
+    """Compact mirror of machine_lines() for the X thread — same computed
+    metric dicts, shorter prose. Same honesty rules: n always shown, small n
+    raw, missing source => 'not enough data', never a number."""
+    out = []
+    m = g["reply_sla"]
+    if m is None or (m and m["n"] > 0 and not m["deltas"]):
+        out.append("Reply SLA: not enough data")
+    elif m["n"] == 0:
+        out.append("Reply SLA: 0 human replies (n=0)")
+    elif len(m["deltas"]) < 3:
+        out.append("Reply SLA: " + ", ".join(fmt_dur(x) for x in m["deltas"])
+                   + f" (n={len(m['deltas'])}, raw)")
+    else:
+        d = m["deltas"]
+        out.append(f"Reply SLA: median {fmt_dur(d[len(d) // 2])} (n={len(d)})")
+    m = g["fulfillment"]
+    if m is None or m["n"] == 0:
+        out.append("Fulfillment: not enough data (n=0; key join only)")
+    elif m["n"] < 3:
+        out.append("Fulfillment: " + ", ".join(fmt_dur(x) for x in m["latencies"])
+                   + f" (n={m['n']}, raw)")
+    else:
+        lat = m["latencies"]
+        out.append(f"Fulfillment: median {fmt_dur(lat[len(lat) // 2])} (n={m['n']})")
+    m = g["uptime"]
+    if m is None:
+        out.append("Uptime: not enough data")
+    else:
+        line = f"Uptime: {m['pct']:.1f}% (down {fmt_dur(m['down_s'])}, n={m['samples']})"
+        if m["incidents"]:
+            line += f", incl {m['incidents'][0].split(':')[0]} outage — postmortem on the page"
+        out.append(line)
+    m = g["saves"]
+    out.append("Saves attempted: not enough data" if m is None
+               else f"Saves attempted: {m['attempted']} (Rick-attributable only)")
+    return out
 
 
 def fmt_short(t): return t.astimezone(PT).strftime("%a %H:%M")
@@ -306,6 +587,12 @@ def build_html(now_utc):
                    'share this on X →</a>')
     cta_block = cta_block + pilot_cta + x_share_cta
 
+    machine_rows = "".join(
+        f'<tr><td class="ts">{escape(name)}</td><td><strong>{escape(val)}</strong>'
+        + (f'<br><span style="color:#666;font-size:12px">{escape(basis)}</span>' if basis else "")
+        + '</td></tr>'
+        for name, val, basis in machine_lines(g))
+
     week_label = f'{(anchor - timedelta(days=7)).strftime("%b %d")} – {anchor.strftime("%b %d, %Y")}'
     summary = (f'{len(g["commits"])} commits · {len(g["posts"])} posts · '
                f'{len(g["newsletters"])} newsletter{"s" if len(g["newsletters"])!=1 else ""} · '
@@ -333,10 +620,16 @@ def build_html(now_utc):
   <p class="disclosure">This page is auto-generated from production logs every Monday at 09:00 PT.
      No marketing copy, no curated highlights — every line below is a real entry from
      <code>execution-ledger</code>, <code>sequencer</code>, <code>reply-router</code>,
-     <code>email-sends</code>, the workspace git log, and the <code>meetrick-content/blog</code> tree.</p>
+     <code>email-sends</code>, <code>system-health</code>, <code>winback-scheduler</code>,
+     <code>critical-window-monitor</code>, the fulfillment receipt ledger, the workspace
+     git log, and the <code>meetrick-content/blog</code> tree.</p>
   <p class="window">Window: <strong>{escape(week_label)}</strong> &nbsp;•&nbsp;
      Generated: {escape(anchor.strftime("%Y-%m-%d %H:%M PT"))} &nbsp;•&nbsp; {escape(summary)}</p>
   <section><h2>THE WEEK'S BILL</h2><table>{rows}</table></section>
+  <section><h2>THE MACHINE</h2><table>{machine_rows}</table>
+    <p class="disclosure" style="margin-top:8px">Every number above is computed from logs at
+       generation time and shows its sample size. Small samples are shown raw, never averaged.
+       A missing log renders "{escape(NOT_ENOUGH)}" — never a stale number.</p></section>
   <section><h2>THE WEEK'S $</h2>
     {money_html}
   </section>
@@ -387,6 +680,11 @@ def build_x_thread_draft(now_utc):
           f"{mrr_line}\n\n"
           f"Every line is from a prod log. No marketing copy.")[:270]
 
+    # Machine tweet — mirrors THE MACHINE section: same metric dicts from
+    # gather(), compact prose. The thread can never claim what the page doesn't.
+    t_machine = ("The machine, from logs:\n" + "\n".join(machine_tweet_lines(g))
+                 + "\nSmall n shown raw, never averaged.")[:270]
+
     if g["sends_total"] and top_reply:
         t2 = (f"The 1 reply was from {top_reply.get('email','a founder').split('@')[-1]}. "
               f"Classified {top_reply.get('label','—')} → routed to {top_reply.get('action','—')}.\n\n"
@@ -409,9 +707,9 @@ def build_x_thread_draft(now_utc):
           f"https://meetrick.ai/this-week?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share\n\n"
           f"Pilot: https://meetrick.ai/pilot?utm_source=x_thread&utm_medium=distribution&utm_campaign=this-week-share")[:270]
 
-    tweets = [t1, t2, t3, t4]
-    if headline_url and len(tweets) < 5:
-        tweets.insert(3, f"Read: {headline_url}"[:270])
+    tweets = [t1, t_machine, t2, t3, t4]
+    if headline_url and len(tweets) < 6:
+        tweets.insert(4, f"Read: {headline_url}"[:270])
 
     body = "\n\n---\n\n".join(tweets)
     return body, anchor
