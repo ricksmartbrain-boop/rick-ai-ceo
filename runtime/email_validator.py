@@ -188,12 +188,20 @@ _PLACEHOLDER_DOMAINS: frozenset[str] = frozenset({
 })
 
 
+# RFC-2606/6761 reserved TLDs can never receive real mail — a scraped contact
+# under one is always a fixture (mina@example.test shipped for shikigami.dev
+# on 2026-07-19 because only exact domains were blocked).
+_RESERVED_TLDS: frozenset[str] = frozenset({"test", "invalid", "localhost", "example"})
+
+
 def is_placeholder_domain(email: str) -> bool:
-    """Return True if the domain is a docs/demo placeholder (acme.com, example.com, …)."""
+    """Return True if the domain is a docs/demo placeholder (acme.com, example.com, .test TLD, …)."""
     try:
         _, domain = _parse_parts(email)
     except ValueError:
         return False
+    if domain.rsplit(".", 1)[-1] in _RESERVED_TLDS:
+        return True
     return domain in _PLACEHOLDER_DOMAINS
 
 

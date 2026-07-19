@@ -296,7 +296,7 @@ class EmailSendSafetyTests(unittest.TestCase):
             )
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             sends = [
-                {"status": "sent", "to": f"person{i}@example.test", "ts": f"{today}T12:00:{i:02d}Z"}
+                {"status": "sent", "to": f"person{i}@lead.example.com", "ts": f"{today}T12:00:{i:02d}Z"}
                 for i in range(20)
             ]
             (data_root / "operations" / "email-sends.jsonl").write_text(
@@ -368,7 +368,7 @@ class EmailSendSafetyTests(unittest.TestCase):
             )
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             sends = [
-                {"status": "sent", "to": f"p{i}@example.test", "ts": f"{today}T10:00:{i % 60:02d}Z"}
+                {"status": "sent", "to": f"p{i}@lead.example.com", "ts": f"{today}T10:00:{i % 60:02d}Z"}
                 for i in range(50)
             ]
             (data_root / "operations" / "email-sends.jsonl").write_text(
@@ -456,10 +456,10 @@ class EmailSendSafetyTests(unittest.TestCase):
             (data_root / "operations").mkdir(parents=True)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             rows = [
-                {"status": "sent", "to": "reader@example.test", "ts": now, "type": "newsletter", "resend_id": "re-1"},
-                {"status": "sent", "to": "fresh@example.test", "ts": now, "type": "newsletter_welcome", "resend_id": "re-2"},
-                {"status": "sent", "to": "operator@example.test", "ts": now, "type": "manual", "resend_id": "re-3"},
-                {"status": "sent", "to": "lead@example.test", "ts": now},
+                {"status": "sent", "to": "reader@lead.example.com", "ts": now, "type": "newsletter", "resend_id": "re-1"},
+                {"status": "sent", "to": "fresh@lead.example.com", "ts": now, "type": "newsletter_welcome", "resend_id": "re-2"},
+                {"status": "sent", "to": "operator@lead.example.com", "ts": now, "type": "manual", "resend_id": "re-3"},
+                {"status": "sent", "to": "lead@lead.example.com", "ts": now},
             ]
             (data_root / "operations" / "email-sends.jsonl").write_text(
                 "".join(json.dumps(r) + "\n" for r in rows),
@@ -483,8 +483,8 @@ class EmailSendSafetyTests(unittest.TestCase):
                 kill_switches = self.reload_kill_switches()
                 # Touch-level dedupe unchanged: the newsletter row still
                 # blocks a second touch to the same person inside 60m.
-                self.assertIsNotNone(kill_switches.last_send_ts("reader@example.test"))
-                allowed, reason = kill_switches.is_send_allowed("reader@example.test", cold=False)
+                self.assertIsNotNone(kill_switches.last_send_ts("reader@lead.example.com"))
+                allowed, reason = kill_switches.is_send_allowed("reader@lead.example.com", cold=False)
                 self.assertFalse(allowed)
                 self.assertIn("recent_send_cap_60m", reason)
             self.reload_kill_switches()
@@ -565,7 +565,7 @@ class EmailSendSafetyTests(unittest.TestCase):
             (data_root / "operations").mkdir(parents=True)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             (data_root / "operations" / "email-sends.jsonl").write_text(
-                json.dumps({"status": "sent", "to": "founder@example.test", "ts": now}) + "\n",
+                json.dumps({"status": "sent", "to": "founder@lead.example.com", "ts": now}) + "\n",
                 encoding="utf-8",
             )
             with patch.dict(
@@ -578,7 +578,7 @@ class EmailSendSafetyTests(unittest.TestCase):
                 clear=False,
             ):
                 kill_switches = self.reload_kill_switches()
-                allowed, reason = kill_switches.is_send_allowed("founder@example.test", cold=False)
+                allowed, reason = kill_switches.is_send_allowed("founder@lead.example.com", cold=False)
                 self.assertFalse(allowed)
                 self.assertIn("recent_send_cap_60m", reason)
             self.reload_kill_switches()
@@ -596,13 +596,13 @@ class EmailSendSafetyTests(unittest.TestCase):
                 {
                     "ts": now,
                     "stage": "followup_day5_sent",
-                    "email": "blockedlead@example.test",
+                    "email": "blockedlead@lead.example.com",
                     "resend_id": "channel_paused: sender warmup cap reached (0); ok",
                 },
                 {
                     "ts": now,
                     "stage": "followup_day5_sent",
-                    "email": "reallead@example.test",
+                    "email": "reallead@lead.example.com",
                     "resend_id": "f88e6ee3-34e2-4e93-b777-e463cf2bed01",
                 },
             ]
@@ -620,10 +620,10 @@ class EmailSendSafetyTests(unittest.TestCase):
                 clear=False,
             ):
                 kill_switches = self.reload_kill_switches()
-                self.assertIsNone(kill_switches.last_send_ts("blockedlead@example.test"))
-                allowed, reason = kill_switches.is_send_allowed("blockedlead@example.test", cold=True)
+                self.assertIsNone(kill_switches.last_send_ts("blockedlead@lead.example.com"))
+                allowed, reason = kill_switches.is_send_allowed("blockedlead@lead.example.com", cold=True)
                 self.assertTrue(allowed, f"phantom send must not block re-touch: {reason}")
-                allowed, reason = kill_switches.is_send_allowed("reallead@example.test", cold=True)
+                allowed, reason = kill_switches.is_send_allowed("reallead@lead.example.com", cold=True)
                 self.assertFalse(allowed)
                 self.assertIn("recent_send_cap_60m", reason)
             self.reload_kill_switches()
@@ -640,14 +640,14 @@ class EmailSendSafetyTests(unittest.TestCase):
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             mid = "72ab47d8-f7a7-4757-a153-053f059f20e0"
             (data_root / "operations" / "email-sends.jsonl").write_text(
-                json.dumps({"message_id": mid, "status": "sent", "to": "a@example.test", "ts": f"{today}T10:00:00Z"})
+                json.dumps({"message_id": mid, "status": "sent", "to": "a@lead.example.com", "ts": f"{today}T10:00:00Z"})
                 + "\n"
-                + json.dumps({"status": "sent", "to": "b@example.test", "ts": f"{today}T10:01:00Z"})
+                + json.dumps({"status": "sent", "to": "b@lead.example.com", "ts": f"{today}T10:01:00Z"})
                 + "\n",
                 encoding="utf-8",
             )
             (data_root / "operations" / "email-sequence-send.jsonl").write_text(
-                json.dumps({"message_id": mid, "status": "sent", "to": "a@example.test", "timestamp": f"{today}T10:00:00"})
+                json.dumps({"message_id": mid, "status": "sent", "to": "a@lead.example.com", "timestamp": f"{today}T10:00:00"})
                 + "\n",
                 encoding="utf-8",
             )
@@ -1286,8 +1286,14 @@ class PlaceholderDomainTests(unittest.TestCase):
         from runtime.email_validator import is_placeholder_domain
         self.assertTrue(is_placeholder_domain("sam@acme.com"))
         self.assertTrue(is_placeholder_domain("ceo@example.com"))
+        # RFC-reserved TLDs are always placeholders — mina@example.test
+        # shipped for shikigami.dev on 2026-07-19 through the exact-list gap.
+        self.assertTrue(is_placeholder_domain("mina@example.test"))
+        self.assertTrue(is_placeholder_domain("x@foo.invalid"))
         self.assertFalse(is_placeholder_domain("founder@keyline.sh"))
-        self.assertFalse(is_placeholder_domain("reader@example.test"))
+        # Subdomains of listed domains stay clear — they are the test-fixture
+        # namespace (lead.example.com) and never appear in real scrapes.
+        self.assertFalse(is_placeholder_domain("reader@lead.example.com"))
 
     def test_unified_send_gate_blocks_placeholder_domains(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1330,7 +1336,7 @@ class SequenceEnrollStartsPastWelcomeTests(unittest.TestCase):
                 sequence_config_path=cfg,
                 email="Buyer@Example.Test",
                 customer_name="",
-                delivery_url="https://example.test/app",
+                delivery_url="https://lead.example.com/app",
                 product_name="X Subscription",
                 workflow_id="wf_test",
             )
