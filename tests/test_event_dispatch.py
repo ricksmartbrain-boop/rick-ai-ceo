@@ -58,12 +58,22 @@ def test_dispatch_event_no_reactions():
         assert row is not None
 
 
-def test_queue_initiative_workflow():
-    """queue_initiative_workflow should create workflow + first job."""
+def test_queue_initiative_workflow(monkeypatch):
+    """A clean-identity initiative must create a workflow + a first 'plan' job.
+
+    The identity gate (2026-07 intake canonicalization) is stubbed to 'create'
+    — its dedupe behavior is the resolver's own concern; this test guards the
+    creation path behind it. RICK_INITIATIVE_DISABLED must not leak in from
+    the environment (it gates the whole family off)."""
+    monkeypatch.delenv("RICK_INITIATIVE_DISABLED", raising=False)
     conn = make_test_db()
     from runtime.engine import queue_initiative_workflow
 
-    wf_id = queue_initiative_workflow(conn, objective="Test initiative", project="test")
+    with patch(
+        "scripts.workflow_identity_resolver.resolve_or_create_workflow",
+        return_value=MagicMock(action="create"),
+    ):
+        wf_id = queue_initiative_workflow(conn, objective="Test initiative", project="test")
     assert wf_id.startswith("wf_")
 
     workflow = conn.execute("SELECT * FROM workflows WHERE id = ?", (wf_id,)).fetchone()
@@ -77,8 +87,14 @@ def test_queue_initiative_workflow():
     assert jobs[0]["step_name"] == "plan"
 
 
-def test_notify_operator_uses_flag_value_for_text():
-    """notify_operator should pass event text as the value to --text, not as a positional arg."""
+def test_notify_operator_uses_flag_value_for_text(monkeypatch):
+    """notify_operator must pass event text as the value to --text (not positional).
+
+    Quiet hours + the 5s rate limit are disabled via their own env switches so
+    this stays deterministic at any wall-clock time — the old version silently
+    hit the 22:00-07:00 digest path and never invoked the CLI."""
+    monkeypatch.setenv("RICK_QUIET_HOURS_ENABLED", "0")
+    monkeypatch.setenv("RICK_NOTIFY_RATE_LIMIT_DISABLED", "1")
     conn = make_test_db()
     from runtime.engine import notify_operator
 
@@ -94,6 +110,24 @@ def test_notify_operator_uses_flag_value_for_text():
         check=False,
         timeout=20,
     )
+
+
+def test_notify_operator_urgent_bypasses_quiet_hours(monkeypatch):
+    """A revenue-purpose notification must deliver even during quiet hours —
+    deferring a warm-lead ping to the morning digest would defeat the reply rail."""
+    monkeypatch.setenv("RICK_QUIET_HOURS_ENABLED", "1")
+    monkeypatch.setenv("RICK_NOTIFY_RATE_LIMIT_DISABLED", "1")
+    conn = make_test_db()
+    from runtime import engine
+
+    completed = MagicMock(returncode=0, stderr="", stdout="")
+    fixed_quiet = MagicMock()
+    fixed_quiet.now.return_value = MagicMock(hour=3)
+    with patch("runtime.engine.datetime", fixed_quiet):
+        with patch("runtime.engine.shutil.which", return_value="/usr/local/bin/openclaw"):
+            with patch("runtime.engine.subprocess.run", return_value=completed) as mock_run:
+                engine.notify_operator(conn, "warm reply landed", purpose="revenue")
+    assert mock_run.call_count == 1
 
 
 if __name__ == "__main__":

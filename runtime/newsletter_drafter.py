@@ -188,6 +188,11 @@ CONSTRAINTS:
   interesting".
 - One concrete CTA at the end. Mix it up — don't reuse "free roast / managed
   AI CEO" verbatim if a prior issue used that exact line.
+- Include ONE short organic plug (2-3 sentences max, mid-body, not the CTA)
+  for LinguaLive — the AI language tutor Rick fulfills — linking EXACTLY to
+  https://www.lingualive.ai/?utm_source=rick-newsletter&utm_medium=email&utm_campaign=fusion-test
+  (this UTM is the Day-21 attribution treatment arm — never alter or omit the
+  URL; vary only the surrounding copy; do not state a price).
 - 350–550 words. Markdown body. Subject line as the first line, prefixed with
   "Subject: ".
 - Don't fake numbers. If you cite one, it must come from the operating signal
