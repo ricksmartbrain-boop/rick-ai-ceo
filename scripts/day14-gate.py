@@ -53,6 +53,7 @@ MAILBOX_SENT = os.path.join(VAULT, "mailbox", "sent")
 MAILBOX_OUTBOX = os.path.join(VAULT, "mailbox", "outbox")
 TRIAGE_DIR = os.path.join(VAULT, "mailbox", "triage")
 CALL_QUEUE = os.path.join(VAULT, "control", "call-queue.jsonl")
+LINGUALIVE_ARM = os.path.join(VAULT, "control", "lingualive-arm.json")
 PILOT_INTAKE = os.path.join(VAULT, "operations", "pilot-intake.jsonl")
 PILOT_POLL_STATE = os.path.join(VAULT, "operations", "pilot-lead-poll-state.json")
 RUNTIME_DB = os.environ.get(
@@ -318,6 +319,18 @@ def is_meetrick(tags_json, metadata_json):
     return "rick-pro" in (tags_json or "") or "Rick Pro" in (metadata_json or "")
 
 
+def lingualive_arm_status():
+    """Treatment-arm record (briefing 2026-07-18 item 7). None = never armed;
+    {"_unreadable": True} = file exists but is corrupt (surface loud)."""
+    if not os.path.exists(LINGUALIVE_ARM):
+        return None
+    try:
+        with open(LINGUALIVE_ARM, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"_unreadable": True}
+
+
 def lingualive_counts():
     out = {"db_ok": False, "new_active": [], "baseline_30d": 0,
            "churn_watch": [], "active_total": 0}
@@ -521,6 +534,29 @@ def render():
     lines.append("## 6. LinguaLive — %d new active sub(s) since %s"
                  % (new_subs, WINDOW_START))
     lines.append("")
+    # Treatment arm (strategy §4 / briefing 2026-07-18 item 7): both the
+    # Day-14 and Day-21(b) readings of this doc must show whether the
+    # UTM experiment actually ran, or "~0 incremental" is unjudgeable.
+    arm = lingualive_arm_status()
+    if arm is None:
+        lines.append("- Treatment arm (strategy §4): **NOT ARMED** — no "
+                     "`control/lingualive-arm.json`; Day-21(b) has no "
+                     "treatment data.")
+    elif arm.get("_unreadable"):
+        lines.append("- Treatment arm (strategy §4): **ARM FILE UNREADABLE** — "
+                     "fix `control/lingualive-arm.json` before the gate.")
+    else:
+        armed_date = (arm.get("armed_at") or "?")[:10]
+        if arm.get("sent_at"):
+            arm_state = "sent %s in issue %s" % (
+                str(arm.get("sent_at"))[:10], arm.get("sent_issue") or "?")
+        else:
+            arm_state = "staged, NOT yet sent"
+        lines.append("- Treatment arm (strategy §4): **ARMED %s** via %s, "
+                     "campaign `%s` — %s; baseline %s active sub(s) at arming."
+                     % (armed_date, arm.get("channel", "?"),
+                        arm.get("utm_campaign", "?"), arm_state,
+                        arm.get("baseline_active_subs", "?")))
     if not ll["db_ok"]:
         lines.append("- **runtime DB unavailable — LinguaLive numbers missing.**")
     else:
@@ -547,6 +583,7 @@ def render():
     lines.append("- `go-to-market/concierge-batch-2026-07-14/CHECKLIST.md` (+ optional `sent/` subdir)")
     lines.append("- `operations/email-sends.jsonl` · `mailbox/sent/*.json` · `mailbox/outbox/founder-*.json`")
     lines.append("- `mailbox/triage/inbound-*.jsonl` · `control/call-queue.jsonl`")
+    lines.append("- `control/lingualive-arm.json` (treatment-arm record, briefing 2026-07-18 item 7)")
     lines.append("- `operations/pilot-intake.jsonl` · `operations/pilot-lead-poll-state.json`")
     lines.append("- runtime DB (read-only): `customers`, `prospect_pipeline`")
     lines.append("- Rule source: `decisions/strategy-2026-07-13.md` (KILL CRITERIA)")

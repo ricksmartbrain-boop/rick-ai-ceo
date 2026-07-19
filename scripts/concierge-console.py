@@ -3,7 +3,7 @@
 concierge-console.py — one-shot generator for the concierge hand-send console.
 
 Reads ~/rick-vault/go-to-market/concierge-batch-2026-07-14/ (CHECKLIST.md +
-the 20 NN-*.md drafts) and writes send-console.html into that same directory:
+the NN-*.md drafts) and writes send-console.html into that same directory:
 a single self-contained local HTML page (file://, no server, no external
 resources) that collapses each hand-send to a few clicks — mailto links with
 the subject+body taken VERBATIM from the draft, copy-to-clipboard buttons,
@@ -35,7 +35,9 @@ import urllib.parse
 BATCH_DIR = os.path.expanduser(
     "~/rick-vault/go-to-market/concierge-batch-2026-07-14")
 OUT_HTML = os.path.join(BATCH_DIR, "send-console.html")
-EXPECTED_DRAFTS = 20
+# 21 = the original 20 plus 21-nada-tunelab.md (2026-07-19 replacement for
+# draft 20, which is DO-NOT-SEND — synthetic test persona, kept for audit).
+EXPECTED_DRAFTS = 21
 # Practical mailto URL limit: above this many URL-encoded body chars the
 # mailto carries subject only and the row directs to the copy button.
 MAILTO_BODY_LIMIT = 1800
@@ -106,11 +108,21 @@ def linkify(text_escaped):
 
 
 def read_ticks(checklist_text):
-    """filename -> True if ticked [x] in CHECKLIST.md right now."""
+    """filename -> {ticked, do_not_send, note} from CHECKLIST.md right now.
+
+    A tick line may carry a trailing annotation after the filename (the #20
+    DO-NOT-SEND note added 2026-07-19) — day14-gate.py's parser tolerates
+    that, so this one must too. A 'DO-NOT-SEND' marker in the annotation
+    flags the draft as blocked: rendered as a dead row, no mailto, no
+    buttons.
+    """
     ticks = {}
-    for m in re.finditer(r"^- \[( |x|X)\] (\S+\.md)\s*$",
+    for m in re.finditer(r"^- \[( |x|X)\] (\S+\.md)(?:[ \t]+(.*))?$",
                          checklist_text, re.MULTILINE):
-        ticks[m.group(2)] = m.group(1).lower() == "x"
+        note = (m.group(3) or "").strip()
+        ticks[m.group(2)] = {"ticked": m.group(1).lower() == "x",
+                             "do_not_send": "DO-NOT-SEND" in note,
+                             "note": note}
     return ticks
 
 
@@ -127,13 +139,18 @@ def extract_section(checklist_text, header_prefix):
 
 
 def build_rows(drafts, ticks):
-    """Per-draft render/JS data. Order: warm prefilled first, then 01-10, 11-19."""
+    """Per-draft render/JS data. Order: prefilled first, then 01-10, 11-19,
+    with DO-NOT-SEND rows split out (rendered dead, never pinned)."""
     rows = []
     for fname in sorted(drafts):
         d = drafts[fname]
         num = fname[:2]
-        # The one send-ready draft (20, arjun@rtrvr.ai) has its address in
-        # the To line; everyone else needs Vlad's ~30-sec handle grab.
+        tick = ticks.get(fname, {"ticked": False, "do_not_send": False,
+                                 "note": ""})
+        # The one send-ready draft (21, tunelabid@gmail.com — PH-published)
+        # has its address in the To line; everyone else needs Vlad's ~30-sec
+        # handle grab. Draft 20 also has an address on file but is
+        # DO-NOT-SEND (synthetic test persona, 2026-07-19).
         email_m = EMAIL_RE.search(d["to"])
         prefilled = email_m.group(0) if email_m else ""
         body_crlf = d["body"].replace("\n", "\r\n")
@@ -148,12 +165,15 @@ def build_rows(drafts, ticks):
             "channel": d["channel"], "badge": channel_badge(d["channel"]),
             "subject": d["subject"], "body": d["body"], "query": query,
             "prefilled": prefilled, "mailto_too_long": too_long,
-            "ticked": ticks.get(fname, False),
+            "ticked": tick["ticked"], "do_not_send": tick["do_not_send"],
+            "dns_note": tick["note"],
         })
-    # Pinned: prefilled-address rows (draft 20) — zero-friction, highest EV.
-    pinned = [r for r in rows if r["prefilled"]]
-    rest = [r for r in rows if not r["prefilled"]]
-    return pinned, rest
+    # Pinned: prefilled-address rows — zero-friction. NEVER a DO-NOT-SEND
+    # row: those render dead (no mailto, no buttons, no JS data).
+    dns = [r for r in rows if r["do_not_send"]]
+    pinned = [r for r in rows if r["prefilled"] and not r["do_not_send"]]
+    rest = [r for r in rows if not r["prefilled"] and not r["do_not_send"]]
+    return pinned, rest, dns
 
 
 def render_row(r):
@@ -218,6 +238,26 @@ def render_row(r):
         num, num, num, dm_btn, num, num, e(r["file"]))
 
 
+def render_dns_row(r):
+    """DO-NOT-SEND row: unmissable synthetic state, mailto killed, no copy /
+    tick / suppression buttons, no js_data entry — nothing on this row can
+    help a send happen."""
+    e = html.escape
+    return """
+<div class="row dns" id="row-%s">
+  <div class="rowhead">
+    <b>#%s</b> %s
+    <span class="state dns-badge">⛔ SYNTHETIC — DO NOT SEND</span>
+  </div>
+  <div class="meta">To: %s</div>
+  <div class="meta dnsreason">%s</div>
+  <div class="note">Mailto and all buttons removed on purpose. This row
+  exists only so nobody re-promotes the draft; its CHECKLIST.md box stays
+  unticked forever.</div>
+</div>""" % (r["num"], r["num"], e(r["title"]), e(r["to"]),
+             e(r["dns_note"]))
+
+
 def main():
     if not os.path.isdir(BATCH_DIR):
         sys.exit("FATAL: batch dir missing: %s" % BATCH_DIR)
@@ -245,12 +285,14 @@ def main():
         if fname not in ticks:
             sys.exit("FATAL: %s has no tick line in CHECKLIST.md" % fname)
 
-    pinned, rest = build_rows(drafts, ticks)
+    pinned, rest, dns = build_rows(drafts, ticks)
     day1 = [r for r in rest if r["num"] <= "10"]
     day2 = [r for r in rest if r["num"] > "10"]
 
     # JS data: raw strings for clipboard + precomputed mailto query + the
     # BSD-sed tick one-liner (darwin sed -i ''), dots escaped in the pattern.
+    # DO-NOT-SEND rows are deliberately absent — no mailto query, no tick
+    # command exists for them anywhere in the page.
     js_data = {}
     for r in pinned + rest:
         pat = "^- \\[ \\] " + r["file"].replace(".", "\\.")
@@ -265,16 +307,19 @@ def main():
 
     review_note = extract_section(checklist_text, "## ⚠️ Review note")
     gen_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sent_count = sum(1 for v in ticks.values() if v)
+    sent_count = sum(1 for v in ticks.values() if v["ticked"])
 
     sections = []
     if pinned:
-        sections.append("<h2>Send first — warm, address on file</h2>")
+        sections.append("<h2>Send first — address on file (send-ready)</h2>")
         sections.extend(render_row(r) for r in pinned)
     sections.append("<h2>Day 1 block (01–10) — max ~10/day, CHECKLIST rule 4</h2>")
     sections.extend(render_row(r) for r in day1)
     sections.append("<h2>Day 2 block (11–19)</h2>")
     sections.extend(render_row(r) for r in day2)
+    if dns:
+        sections.append("<h2>⛔ DO NOT SEND — synthetic test data, audit only</h2>")
+        sections.extend(render_dns_row(r) for r in dns)
 
     page = """<!DOCTYPE html>
 <html lang="en">
@@ -289,6 +334,9 @@ def main():
   .infobox { border: 1px solid #ccc; background: #fff; padding: .7em 1em; border-radius: 6px; margin-bottom: 1em; white-space: pre-wrap; font-size: .92em; }
   .row { border: 1px solid #ddd; background: #fff; border-radius: 6px; padding: .8em 1em; margin: .8em 0; }
   .row.sent { opacity: .45; background: #f0f0f0; }
+  .row.dns { border: 2px solid #b00; background: #fff3f3; }
+  .dns-badge { color: #b00; font-weight: bold; }
+  .dnsreason { color: #b00; }
   .rowhead { margin-bottom: .3em; }
   .badge { background: #eef; border: 1px solid #99c; border-radius: 4px; padding: 0 .4em; font-size: .85em; }
   .state { font-size: .85em; margin-left: .5em; }
@@ -323,7 +371,8 @@ here are cosmetic localStorage notes and feed nothing.
 </div>
 <div class="infobox">Generated %s from the drafts on disk — a snapshot, not
 live. Re-run <code>python3 scripts/concierge-console.py</code> after any
-draft or CHECKLIST edit. State at generation: %d/%d ticked sent.
+draft or CHECKLIST edit. State at generation: %d/%d ticked sent (%d
+DO-NOT-SEND draft(s) excluded from sending, listed dead at the bottom).
 
 Send from YOUR mailbox and YOUR accounts (CHECKLIST rule 1). If [Open email]
 opens Mail.app but you want Gmail, set the mailto handler once (Gmail &gt;
@@ -385,15 +434,16 @@ Object.keys(D).forEach(function(n) {
 </script>
 </body>
 </html>
-""" % (html.escape(gen_ts), sent_count, EXPECTED_DRAFTS,
+""" % (html.escape(gen_ts), sent_count, EXPECTED_DRAFTS, len(dns),
        html.escape(review_note),
        "\n".join(sections),
        json.dumps(js_data, ensure_ascii=True).replace("</", "<\\/"))
 
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(page)
-    print("wrote %s — %d drafts (%d ticked sent), %d pinned warm"
-          % (OUT_HTML, len(drafts), sent_count, len(pinned)))
+    print("wrote %s — %d drafts (%d ticked sent), %d pinned send-ready, "
+          "%d DO-NOT-SEND"
+          % (OUT_HTML, len(drafts), sent_count, len(pinned), len(dns)))
 
 
 if __name__ == "__main__":
