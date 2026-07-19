@@ -295,25 +295,55 @@ def _mark_thread_replied(conn, ctx: dict, draft_path: str, dry_run: bool) -> dic
 # 4. Notify operator
 # ---------------------------------------------------------------------------
 
+# Same channel + thread the guardian's alerts land in — the one path that
+# provably delivered to Vlad during the 2026-07-16..18 credits outage.
+TEAM_CHAT_ID_DEFAULT = "-1003781085932"
+OPS_ALERTS_THREAD_ID_DEFAULT = 34
+
+
 def _fire_alert(conn, ctx: dict, row: dict, draft_path: str, dry_run: bool, verbose: bool) -> str:
-    """Fire notify_operator_deduped with purpose=revenue (bypasses dedup). Returns result."""
+    """Deliver the reply alert to Vlad's Telegram. Direct Bot API FIRST:
+    the old sole path (notify_operator broadcast -> openclaw system event)
+    returns success when the gateway ACCEPTS the event, but delivery to
+    Telegram depends on a live agent session — both westcoscia alerts
+    claimed 'sent_first' on 2026-07-16/17 and never reached Vlad (agent
+    was credits-dead). Agent broadcast is now only the fallback."""
     if dry_run:
         print(f"  [DRY-RUN] ALERT: 🎯 REPLY from {ctx['email']} | label={ctx['label']} | draft→{draft_path}")
         return "dry-run"
-    try:
-        from runtime.engine import notify_operator_deduped
-    except ImportError:
-        print("  [alert] ImportError: runtime.engine not found")
-        return "import-error"
 
+    subject = (row.get("subject") or "").strip()
     preview = (row.get("body") or "")[:300].replace("\n", " ")
     text = (
-        f"🎯 REPLY DETECTED — {ctx['name']} ({ctx['email']})\n"
+        f"🎯 EMAIL REPLY — {ctx['name']} ({ctx['email']})\n"
+        f"Subject: {subject}\n"
         f"Label: {ctx['label']}\n"
         f"Preview: {preview}\n"
         f"Draft staged: {Path(draft_path).name if draft_path else '(draft failed)'} (review required — NO auto-send)\n"
         f"triage_id: {ctx['triage_id']}"
     )
+
+    try:
+        from runtime.engine import send_telegram_message
+
+        chat_id = os.getenv("RICK_TEAM_CHAT_ID", "").strip() or TEAM_CHAT_ID_DEFAULT
+        thread_id = int(os.getenv("RICK_OPS_ALERTS_THREAD_ID", "").strip() or OPS_ALERTS_THREAD_ID_DEFAULT)
+        msg_id = send_telegram_message(
+            conn, text, chat_id=chat_id, thread_id=thread_id, purpose="revenue"
+        )
+        if msg_id:
+            return f"sent_direct:{msg_id}"
+        print("  [alert] direct telegram returned no message_id — falling back", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — a broken direct path must not lose the alert
+        print(f"  [alert] direct telegram failed: {exc} — falling back", file=sys.stderr)
+
+    # Fallback: agent broadcast. Reaches Vlad only via a live agent session,
+    # but leaves a file-fallback trail inside notify_operator on total failure.
+    try:
+        from runtime.engine import notify_operator_deduped
+    except ImportError:
+        print("  [alert] ImportError: runtime.engine not found")
+        return "import-error"
     # workflow_id stays None: triage ids are not workflows rows and
     # notification_log.workflow_id has a FK to workflows(id).
     result = notify_operator_deduped(
@@ -325,7 +355,7 @@ def _fire_alert(conn, ctx: dict, row: dict, draft_path: str, dry_run: bool, verb
         lane="outreach",
         purpose="revenue",     # URGENT — bypasses dedup
     )
-    return result
+    return f"fallback_agent:{result}"
 
 
 # ---------------------------------------------------------------------------
