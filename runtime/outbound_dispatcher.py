@@ -403,12 +403,21 @@ def drain(conn=None, batch_size: int = 20, dry_run: bool = False) -> dict:
         conn = db_connect()
         own_conn = True
     try:
+        # 2026-07-19: exclude WS-F touch-ledger rows (runtime/touch_log.py
+        # log_touch). Those rows carry payload {to, subject, variant, ...,
+        # outbox_file} and NO body — delivery is owned by the outbox pipeline
+        # (handle_outbox_send / email-send-outbox.py), which flips them to
+        # 'sent' via mark_touch_sent. Draining them here sent nothing and
+        # dead-lettered 18 founder touches as "max-attempts: body_md missing",
+        # after which mark_touch_sent (WHERE status='queued') could no longer
+        # record the real send.
         rows = conn.execute(
             """
             SELECT id, lead_id, channel, template_id, payload_json,
                    status, scheduled_at, attempts
               FROM outbound_jobs
              WHERE status = 'queued' AND scheduled_at <= ?
+               AND COALESCE(json_extract(payload_json, '$.outbox_file'), '') = ''
              ORDER BY scheduled_at ASC
              LIMIT ?
             """,
@@ -481,4 +490,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # 2026-07-19: `python3 -m runtime.outbound_dispatcher` (launchd
+    # ai.rick.outbound) runs this file as __main__; formatters then import a
+    # SECOND copy under 'runtime.outbound_dispatcher', whose PermanentError /
+    # TransientError are different class objects, so _process_one's except
+    # clauses never matched formatter-raised errors — permanent failures
+    # (e.g. "body_md missing") fell into the generic retry path and
+    # dead-lettered as "max-attempts: ..." instead of "permanent: ...".
+    # Alias the module so formatters share THIS module's exception classes.
+    sys.modules.setdefault("runtime.outbound_dispatcher", sys.modules[__name__])
     sys.exit(main())

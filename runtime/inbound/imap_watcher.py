@@ -61,6 +61,67 @@ SELF_SEND_ADDRESSES = {
     "vladislav@belkins.io",
 }
 
+# 2026-07-19 — reply-activated save-offer customers (verified audit
+# 2026-07-18). ANY inbound from these addresses pages Vlad instantly via the
+# reply-watcher fast-path (no classification wait, no date gate — late
+# replies still honored) and must NEVER be noise-dropped here.
+SAVE_OFFER_ADDRESSES: dict[str, str] = {
+    "haeuslsi@gmail.com": "Simone Haeusler",
+    "nat.waterworth@gmail.com": "Nat Waterworth",
+    "diane@factotem.com": "Diane Bloom",
+    "russian@crushermail.com": "russian@crushermail.com",
+}
+
+# 2026-07-19 — deterministic noise drop-list (CLAUDE.md Rule 5: if code can
+# answer, code answers). ~90% of triage volume was platform noise the LLM
+# classifier re-discovered every cycle. These senders are dropped AT INGESTION
+# — the single chokepoint where mail enters triage — with a counted log line
+# per drop (silent-drop is forbidden). Self-mail is already dropped by the
+# SELF_SEND_ADDRESSES guard just below (same chokepoint, counted as
+# self_sends_skipped in the same run-summary log). Save-offer addresses and
+# existing customers (exact email OR customer domain) are NEVER dropped —
+# _protected_sender() checks the customers table before any drop, and on any
+# DB error fails open (noise kept, never a customer lost).
+NOISE_DROP_RULES: tuple[tuple[str, str], ...] = (
+    # (rule_name, regex matched against the full lowercased address)
+    ("producthunt", r"@(?:[\w.-]+\.)?producthunt\.com$"),
+    ("linkedin", r"^[^@]*(?:no-?reply|notification)[^@]*@(?:[\w.-]+\.)?linkedin\.com$"),
+    ("github", r"^[^@]*(?:notification|no-?reply)[^@]*@(?:[\w.-]+\.)?github\.com$"),
+    ("bounce", r"^(?:postmaster|mailer-daemon)@"),
+)
+_NOISE_DROP_COMPILED = tuple((name, re.compile(pat)) for name, pat in NOISE_DROP_RULES)
+
+
+def noise_drop_rule(from_email: str) -> str | None:
+    """Return the name of the matching drop rule, or None. Deterministic."""
+    low = (from_email or "").strip().lower()
+    if not low or "@" not in low:
+        return None
+    for name, rx in _NOISE_DROP_COMPILED:
+        if rx.search(low):
+            return name
+    return None
+
+
+def _protected_sender(conn: sqlite3.Connection, from_email: str) -> bool:
+    """True when the sender must never be dropped: save-offer addresses,
+    existing customers (exact email), or any customer's domain."""
+    low = (from_email or "").strip().lower()
+    if low in SAVE_OFFER_ADDRESSES:
+        return True
+    domain = low.rpartition("@")[2]
+    try:
+        rows = conn.execute("SELECT email FROM customers").fetchall()
+    except Exception:
+        # Can't verify against the customers table → refuse to drop (fail
+        # open: worst case is noise reaching the classifier, never a lost
+        # customer email). Logged so the failure is visible.
+        _log({"event": "noise-drop-guard-error", "reason": "customers-table-unreadable"})
+        return True
+    emails = {(r[0] or "").strip().lower() for r in rows}
+    domains = {e.rpartition("@")[2] for e in emails if "@" in e}
+    return low in emails or (domain in domains)
+
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 MAX_MESSAGES_PER_RUN = 200
@@ -334,6 +395,27 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
                     except Exception:
                         pass
                 continue
+            # 2026-07-19 deterministic noise drop-list (see NOISE_DROP_RULES).
+            # Save-offer addresses + existing customers are exempt via
+            # _protected_sender. Every drop is logged with a running count.
+            rule = noise_drop_rule(low)
+            if rule and not _protected_sender(conn, low):
+                summary["noise_dropped"] = summary.get("noise_dropped", 0) + 1
+                by_rule = summary.setdefault("noise_dropped_by_rule", {})
+                by_rule[rule] = by_rule.get(rule, 0) + 1
+                _log({
+                    "event": "noise-drop",
+                    "rule": rule,
+                    "from": low,
+                    "subject": (msg.get("Subject", "") or "")[:120],
+                    "dropped_this_run": summary["noise_dropped"],
+                })
+                if not dry_run:
+                    try:
+                        mail.store(uid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                continue
         subject = msg.get("Subject", "") or ""
         # Strip < > wrappers consistently (Gmail returns "<id@gmail.com>")
         msgid_raw = (msg.get("Message-ID", "") or "").strip()
@@ -371,6 +453,11 @@ def process_messages(conn, mailbox, mail: imaplib.IMAP4_SSL, search_criteria: st
             "received_at": received_at,
             "ingested_at": _now_iso(),
         }
+        # 2026-07-19 — stamp save-offer rows at ingestion so downstream
+        # consumers (reply-watcher fast-path) can react without waiting for
+        # the classifier.
+        if from_email in SAVE_OFFER_ADDRESSES:
+            row["save_offer"] = True
         # Signature extraction + enrichment
         sig = extract_signature(body_text or body_html)
         if sig:

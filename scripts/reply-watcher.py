@@ -54,6 +54,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from runtime.llm import BudgetExceeded  # noqa: E402
+from runtime.inbound.imap_watcher import SAVE_OFFER_ADDRESSES  # noqa: E402
 
 DATA_ROOT   = Path(os.getenv("RICK_DATA_ROOT", str(Path.home() / "rick-vault")))
 DB_PATH     = Path(os.getenv("RICK_RUNTIME_DB_FILE", str(DATA_ROOT / "runtime" / "rick-runtime.db")))
@@ -135,6 +136,13 @@ def _load_watch_rows(handled: dict[str, str], verbose: bool = False) -> list[dic
             em    = (r.get("from") or "").lower().strip()
             if not rid or rid in seen_ids or rid in handled:
                 continue
+            # 2026-07-19 save-offer fast-path: ANY inbound from a save-offer
+            # address bypasses classification entirely — no waiting on the
+            # classifier loop, no date gate (late replies still honored).
+            if em in SAVE_OFFER_ADDRESSES:
+                seen_ids.add(rid)
+                rows.append(r)
+                continue
             if label not in WATCH_LABELS or not em:
                 continue
             # Defense in depth — imap-watcher already skips self-sends
@@ -150,6 +158,9 @@ def _load_watch_rows(handled: dict[str, str], verbose: bool = False) -> list[dic
 def _row_ctx(row: dict) -> dict:
     """Build the drafting/alert context from a triage row."""
     em = (row.get("from") or "").lower().strip()
+    # Save-offer rows may reach us unclassified (fast-path bypasses the
+    # classifier) — give them a deterministic label for drafting/logging.
+    label = row.get("classification") or ("save_offer" if em in SAVE_OFFER_ADDRESSES else "")
     return {
         "triage_id":   row.get("id") or "",
         "email":       em,
@@ -157,7 +168,7 @@ def _row_ctx(row: dict) -> dict:
         "company":     em.rpartition("@")[2],
         "opener_subj": row.get("subject") or "",
         "opener_body": "",
-        "label":       row.get("classification") or "",
+        "label":       label,
         "thread_id":   row.get("thread_id") or "",
         "received_at": row.get("received_at") or row.get("ingested_at") or "",
     }
@@ -308,14 +319,23 @@ def _fire_alert(conn, ctx: dict, row: dict, draft_path: str, dry_run: bool, verb
     Telegram depends on a live agent session — both westcoscia alerts
     claimed 'sent_first' on 2026-07-16/17 and never reached Vlad (agent
     was credits-dead). Agent broadcast is now only the fallback."""
+    # 2026-07-19 save-offer fast-path: reply-activated save customers get a
+    # P0 header naming them — Vlad must be paged on ANY inbound from them.
+    save_name = SAVE_OFFER_ADDRESSES.get(ctx["email"])
+    if save_name:
+        header = f"🚨 P0 SAVE-OFFER REPLY — {save_name} — offer is reply-activated ({ctx['email']})"
+        alert_kind = "save_offer_reply"
+    else:
+        header = f"🎯 EMAIL REPLY — {ctx['name']} ({ctx['email']})"
+        alert_kind = "reply_watcher_hit"
     if dry_run:
-        print(f"  [DRY-RUN] ALERT: 🎯 REPLY from {ctx['email']} | label={ctx['label']} | draft→{draft_path}")
+        print(f"  [DRY-RUN] ALERT: {header} | label={ctx['label']} | draft→{draft_path}")
         return "dry-run"
 
     subject = (row.get("subject") or "").strip()
     preview = (row.get("body") or "")[:300].replace("\n", " ")
     text = (
-        f"🎯 EMAIL REPLY — {ctx['name']} ({ctx['email']})\n"
+        f"{header}\n"
         f"Subject: {subject}\n"
         f"Label: {ctx['label']}\n"
         f"Preview: {preview}\n"
@@ -349,7 +369,7 @@ def _fire_alert(conn, ctx: dict, row: dict, draft_path: str, dry_run: bool, verb
     result = notify_operator_deduped(
         conn,
         text,
-        kind="reply_watcher_hit",
+        kind=alert_kind,
         dedup_window_hours=168,
         workflow_id=None,
         lane="outreach",

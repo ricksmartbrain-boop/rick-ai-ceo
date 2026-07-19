@@ -201,10 +201,25 @@ COMMITMENT_INTENT_RE = re.compile(
 
 # deal_close last step — approving records the owner's YES without re-queueing
 # any automated pipeline step (next_step() returns None for the final step).
+# Still used by the commitment gate: payment/sign language stays record-only.
 _APPROVAL_STEP = ("close_or_escalate", 5, "strategy")
 
+# 2026-07-19 reply→deal_close handoff fix. Parking label-based sales-intent
+# approvals at the FINAL step made every approval a completed no-op: resolve_
+# approval marked the job done, next_step() returned None, and the workflow
+# closed without lead_intake/qualify/pitch ever running — a sales-intent reply
+# from a real human could never advance a deal (Nikola/Zeno class of loss;
+# same shape as the 2026-07-17 pitch_send approval-resume bug). These now park
+# BLOCKED at the pipeline START; lead_intake is in engine.SELF_GATED_STEPS, so
+# the owner's YES re-queues the job and the EXISTING deal_close path runs:
+# lead_intake → lead_qualify → pitch_draft → pitch_send (still owner-gated,
+# raises ApprovalRequired) → followup_sequence → close_or_escalate. Nothing
+# runs before the approval; nothing sends without the pitch_send approval.
+_PIPELINE_START_STEP = ("lead_intake", 0, "analysis")
 
-def _create_owner_approval(conn, row: dict, label: str, reason: str, dry_run: bool) -> dict:
+
+def _create_owner_approval(conn, row: dict, label: str, reason: str, dry_run: bool,
+                           step: tuple[str, int, str] = _APPROVAL_STEP) -> dict:
     """Insert workflows + jobs + approvals rows (engine schema/conventions) so
     the existing /approve flow + daily approval_reminder pick this up.
     Job stays status='blocked' — the engine only executes 'queued' jobs, so
@@ -218,7 +233,7 @@ def _create_owner_approval(conn, row: dict, label: str, reason: str, dry_run: bo
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     apr_id = f"apr_{uuid.uuid4().hex[:12]}"
     title = f"Owner approval: {label} from {email}"
-    step_name, step_index, route = _APPROVAL_STEP
+    step_name, step_index, route = step
     try:
         conn.execute(
             "INSERT INTO workflows (id, kind, title, slug, project, status, stage, priority, "
@@ -298,6 +313,7 @@ def dispatch_sales_inquiry(conn, row: dict, dry_run: bool) -> dict:
     approval = _create_owner_approval(
         conn, row, "sales_inquiry",
         "Approve reply/next step for inbound sales inquiry", dry_run,
+        step=_PIPELINE_START_STEP,
     )
     alert = _alert_vlad("sales_inquiry", conn, row, dry_run, area="sales", urgent=True)
     return {"action": approval.get("action", "error"), "email": email,
@@ -478,7 +494,8 @@ def dispatch_pricing_question(conn, row, dry_run):
     out = _alert_vlad("pricing_question", conn, row, dry_run, area="sales", urgent=True)
     out["approval"] = _create_owner_approval(
         conn, row, "pricing_question",
-        "Approve pricing answer for inbound prospect", dry_run)
+        "Approve pricing answer for inbound prospect", dry_run,
+        step=_PIPELINE_START_STEP)
     return out
 
 
@@ -487,7 +504,8 @@ def dispatch_scheduling_request(conn, row, dry_run):
     out = _alert_vlad("scheduling_request", conn, row, dry_run, area="sales", urgent=True)
     out["approval"] = _create_owner_approval(
         conn, row, "scheduling_request",
-        "Approve call booking for inbound prospect", dry_run)
+        "Approve call booking for inbound prospect", dry_run,
+        step=_PIPELINE_START_STEP)
     return out
 
 

@@ -5925,11 +5925,18 @@ def guard_non_owner_mutation(
     return reason
 
 
-# Steps whose handler raises ApprovalRequired INSIDE the step that performs
-# the gated action (see the two-pattern note in resolve_approval). Any new
-# handler that gates mid-step MUST be listed here or its approval resolves
-# to a silent no-op.
-SELF_GATED_STEPS = frozenset({"pitch_send"})
+# Steps whose approved job must be RE-QUEUED (run for real), not marked done.
+# Two ways a step lands here:
+#   1. Its handler raises ApprovalRequired INSIDE the step that performs the
+#      gated action (pitch_send) — marking it done would skip the action (see
+#      the two-pattern note in resolve_approval; found 2026-07-17).
+#   2. The reply-router parks reply-sourced deal_close workflows BLOCKED at
+#      lead_intake before any work has run (2026-07-19 handoff fix) — the
+#      owner's YES means "run the pipeline", so the job must execute, not be
+#      skipped-and-advanced with an empty dossier.
+# Any new handler that gates mid-step MUST be listed here or its approval
+# resolves to a silent no-op.
+SELF_GATED_STEPS = frozenset({"pitch_send", "lead_intake"})
 
 
 def resolve_approval(connection: sqlite3.Connection, approval_id: str, decision: str, note: str, actor: str) -> dict[str, Any]:
