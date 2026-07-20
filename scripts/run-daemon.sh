@@ -234,9 +234,9 @@ PYEOF_SL
         || echo "[sibling-liveness] kickstart FAILED for $agent"
     fi
   done <<'LIVENESS'
-ai.rick.guardian|guardian.log|90
-ai.rick.email-sequence|email-send-outbox.log|45
-ai.rick.imap-watcher|imap-watcher.log|30
+ai.rick.guardian|guardian.log|65
+ai.rick.email-sequence|email-send-outbox.log|20
+ai.rick.imap-watcher|imap-watcher.log|15
 LIVENESS
 
   sleep "$INTERVAL_SECONDS"
