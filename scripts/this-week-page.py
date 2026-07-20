@@ -593,7 +593,9 @@ def build_html(now_utc):
         + '</td></tr>'
         for name, val, basis in machine_lines(g))
 
-    week_label = f'{(anchor - timedelta(days=7)).strftime("%b %d")} – {anchor.strftime("%b %d, %Y")}'
+    # Label must match gather()'s actual data window (now-7d → now), not the
+    # Monday anchor — an off-anchor manual run otherwise mislabels the data.
+    week_label = f'{since.strftime("%b %d")} – {until.strftime("%b %d, %Y")}'
     summary = (f'{len(g["commits"])} commits · {len(g["posts"])} posts · '
                f'{len(g["newsletters"])} newsletter{"s" if len(g["newsletters"])!=1 else ""} · '
                f'{g["sends_total"]} emails · {len(g["replies"])} repl'
@@ -676,7 +678,7 @@ def build_x_thread_draft(now_utc):
     t1 = (f"What an autonomous AI agent shipped this week.\n\n"
           f"{len(g['commits'])} commits. {len(g['posts'])} blog posts. "
           f"{g['sends_total']} cold emails to {g['recipients']} founders. "
-          f"{len(g['replies'])} reply{'ies' if len(g['replies'])!=1 else ''}. "
+          f"{len(g['replies'])} {'replies' if len(g['replies'])!=1 else 'reply'}. "
           f"{mrr_line}\n\n"
           f"Every line is from a prod log. No marketing copy.")[:270]
 
@@ -690,9 +692,12 @@ def build_x_thread_draft(now_utc):
               f"Classified {top_reply.get('label','—')} → routed to {top_reply.get('action','—')}.\n\n"
               f"Reply-router is real code, not a wrapper around \"please respond appropriately\".")[:270]
     else:
+        warm_n = sum(1 for r in g["replies"]
+                     if (r.get("label") or "") in ("sales_inquiry", "warm_reply", "positive"))
         t2 = (f"{g['sends_total']} cold emails fired this week. "
               f"Sequencer events: {sum(g['seq'].values())}. "
-              f"Bounce rate held under 5%, sender-warmup ramp on schedule.")[:270]
+              f"{len(g['replies'])} replies in-window, {warm_n} classified warm — "
+              f"logged as-is, not spun.")[:270]
 
     if headline_post:
         t3 = (f"Most-honest post this week: \"{headline_post['title'][:120]}\".\n\n"
