@@ -1486,7 +1486,10 @@ def notify_operator(
     # Quiet-hours guard (2026-04-22). Between 22:00–07:00 local, batch
     # non-urgent notifications into a digest file instead of pinging Vlad.
     # Always-through purposes (urgent + ops + revenue) bypass the guard.
-    URGENT_PURPOSES = {"urgent", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
+    # 2026-07-20: 'ops' added — the comment above always claimed it bypassed,
+    # but the set never included it, so critical ops alerts (anthropic
+    # cooldown 03:16, guardian CHURN 03:26) died in the quiet-hours digest.
+    URGENT_PURPOSES = {"urgent", "ops", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
     URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
 
     # TIER-2 #B4 (2026-04-23) — concurrency rate limit.
@@ -1531,6 +1534,35 @@ def notify_operator(
                 pass  # Fall through to live send rather than swallow on disk error
     except Exception:
         pass  # Never let the quiet-hours guard break notification delivery
+
+    # Direct-first delivery (2026-07-20, mirrors reply-watcher commit 017cbad).
+    # The broadcast below ('openclaw system event') returns success when the
+    # gateway ACCEPTS the event, but delivery to Telegram needs a live agent
+    # session — alerts claimed sent and never reached Vlad 2026-07-16..18.
+    # Direct Bot API first: the notification_log row send_telegram_message
+    # writes (telegram_message_id) is the delivery proof. Any failure falls
+    # through to the agent broadcast unchanged.
+    try:
+        _direct_chat = chat_id or os.getenv("RICK_TEAM_CHAT_ID", "").strip() or "-1003781085932"
+        _direct_thread = thread_id if thread_id is not None else int(
+            os.getenv("RICK_OPS_ALERTS_THREAD_ID", "").strip() or "34"
+        )
+        _direct_msg_id = send_telegram_message(
+            connection, text,
+            workflow_id=workflow_id, lane=lane, purpose=purpose,
+            chat_id=_direct_chat, thread_id=_direct_thread,
+        )
+        if _direct_msg_id:
+            logger.info("notify_operator delivered direct: msg_id=%s", _direct_msg_id)
+            # Bonus: parallel Slack for P0-urgency (opt-in via RICK_SLACK_P0_ENABLED=1)
+            if is_urgent_for_rate and os.getenv("RICK_SLACK_P0_ENABLED", "").strip() in ("1", "true"):
+                _slack_bin = shutil.which(os.getenv("RICK_OPENCLAW_EVENT_BIN", "openclaw").strip() or "openclaw")
+                if _slack_bin:
+                    _fire_slack_parallel(_slack_bin, text, logger)
+            return
+        logger.warning("notify_operator direct send got no message_id — falling back to broadcast")
+    except Exception as _direct_exc:
+        logger.warning("notify_operator direct send failed: %s — falling back to broadcast", _direct_exc)
 
     binary = os.getenv("RICK_OPENCLAW_EVENT_BIN", "openclaw").strip()
     if not binary:
@@ -1594,6 +1626,91 @@ def notify_operator(
     _fallback_notification(text, workflow_id=workflow_id, error=last_error)
 
 
+def flush_quiet_hours_digest(connection: sqlite3.Connection) -> int:
+    """Deliver suppressed quiet-hours alerts to Vlad after quiet hours end.
+
+    notify_operator's quiet-hours guard defers non-urgent alerts to
+    operations/quiet-hours-digest-YYYY-MM-DD.jsonl — but until 2026-07-20
+    nothing ever flushed those files, so deferred alerts died silently.
+    Called from heartbeat(): outside quiet hours (07:00-22:00) it batches
+    each recent unflushed digest into ONE direct Telegram message (same
+    direct-first path as notify_operator). A sidecar <digest>.flushed file
+    records flushed_lines + flushed_at so nothing double-sends; lines
+    appended after a flush (tonight's 22:00-24:00 entries land in today's
+    already-flushed file) are picked up next morning via the line count.
+    Only the last 3 days are scanned — older files are pre-fix backlog,
+    left unsent for manual review. Returns the number of files flushed.
+    """
+    from runtime.log import get_logger
+
+    logger = get_logger("rick.engine")
+    _hour = datetime.now().hour
+    if _hour >= 22 or _hour < 7:
+        return 0  # still quiet — not a delivery-capable moment yet
+
+    flushed_files = 0
+    today = datetime.now()
+    for day in (today - timedelta(days=2), today - timedelta(days=1), today):
+        digest_path = DATA_ROOT / "operations" / f"quiet-hours-digest-{day.strftime('%Y-%m-%d')}.jsonl"
+        if not digest_path.exists():
+            continue
+        marker_path = digest_path.parent / (digest_path.name + ".flushed")
+        already_flushed = 0
+        if marker_path.exists():
+            try:
+                already_flushed = int(json.loads(marker_path.read_text(encoding="utf-8")).get("flushed_lines", 0))
+            except (OSError, ValueError):
+                already_flushed = 0  # unreadable marker → safest is re-send, never blackhole
+        try:
+            lines = digest_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            logger.warning("quiet-hours flush: cannot read %s: %s", digest_path.name, exc)
+            continue
+        pending = [ln for ln in lines[already_flushed:] if ln.strip()]
+        if not pending:
+            continue
+        body_lines = []
+        for ln in pending:
+            try:
+                entry = json.loads(ln)
+            except ValueError:
+                entry = {"ts": "", "purpose": "?", "text": ln[:200]}
+            body_lines.append(
+                f"- {(entry.get('ts') or '')[11:16] or '??:??'} [{entry.get('purpose') or 'general'}] {(entry.get('text') or '')[:300]}"
+            )
+        text = (
+            f"🌙 Quiet-hours digest ({day.strftime('%Y-%m-%d')}) — "
+            f"{len(pending)} suppressed alert(s):\n" + "\n".join(body_lines)
+        )
+        # Direct-first: telegram_message_id in notification_log is the proof.
+        msg_id = None
+        try:
+            _chat = os.getenv("RICK_TEAM_CHAT_ID", "").strip() or "-1003781085932"
+            _thread = int(os.getenv("RICK_OPS_ALERTS_THREAD_ID", "").strip() or "34")
+            msg_id = send_telegram_message(connection, text, purpose="ops", chat_id=_chat, thread_id=_thread)
+        except Exception as exc:
+            logger.warning("quiet-hours flush: direct send failed: %s", exc)
+        if not msg_id:
+            # Fallback: agent broadcast (purpose='ops' bypasses quiet/rate
+            # guards; we are outside quiet hours anyway). notify_operator has
+            # its own file fallback on total failure — treat as delivered.
+            try:
+                notify_operator(connection, text, purpose="ops")
+            except Exception as exc:
+                logger.error("quiet-hours flush: broadcast fallback failed for %s: %s — will retry next heartbeat", digest_path.name, exc)
+                continue  # marker NOT written → retried on next heartbeat
+        try:
+            marker_path.write_text(
+                json.dumps({"flushed_lines": len(lines), "flushed_at": now_iso(), "telegram_message_id": msg_id}) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.error("quiet-hours flush: marker write failed for %s: %s — may double-send", digest_path.name, exc)
+        flushed_files += 1
+        logger.info("quiet-hours flush: sent %d entries from %s (msg_id=%s)", len(pending), digest_path.name, msg_id)
+    return flushed_files
+
+
 # 2026-04-24: per-error dedup helper. The blocked-job notifier in proactive.py
 # was sending 450 identical pings for ONE stuck job over 7 days → Vlad muted
 # Rick. Wrap noisy alerts in this helper so the same normalized error never
@@ -1637,6 +1754,10 @@ def notify_operator_deduped(
 
     Returns one of: 'sent_first', 'sent_with_count', 'suppressed'. URGENT_PURPOSES
     + URGENT_KEYWORDS (defined in notify_operator) bypass dedup completely.
+
+    2026-07-20: this set DELIBERATELY excludes 'ops' (unlike notify_operator's
+    quiet-hours set) — ops alerts must deliver at night but repeats still
+    dedupe, else the 450-ping cooldown spam returns.
     """
     URGENT_PURPOSES = {"urgent", "escalation", "revenue", "approval", "approval_required", "stripe", "customer_milestone"}
     URGENT_KEYWORDS = ("URGENT", "ESCALATE", "CRITICAL", "PAYMENT_FAILED", "CHURN", "🚨")
@@ -6433,6 +6554,16 @@ def heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     except Exception as exc:
         from runtime.log import get_logger
         get_logger("rick.engine").error("Proactive checks failed: %s", exc)
+
+    # Quiet-hours digest flush (2026-07-20): first heartbeat after 07:00
+    # delivers the previous night's suppressed alerts. Best-effort.
+    try:
+        digest_flushes = flush_quiet_hours_digest(connection)
+        if digest_flushes:
+            summary["quiet_hours_digest_flushed"] = digest_flushes
+    except Exception as exc:
+        from runtime.log import get_logger
+        get_logger("rick.engine").warning("Quiet-hours digest flush failed: %s", exc)
 
     # Tenant scheduler cycle — service active tenants
     try:
