@@ -26,6 +26,12 @@ OUTBOX_DIR = DATA_ROOT / "mailbox" / "outbox"
 SENT_DIR = DATA_ROOT / "mailbox" / "sent"
 SENDS_LOG = DATA_ROOT / "operations" / "email-sends.jsonl"  # bounce-rate-guardian denominator
 SUPPRESSION_FILE = DATA_ROOT / "mailbox" / "suppression.txt"
+VIOLATIONS_FILE = DATA_ROOT / "operations" / "suppression-violations.jsonl"
+# Gate reasons that can never clear for this recipient (is_send_allowed
+# prefixes): park the item instead of retrying every 900s forever.
+# mina@example.test (2026-07-19) retried through the 15-min .test-TLD
+# validator gap because placeholder blocks were treated as transient.
+PERMANENT_BLOCK_PREFIXES = ("suppressed", "placeholder_domain", "role_account", "invalid_recipient")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 FROM_EMAIL = os.getenv("RICK_EMAIL_FROM", "rick@meetrick.ai")
 MAX_PER_BATCH = 20
@@ -282,15 +288,31 @@ def process_outbox(dry_run: bool = False) -> dict:
             result = send_email(to_email, subject, body_md, cold=bool(msg.get("cold", False)))
             blocked_reason = result.get("blocked")
             if blocked_reason:
-                # Mirror phase1.handle_outbox_send: suppressed is permanent —
-                # park the message so it never retries. Non-permanent blocks
-                # (master kill / live flag / frequency cap) leave the file
-                # pending for a later run.
-                if str(blocked_reason).startswith("suppressed"):
+                # Mirror phase1.handle_outbox_send: recipient-level blocks
+                # (suppressed / placeholder domain / role account / invalid)
+                # are permanent — park the message so it never retries, and
+                # append the attempt to suppression-violations.jsonl (same
+                # ledger resend-suppression-sync + formatters/email use).
+                # Non-permanent blocks (master kill / live flag / frequency
+                # cap) leave the file pending for a later run.
+                reason = str(blocked_reason)
+                if reason.startswith(PERMANENT_BLOCK_PREFIXES):
                     msg["status"] = "blocked"
-                    msg["error"] = f"SEND_BLOCKED reason={blocked_reason}"[:200]
+                    msg["error"] = f"SEND_BLOCKED reason={reason}"[:200]
                     claim.write_text(json.dumps(msg, indent=2), encoding="utf-8")
                     errors += 1
+                    try:
+                        VIOLATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        with VIOLATIONS_FILE.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(
+                                {"ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                 "violation": "outbox_drain_blocked",
+                                 "to": to_email,
+                                 "suppression_reason": reason,
+                                 "outbox_file": f.name,
+                                 "subject": subject}) + "\n")
+                    except OSError as exc:
+                        print(f"suppression-violations.jsonl append failed (item parked): {exc}", file=sys.stderr)
                 else:
                     skipped += 1
                 claim.rename(f)  # release the claim; blocked parks, skipped retries
