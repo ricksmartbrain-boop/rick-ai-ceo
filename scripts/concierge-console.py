@@ -558,7 +558,7 @@ function openMail(n) {
 function copySuppression(n, btn) {
   var a = getAddr(n);
   if (!a) { alert("Grab the address first — the check needs it."); return; }
-  copyText('grep -i "' + a + '" ~/rick-vault/mailbox/suppression.txt', btn);
+  copyText('grep -i "' + a + '" ~/rick-vault/mailbox/suppression.txt ~/rick-vault/operations/suppression.txt ~/rick-vault/control/dnc-list.txt ~/rick-vault/projects/outreach/unsubscribes.txt', btn);
 }
 function saveAddr(n) {
   localStorage.setItem(NS + "addr:" + n,
