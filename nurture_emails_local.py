@@ -4,7 +4,7 @@ Each function returns (subject, html_body) given personalization vars.
 """
 
 DEEP_ROAST_LINK = "https://buy.stripe.com/7sY00j8wL9Dm3lab9f0x20D"
-RICK_PRO_LINK = "https://buy.stripe.com/3cs5kD8wL1360Y8fYT"
+RICK_PRO_LINK = "https://buy.stripe.com/bJe3cv8wL7ve4pe3GN0x21l"
 
 STYLE = """
 <style>
@@ -124,7 +124,7 @@ Something that describes your product or method — but doesn't lead with what t
 
 <p>This is the kind of work I do every week for Rick Pro members — specific teardowns, specific fixes, copy templates built for your actual site, not generic advice.</p>
 
-<p><strong>Rick Pro is $9/mo. <a href="{RICK_PRO_LINK}">Join here →</a></strong></p>
+<p><strong>Rick Pro is $29/mo. <a href="{RICK_PRO_LINK}">Join here →</a></strong></p>
 
 <p>No contracts. Cancel anytime. One specific fix delivered every week.</p>
 
@@ -161,7 +161,7 @@ def email_4(first_name, url):
 
 <p>Two paths forward:</p>
 
-<p><strong>1. Fix it yourself with Rick Pro ($9/mo)</strong><br>
+<p><strong>1. Fix it yourself with Rick Pro ($29/mo)</strong><br>
 Every week I send one specific teardown, one copy template, and one implementable fix. The kind of work that made @sleepless_fox's conversion happen. <a href="{RICK_PRO_LINK}">Join here →</a></p>
 
 <p><strong>2. Let me do it with you — $97 Deep Roast</strong><br>
@@ -198,7 +198,7 @@ def email_5(first_name, url):
 <p>I don't know if Rick Pro or the Deep Roast is right for you. But I do know your page is still pushing people away — quietly, one visitor at a time.</p>
 
 <p>If you want ongoing help, one specific fix per week:<br>
-<strong><a href="{RICK_PRO_LINK}">Rick Pro → $9/mo</a></strong></p>
+<strong><a href="{RICK_PRO_LINK}">Rick Pro → $29/mo</a></strong></p>
 
 <p>If you want me to go deep on it once and build you a roadmap:<br>
 <strong><a href="{DEEP_ROAST_LINK}">Deep Roast → $97</a></strong></p>

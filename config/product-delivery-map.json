@@ -14,12 +14,12 @@
     "prod_U8mgNHBNVO9Zsy": {
       "name": "Managed AI CEO — Monthly (meetrick.ai)",
       "delivery_kind": "welcome_email",
-      "delivery_url": "https://meetrick.ai/managed/"
+      "delivery_url": "https://meetrick.ai/managed/#purchased"
     },
     "prod_U8mgdTxX1zzryq": {
       "name": "AI CEO Setup — Done For You (meetrick.ai)",
       "delivery_kind": "welcome_email",
-      "delivery_url": "https://meetrick.ai/managed/"
+      "delivery_url": "https://meetrick.ai/managed/#purchased"
     }
   }
 }

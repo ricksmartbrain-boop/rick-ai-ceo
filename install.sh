@@ -10,6 +10,7 @@ set -euo pipefail
 #   curl -fsSL https://meetrick.ai/install.sh | bash -s -- --tier free
 #   curl -fsSL https://meetrick.ai/install.sh | bash -s -- --uninstall
 #   curl -fsSL https://meetrick.ai/install.sh | bash -s -- --help
+#   curl -fsSL https://meetrick.ai/install.sh | bash -s -- --client 404models --license-key rick_biz_XXXX
 #
 # ================================================================
 
@@ -25,6 +26,8 @@ NO_TELEMETRY=false
 UNINSTALL=false
 VERBOSE=false
 TEMP_DIR=""
+CLIENT_SLUG=""
+CLIENT_MODE=false
 
 # Colors (disable on dumb terminals or non-TTY stdout)
 if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -57,10 +60,26 @@ print_banner() {
   echo "   ██   ██ ██ ██      ██  ██"
   echo "   ██   ██ ██  ██████ ██   ██"
   echo ""
+  echo "              .---.      "
+  echo "             ( o_o )     "
+  echo "              > ^ <      "
+  echo ""
   echo "   meetrick.ai — AI for everyone"
   echo "   v${RICK_INSTALLER_VERSION}"
   echo ""
   echo "========================================"
+  echo -e "${NC}"
+}
+
+# Celebration salute — called after a successful install to stamp the moment.
+# Keeps it under 8 lines so piped installs stay readable.
+print_rick_salute() {
+  local callsign="${1:-Rick}"
+  echo -e "${GREEN}"
+  echo "   .---.  "
+  echo "  ( ^_^ )   ← ${callsign} reporting for duty."
+  echo "  <| - |>   Say /hello in Telegram when you're ready."
+  echo "   /   \\  "
   echo -e "${NC}"
 }
 
@@ -157,6 +176,11 @@ while [ $# -gt 0 ]; do
       if [ $# -lt 2 ]; then echo "Error: --license-key requires a value"; exit 1; fi
       LICENSE_KEY="$2"
       shift 2 ;;
+    --client)
+      if [ $# -lt 2 ]; then echo "Error: --client requires a value (e.g. 404models)"; exit 1; fi
+      CLIENT_SLUG="$2"
+      shift 2 ;;
+    --deploy-for-client) CLIENT_MODE=true; shift ;;
     --non-interactive) NON_INTERACTIVE=true; shift ;;
     --no-telemetry)    NO_TELEMETRY=true; shift ;;
     --uninstall)       UNINSTALL=true; shift ;;
@@ -1094,6 +1118,20 @@ if [ -n "$RICK_SECRET" ]; then
   chmod 600 "$OPENCLAW_DIR/.rick_secret"
 fi
 
+# ── Add to Rick Operators newsletter audience (non-blocking) ──
+if [ "$NO_TELEMETRY" != true ]; then
+  USER_EMAIL=""
+  # Try to find email from git config, env, or openclaw config
+  USER_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
+  [ -z "$USER_EMAIL" ] && USER_EMAIL=$(grep -o '[^"]*@[^"]*' "$OPENCLAW_DIR/openclaw.json" 2>/dev/null | head -1 || echo "")
+  if [ -n "$USER_EMAIL" ]; then
+    curl -s --max-time 5 -X POST "https://rick-api-production.up.railway.app/api/v1/subscribe" \
+      -H "Content-Type: application/json" \
+      -d "{\"email\":\"$USER_EMAIL\",\"source\":\"install\",\"tier\":\"$TIER\"}" >/dev/null 2>&1 || true
+    debug "Registered email with Rick network: $USER_EMAIL"
+  fi
+fi
+
 # ================================================================
 # AUTO-UPDATE SCRIPT
 # ================================================================
@@ -1309,6 +1347,97 @@ else
 fi
 
 # ================================================================
+# CLIENT CONFIG (white-glove deployment)
+# ================================================================
+if [ -n "$CLIENT_SLUG" ] && [ -n "$LICENSE_KEY" ]; then
+  info "Fetching client config for: $CLIENT_SLUG"
+  HTTP_CODE=$(curl -s --max-time 15 -w '%{http_code}' -o /tmp/rick_client_config.json \
+    "https://meetrick.ai/api/deploy/${CLIENT_SLUG}?key=${LICENSE_KEY}" \
+    2>/dev/null || echo "000")
+  CLIENT_CONFIG=$(cat /tmp/rick_client_config.json 2>/dev/null || echo "{}")
+  rm -f /tmp/rick_client_config.json
+
+  if [ "$HTTP_CODE" = "000" ]; then
+    error "Could not reach meetrick.ai — check your internet connection and try again."
+    exit 1
+  elif [ "$HTTP_CODE" = "401" ]; then
+    error "Invalid license key for client '$CLIENT_SLUG'. Check your --license-key and try again."
+    exit 1
+  elif [ "$HTTP_CODE" = "404" ]; then
+    error "Client '$CLIENT_SLUG' not found. Check the --client slug and try again."
+    exit 1
+  fi
+
+  CONFIG_OK=$(echo "$CLIENT_CONFIG" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('ok') else 'no')" 2>/dev/null || echo "no")
+
+  if [ "$CONFIG_OK" = "yes" ]; then
+    CLIENT_NAME=$(echo "$CLIENT_CONFIG" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('client_name',''))" 2>/dev/null || echo "$CLIENT_SLUG")
+
+    # Workspace dir should already exist from step 6
+    mkdir -p "$WORKSPACE_DIR"
+
+    # Write SOUL.md — only if not already customized (check for generic marker)
+    SOUL_CONTENT=$(echo "$CLIENT_CONFIG" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('soul',''))" 2>/dev/null || echo "")
+    if [ -n "$SOUL_CONTENT" ]; then
+      if [ ! -f "$WORKSPACE_DIR/SOUL.md" ] || grep -q 'meetrick.ai' "$WORKSPACE_DIR/SOUL.md" 2>/dev/null; then
+        chmod 644 "$WORKSPACE_DIR/SOUL.md" 2>/dev/null || true
+        printf '%s\n' "$SOUL_CONTENT" > "$WORKSPACE_DIR/SOUL.md"
+        chmod 444 "$WORKSPACE_DIR/SOUL.md" 2>/dev/null || true
+        debug "Wrote client SOUL.md"
+      else
+        info "Keeping existing SOUL.md (already customized)"
+      fi
+    fi
+
+    # Write IDENTITY.md — always apply
+    IDENTITY_CONTENT=$(echo "$CLIENT_CONFIG" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('identity',''))" 2>/dev/null || echo "")
+    if [ -n "$IDENTITY_CONTENT" ]; then
+      printf '%s\n' "$IDENTITY_CONTENT" > "$WORKSPACE_DIR/IDENTITY.md"
+      debug "Wrote client IDENTITY.md"
+    fi
+
+    # Write USER.md — always apply
+    USER_CONTENT=$(echo "$CLIENT_CONFIG" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('user',''))" 2>/dev/null || echo "")
+    if [ -n "$USER_CONTENT" ]; then
+      printf '%s\n' "$USER_CONTENT" > "$WORKSPACE_DIR/USER.md"
+      debug "Wrote client USER.md"
+    fi
+
+    # Append env vars to config/rick.env
+    ENV_VARS=$(echo "$CLIENT_CONFIG" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+env = d.get('env', {})
+for k, v in env.items():
+    print(f'export {k}={json.dumps(str(v))}')
+" 2>/dev/null || echo "")
+    if [ -n "$ENV_VARS" ]; then
+      mkdir -p "$WORKSPACE_DIR/config"
+      ENV_FILE="$WORKSPACE_DIR/config/rick.env"
+      printf '\n# Client config: %s\n' "$CLIENT_NAME" >> "$ENV_FILE"
+      printf '%s\n' "$ENV_VARS" >> "$ENV_FILE"
+      debug "Appended client env vars to $ENV_FILE"
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}🤖 Rick has been configured for ${BOLD}${CLIENT_NAME}${NC}${GREEN}. Starting...${NC}"
+    echo ""
+    ok "Client config applied: $CLIENT_NAME"
+  else
+    CLIENT_ERR=$(echo "$CLIENT_CONFIG" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null || echo "unknown error")
+    error "Client config fetch failed: $CLIENT_ERR"
+    error "Cannot continue client deploy without valid config. Check slug/key and re-run."
+    exit 1
+  fi
+fi
+
+# ================================================================
 # SUCCESS
 # ================================================================
 echo ""
@@ -1363,11 +1492,212 @@ case "$CMD" in
   stop)         exec openclaw gateway stop "$@" ;;
   restart)      exec openclaw gateway restart "$@" ;;
   status)       exec openclaw status "$@" ;;
+  heartbeat|ping)
+    # Rick heartbeat — manually trigger a heartbeat to HQ
+    RICK_ID_FILE="$HOME/.openclaw/.rick_id"
+    RICK_SECRET_FILE="$HOME/.openclaw/.rick_secret"
+    RICK_VERSION_FILE="$HOME/.openclaw/.rick_version"
+    if [ ! -f "$RICK_ID_FILE" ] || [ ! -f "$RICK_SECRET_FILE" ]; then
+      echo "❌ Rick not registered. Run the installer first."
+      exit 1
+    fi
+    HB_RICK_ID=$(cat "$RICK_ID_FILE")
+    HB_RICK_SECRET=$(cat "$RICK_SECRET_FILE")
+    HB_VERSION=$(cat "$RICK_VERSION_FILE" 2>/dev/null || echo "unknown")
+    # Collect diagnostics
+    HB_GW_STATUS="unknown"
+    if curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:18789/ 2>/dev/null | grep -q "200\|404"; then
+      HB_GW_STATUS="running"
+    else
+      HB_GW_STATUS="down"
+    fi
+    HB_NODE_V=$(node -v 2>/dev/null || echo "none")
+    HB_DISK_FREE=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{printf "%.1fGB", $4/1048576}')
+    HB_CRON_COUNT=$(crontab -l 2>/dev/null | grep -c "rick\|openclaw\|meetrick" || echo "0")
+    RESP=$(curl -s --max-time 10 -X POST "https://rick-api-production.up.railway.app/api/v1/heartbeat" \
+      -H "Content-Type: application/json" \
+      -d "{\"rick_id\":\"$HB_RICK_ID\",\"rick_secret\":\"$HB_RICK_SECRET\",\"version\":\"$HB_VERSION\",\"diagnostics\":{\"gateway_status\":\"$HB_GW_STATUS\",\"node_version\":\"$HB_NODE_V\",\"disk_free\":\"$HB_DISK_FREE\",\"cron_count\":$HB_CRON_COUNT}}" 2>/dev/null || echo '{"error":"unreachable"}')
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$HOME/.openclaw/.last_heartbeat"
+    if echo "$RESP" | grep -q '"ok":true'; then
+      echo "💚 Heartbeat sent to Rick HQ"
+    else
+      echo "❌ Heartbeat failed: $RESP"
+    fi
+    ;;
   setup)        exec openclaw onboard --install-daemon --skip-wizard "$@" ;;
   log|logs)     exec openclaw log "$@" ;;
   update)       exec openclaw update "$@" ;;
   config)       exec openclaw config "$@" ;;
   dashboard)    exec openclaw dashboard "$@" ;;
+  doctor)
+    # Rick Doctor — full health check
+    echo ""
+    echo "🩺 Rick Doctor — Health Check"
+    echo "════════════════════════════════════════"
+    echo ""
+    PASS="✓" FAIL="✗" WARN="!"
+    ISSUES=0
+
+    # 1. OpenClaw gateway status
+    printf "  Gateway status:       "
+    GW_STATUS=$(openclaw gateway status 2>&1 || true)
+    if echo "$GW_STATUS" | grep -qi "running\|active\|online"; then
+      echo "$PASS Running"
+    else
+      echo "$FAIL Not running"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 2. Gateway reachable
+    printf "  Gateway reachable:    "
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:18789/ 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" != "" ]; then
+      echo "$PASS HTTP $HTTP_CODE"
+    else
+      echo "$FAIL Unreachable"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 3. Node.js version
+    printf "  Node.js:              "
+    if command -v node &>/dev/null; then
+      NODE_V=$(node -v 2>/dev/null)
+      NODE_MAJOR=$(echo "$NODE_V" | sed 's/v//' | cut -d. -f1)
+      if [ "${NODE_MAJOR:-0}" -ge 22 ] 2>/dev/null; then
+        echo "$PASS $NODE_V"
+      else
+        echo "$WARN $NODE_V (22+ recommended)"
+        ISSUES=$((ISSUES+1))
+      fi
+    else
+      echo "$FAIL Not found"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 4. LaunchAgent
+    printf "  LaunchAgent:          "
+    if [ "$(uname -s)" = "Darwin" ]; then
+      if launchctl list 2>/dev/null | grep -q openclaw; then
+        echo "$PASS Loaded"
+      else
+        echo "$WARN Not loaded (Rick may not auto-start on boot)"
+      fi
+    else
+      echo "— (Linux — check systemd/cron instead)"
+    fi
+
+    # 5. Disk space
+    printf "  Disk space:           "
+    FREE_KB=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+    FREE_GB=$(( FREE_KB / 1048576 ))
+    FREE_MB=$(( FREE_KB / 1024 ))
+    if [ "${FREE_KB:-0}" -gt 1048576 ] 2>/dev/null; then
+      echo "$PASS ${FREE_GB}GB free"
+    elif [ "${FREE_KB:-0}" -gt 512000 ] 2>/dev/null; then
+      echo "$WARN ${FREE_MB}MB free (low)"
+    else
+      echo "$FAIL ${FREE_MB}MB free (critically low)"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 6. API keys configured
+    printf "  API keys:             "
+    AUTH_FILE="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
+    if [ -f "$AUTH_FILE" ] && [ -s "$AUTH_FILE" ]; then
+      KEY_COUNT=$(python3 -c "import json; d=json.load(open('$AUTH_FILE')); print(len(d.get('profiles',[])))" 2>/dev/null || echo "0")
+      if [ "${KEY_COUNT:-0}" -gt 0 ]; then
+        echo "$PASS $KEY_COUNT provider(s) configured"
+      else
+        echo "$FAIL No API keys found"
+        ISSUES=$((ISSUES+1))
+      fi
+    else
+      echo "$FAIL No auth profiles found"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 7. Last heartbeat
+    printf "  Last heartbeat:       "
+    HB_FILE="$HOME/.openclaw/.last_heartbeat"
+    if [ -f "$HB_FILE" ]; then
+      echo "$PASS $(cat "$HB_FILE")"
+    else
+      echo "$WARN Unknown (no heartbeat file)"
+    fi
+
+    # 8. OpenClaw version
+    printf "  OpenClaw version:     "
+    if command -v openclaw &>/dev/null; then
+      OC_VER=$(openclaw --version 2>/dev/null || echo "unknown")
+      echo "$PASS $OC_VER"
+    else
+      echo "$FAIL openclaw not found in PATH"
+      ISSUES=$((ISSUES+1))
+    fi
+
+    # 9. Rick version
+    printf "  Rick version:         "
+    RICK_VER_FILE="$HOME/.openclaw/.rick_version"
+    if [ -f "$RICK_VER_FILE" ]; then
+      echo "$PASS $(cat "$RICK_VER_FILE")"
+    else
+      echo "$WARN Unknown"
+    fi
+
+    # 10. Rick tier
+    printf "  Tier:                 "
+    RICK_TIER_FILE="$HOME/.openclaw/.rick_tier"
+    if [ -f "$RICK_TIER_FILE" ]; then
+      echo "$(cat "$RICK_TIER_FILE")"
+    else
+      echo "unknown"
+    fi
+
+    echo ""
+    echo "════════════════════════════════════════"
+    if [ "$ISSUES" -eq 0 ]; then
+      echo "  ✅ All checks passed. Rick is healthy."
+    else
+      echo "  ⚠️  $ISSUES issue(s) found."
+    fi
+    echo ""
+    echo "Share this output with Rick HQ: https://t.me/rickaiassistant_bot"
+    echo ""
+    ;;
+  connect-hq)
+    # Connect to Rick HQ for remote diagnosis
+    echo ""
+    echo "🔗 Rick Connect-HQ"
+    echo "════════════════════════════════════════"
+    echo ""
+
+    # Read or generate hive ID
+    HIVE_ID_FILE="$HOME/.openclaw/workspace/.hive-id"
+    if [ -f "$HIVE_ID_FILE" ]; then
+      HIVE_ID=$(cat "$HIVE_ID_FILE")
+    else
+      HIVE_ID=$(openssl rand -hex 8 2>/dev/null || python3 -c 'import os,binascii; print(binascii.hexlify(os.urandom(8)).decode())' 2>/dev/null || echo "unknown")
+      mkdir -p "$HOME/.openclaw/workspace"
+      printf '%s' "$HIVE_ID" > "$HIVE_ID_FILE"
+    fi
+
+    # Generate 6-char connection code
+    CONNECT_CODE=$(python3 -c "import random,string; print(''.join(random.choices(string.ascii_uppercase+string.digits,k=6)))" 2>/dev/null || echo "RICK00")
+
+    # Register with HQ
+    curl -s "https://meetrick.ai/api/hive/connect?code=${CONNECT_CODE}&id=${HIVE_ID}" > /dev/null 2>&1 || true
+
+    echo "  Your connection code: $CONNECT_CODE"
+    echo "  Hive ID: $HIVE_ID"
+    echo ""
+    echo "  Share this code with Rick HQ on Telegram:"
+    echo "  👉 https://t.me/rickaiassistant_bot"
+    echo ""
+    echo "  Send: /connect $CONNECT_CODE"
+    echo ""
+    echo "  Rick HQ will respond within 5 minutes."
+    echo ""
+    ;;
   *)            exec openclaw "$CMD" "$@" ;;
 esac
 RICK_WRAPPER
@@ -1384,10 +1714,31 @@ done
 export PATH="$HOME/.local/bin:$PATH"
 ok "rick command installed → try: rick start"
 
+# ================================================================
+# HEARTBEAT CRON — every 30 minutes
+# ================================================================
+if ! crontab -l 2>/dev/null | grep -q "rick heartbeat"; then
+  (crontab -l 2>/dev/null; echo "*/30 * * * * $HOME/.local/bin/rick heartbeat >> $HOME/.openclaw/.heartbeat.log 2>&1") | crontab -
+  debug "Installed heartbeat cron (every 30 minutes)"
+fi
+ok "Heartbeat scheduled (every 30 min)"
+
 # Ping complete
 ping_api "complete" "$(node -v 2>/dev/null || echo)" "$(openclaw --version 2>/dev/null || echo)"
 
 # Join the Rick network — fire and forget
+# Try to read telegram_chat_id from openclaw config if not captured during install
+if [ -z "${TG_CHAT_ID:-}" ] && [ -f "$OPENCLAW_DIR/openclaw.json" ]; then
+  TG_CHAT_ID=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        c = json.load(f)
+    ids = c.get('channels',{}).get('telegram',{}).get('allowedChatIds',[])
+    if ids: print(ids[0])
+except: pass
+" "$OPENCLAW_DIR/openclaw.json" 2>/dev/null || echo "")
+fi
 if [ "$NO_TELEMETRY" = false ]; then
   _NETWORK_PAYLOAD=$(python3 -c "
 import json, sys
@@ -1408,6 +1759,25 @@ print(json.dumps({
     -H 'Content-Type: application/json' \
     -d "$_NETWORK_PAYLOAD" >/dev/null 2>&1 &
 fi
+
+# ================================================================
+# HIVE REGISTRATION — non-blocking, best-effort
+# ================================================================
+HIVE_ID=$(openssl rand -hex 8 2>/dev/null || python3 -c 'import os,binascii; print(binascii.hexlify(os.urandom(8)).decode())' 2>/dev/null || echo "unknown")
+printf '%s' "$HIVE_ID" > "$WORKSPACE_DIR/.hive-id" 2>/dev/null || true
+
+# Beacon to hive (non-blocking — if this fails, install continues fine)
+curl -s "https://meetrick.ai/api/hive/register?id=${HIVE_ID}&tier=${TIER}" > /dev/null 2>&1 || true
+
+# Fetch hive size for display (best-effort)
+HIVE_SIZE=$(curl -s --max-time 5 "https://meetrick.ai/api/hive/register.json" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('hive_size','56'))" 2>/dev/null || echo "56")
+HIVE_NUM=$(( HIVE_SIZE + 1 ))
+
+echo ""
+echo -e "${YELLOW}🐝 Connected to the Rick Hive. You're Rick #${HIVE_NUM}.${NC}"
+echo -e "   ${DIM}Hive ID: ${HIVE_ID}${NC}"
+echo -e "   ${DIM}Learn more: https://meetrick.ai/hive${NC}"
+echo ""
 
 # Final clear success box
 echo ""
