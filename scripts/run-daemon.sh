@@ -227,8 +227,10 @@ PYEOF_SL
     [[ -f "$logpath" ]] || continue
     age_min=$(( ( $(date +%s) - $(stat -f %m "$logpath") ) / 60 ))
     if (( age_min > max_age_min )); then
-      echo "[sibling-liveness] $agent log stale ${age_min}m (max ${max_age_min}m) — kickstart"
-      launchctl kickstart "gui/$(id -u)/$agent" 2>/dev/null \
+      echo "[sibling-liveness] $agent log stale ${age_min}m (max ${max_age_min}m) — kickstart -k"
+      # -k required: wedged agents sit in 'pended nondemand spawn' and a plain
+      # kickstart no-ops; kill+restart clears it (verify-fix session 2026-07-20).
+      launchctl kickstart -k "gui/$(id -u)/$agent" 2>/dev/null \
         || echo "[sibling-liveness] kickstart FAILED for $agent"
     fi
   done <<'LIVENESS'
