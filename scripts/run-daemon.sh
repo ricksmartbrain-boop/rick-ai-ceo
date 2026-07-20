@@ -216,5 +216,26 @@ pathlib.Path(state_file).parent.mkdir(parents=True, exist_ok=True)
 pathlib.Path(state_file).write_text(json.dumps(state, indent=2))
 PYEOF_SL
 
+  # Sibling liveness (2026-07-20): launchd StartInterval agents silently stop
+  # firing after sleep/wake churn — guardian sat dead 26h on 2026-07-19 with
+  # exit 0 while this daemon kept running, and nothing watches the watchers.
+  # If a sibling's log is stale past ~3x its interval, kickstart it. The log
+  # mtime itself is the throttle: a healthy kick refreshes it; a broken agent
+  # shows up here every cycle, loudly.
+  while IFS='|' read -r agent logfile max_age_min; do
+    logpath="$HOME/rick-vault/logs/cron/$logfile"
+    [[ -f "$logpath" ]] || continue
+    age_min=$(( ( $(date +%s) - $(stat -f %m "$logpath") ) / 60 ))
+    if (( age_min > max_age_min )); then
+      echo "[sibling-liveness] $agent log stale ${age_min}m (max ${max_age_min}m) — kickstart"
+      launchctl kickstart "gui/$(id -u)/$agent" 2>/dev/null \
+        || echo "[sibling-liveness] kickstart FAILED for $agent"
+    fi
+  done <<'LIVENESS'
+ai.rick.guardian|guardian.log|90
+ai.rick.email-sequence|email-send-outbox.log|45
+ai.rick.imap-watcher|imap-watcher.log|30
+LIVENESS
+
   sleep "$INTERVAL_SECONDS"
 done
