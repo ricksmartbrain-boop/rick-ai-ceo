@@ -34,10 +34,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # ── Env load ──────────────────────────────────────────────────────────────────
-for _env_file in [
-    Path.home() / "clawd" / "config" / "rick.env",
-    Path.home() / ".openclaw" / "workspace" / "config" / "rick.env",
-]:
+# RICK_ENV_FILE overrides the rick.env search path so test/sandbox processes
+# never inject production credentials at import time (2026-07-20: pytest
+# collection imported this module and put the live bot token in os.environ).
+for _env_file in (
+    [Path(os.environ["RICK_ENV_FILE"])]
+    if os.environ.get("RICK_ENV_FILE")
+    else [
+        Path.home() / "clawd" / "config" / "rick.env",
+        Path.home() / ".openclaw" / "workspace" / "config" / "rick.env",
+    ]
+):
     if _env_file.exists():
         for _line in _env_file.read_text().splitlines():
             _line = _line.strip()

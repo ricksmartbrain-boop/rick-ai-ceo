@@ -22,6 +22,18 @@ def make_test_db() -> sqlite3.Connection:
     return conn
 
 
+def insert_workflow(conn: sqlite3.Connection, wf_id: str) -> None:
+    # Schema enforces outcomes.workflow_id -> workflows(id): every outcome must
+    # trace back to a real workflow, so fixtures create the parent row first.
+    conn.execute(
+        """INSERT INTO workflows (id, kind, title, slug, project, status, stage,
+                                  context_json, created_at, updated_at)
+           VALUES (?, 'test', ?, ?, 'test-proj', 'active', 'execute',
+                   '{}', datetime('now'), datetime('now'))""",
+        (wf_id, f"Test {wf_id}", wf_id),
+    )
+
+
 def test_high_confidence_tier():
     """0 failures + 3+ wins = high tier."""
     conn = make_test_db()
@@ -29,6 +41,7 @@ def test_high_confidence_tier():
 
     # Insert 3 successful outcomes, 0 failures
     for i in range(3):
+        insert_workflow(conn, f"wf_{i}")
         conn.execute(
             """INSERT INTO outcomes (workflow_id, step_name, route, outcome_type, created_at)
                VALUES (?, ?, ?, 'success', datetime('now', ?))""",
@@ -46,11 +59,13 @@ def test_medium_confidence_tier():
     from runtime.engine import overnight_confidence_tier
 
     for i in range(3):
+        insert_workflow(conn, f"wf_{i}")
         conn.execute(
             """INSERT INTO outcomes (workflow_id, step_name, route, outcome_type, created_at)
                VALUES (?, ?, ?, 'success', datetime('now', ?))""",
             (f"wf_{i}", f"step_{i}", "writing", f"-{i} hours"),
         )
+    insert_workflow(conn, "wf_fail")
     conn.execute(
         """INSERT INTO outcomes (workflow_id, step_name, route, outcome_type, created_at)
            VALUES ('wf_fail', 'step_fail', 'writing', 'failure', datetime('now'))"""
@@ -67,6 +82,7 @@ def test_low_confidence_tier():
     from runtime.engine import overnight_confidence_tier
 
     for i in range(3):
+        insert_workflow(conn, f"wf_{i}")
         conn.execute(
             """INSERT INTO outcomes (workflow_id, step_name, route, outcome_type, created_at)
                VALUES (?, ?, ?, 'failure', datetime('now', ?))""",

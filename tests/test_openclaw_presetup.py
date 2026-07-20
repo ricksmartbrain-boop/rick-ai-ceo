@@ -102,22 +102,23 @@ class OpenClawPreSetupTests(unittest.TestCase):
         self.assertFalse(session_policy["session"]["dm"]["enabled"])
 
     def test_doctor_reports_openclaw_profile_gaps_and_clears_after_bootstrap(self) -> None:
+        # doctor.sh trimmed required_envs to critical-only vars, so openclaw
+        # profile gaps no longer appear under '## Missing Config Files'. With
+        # thread mode enabled, a missing session policy file surfaces as a
+        # '## Warnings' line instead — and must clear once bootstrap creates it.
+        session_policy_path = self.workspace_root / "config" / "openclaw-session-policy.json"
         initial = self.run_script("scripts/doctor.sh")
-        self.assertIn("RICK_OPENCLAW_SESSION_POLICY_FILE", initial.stdout)
-        self.assertIn("RICK_OPENCLAW_AGENT_BLUEPRINT_FILE", initial.stdout)
+        self.assertIn("## Warnings", initial.stdout)
+        self.assertIn(
+            f"thread mode enabled but session policy file is missing: {session_policy_path}",
+            initial.stdout,
+        )
 
         self.run_script("scripts/bootstrap.sh")
         after = self.run_script("scripts/doctor.sh")
 
-        self.assertNotIn(
-            f"RICK_OPENCLAW_SESSION_POLICY_FILE:{self.workspace_root / 'config' / 'openclaw-session-policy.json'}",
-            after.stdout,
-        )
-        self.assertNotIn(
-            f"RICK_OPENCLAW_AGENT_BLUEPRINT_FILE:{self.workspace_root / 'config' / 'openclaw-agent-blueprint.json'}",
-            after.stdout,
-        )
         self.assertNotIn("thread mode enabled but session policy file is missing", after.stdout)
+        self.assertNotIn("## Warnings", after.stdout)
 
     def test_guardrails_audit_founder_gating_reads_openclaw_allowlist(self) -> None:
         # Real Telegram gating is the openclaw.json allowlist, not legacy env vars:
@@ -144,9 +145,12 @@ class OpenClawPreSetupTests(unittest.TestCase):
         self.assertIn("| Founder control gating | fail |", missing.stdout)
 
     def test_docs_capture_single_agent_now_and_four_agent_later(self) -> None:
+        # The setup/profile docs live under docs/ since commit fff4410
+        # (2026-07-14 snapshot) — the workspace root keeps only operational
+        # docs; there is no git history of root-level copies.
         readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
-        setup_doc = (ROOT_DIR / "OPENCLAW_SETUP.md").read_text(encoding="utf-8")
-        profile_doc = (ROOT_DIR / "OPENCLAW_PROFILE.md").read_text(encoding="utf-8")
+        setup_doc = (ROOT_DIR / "docs" / "OPENCLAW_SETUP.md").read_text(encoding="utf-8")
+        profile_doc = (ROOT_DIR / "docs" / "OPENCLAW_PROFILE.md").read_text(encoding="utf-8")
 
         self.assertIn("one main OpenClaw agent (`rick`) stays active", readme)
         self.assertIn("future `rick-ceo`, `rick-builder`, `rick-distribution`, and `rick-customer-ops`", setup_doc)
