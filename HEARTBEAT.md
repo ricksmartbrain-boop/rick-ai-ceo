@@ -105,7 +105,8 @@ The heartbeat should **not** trigger these. They are invoked by cron, the daemon
 5. If ahead of plan, pull the next priority forward.
 6. If there is no urgent revenue fire, default to the MRR grinder loop in `$RICK_DATA_ROOT/control/mrr-grinder-loop.md`.
 7. If no traffic, outreach, acquisition, or client-facing action has shipped in the last 6 hours, the heartbeat should usually execute one before ending. Monitoring alone does not satisfy the beat in that case.
-8. Log progress to the daily note.
+8. One-time (Sat 2026-07-25, after 09:30 PT): verify the weekly newsletter run — `~/clawd/skills/newsletter/issues/issue-0NN.json` written, ONE-ISSUE INSERT deleted from `~/rick-vault/projects/newsletter/weekly-newsletter-prompt.md`, `sent_at` set in `~/rick-vault/control/lingualive-arm.json`, cron job `a98e7d9e` `last_run_status='ok'` in `~/.openclaw/state/openclaw.sqlite` — if the run FAILED, page Vlad via Telegram immediately (the cron's own failure alert does not deliver: `state_json` `lastFailureNotificationDelivered=false` from the 2026-07-18 attempt). Remove this item after Jul-25.
+9. Log progress to the daily note.
 
 ## Site Health Check (every heartbeat)
 
