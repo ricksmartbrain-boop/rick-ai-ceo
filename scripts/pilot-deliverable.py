@@ -11,10 +11,18 @@ Usage:
   python3 scripts/pilot-deliverable.py --intake-json '{"name":"Arjun Patel","email":"arjun@rtrvr.ai","company_url":"https://rtrvr.ai","bottleneck":"need warm reply rate I can show investors","calendly":null}'
   python3 scripts/pilot-deliverable.py --jsonl ~/rick-vault/operations/pilot-intake.jsonl --slug rtrvr-ai
 
-Smart-models invariant:
-  - Reasoning  (ICP scoring)        → claude-opus-4-8
-  - Writing    (cold email drafts)  → claude-sonnet-4-6
-  - Never gpt-5.4-mini.
+Smart-models invariant (2026-07-21: now via Rick's resilient route chain, not a
+direct api.anthropic.com call — the old direct call returned generic hardcoded
+ICP + 10 unrelated prospects for EVERY customer whenever the Anthropic API was
+credit-dead, silently shipping a fake "personalized" deliverable):
+  - Reasoning  (ICP scoring)        → route 'analysis' (gpt-5.6-terra; clean
+                                       JSON extraction; walks live rungs)
+  - Writing    (cold email drafts)  → route 'writing'  (claude-cli sonnet-4-6)
+  - Never a budget/mini tier. Rungs skip credit-dead/cooling providers.
+
+--degraded-ok: a paid Day-1 deliverable must NOT ship the generic template
+silently — if the LLM chain is fully dead, main() exits nonzero unless this
+flag is passed (fail loud, Rule 12).
 
 Idempotent: identical intake → identical output bytes (deterministic seed +
 sorted prospect list). Safe to re-run.
@@ -42,8 +50,26 @@ PT = timezone(timedelta(hours=-7))
 USER_AGENT = "Mozilla/5.0 (compatible; RickPilotBot/1.0; +https://meetrick.ai/pilot)"
 
 # Models — load via env so the rest of Rick's chain stays the source of truth.
-MODEL_REASON = os.getenv("RICK_MODEL_REASON", "claude-opus-4-8")
-MODEL_WRITE = os.getenv("RICK_MODEL_WRITE", "claude-sonnet-4-6")
+# Routes (not raw model ids): generate_text walks each route's provider ladder
+# and skips credit-dead/cooling rungs, so the deliverable survives the
+# Anthropic API being down. 'analysis' (gpt-5.6-terra) is the structured-
+# extraction route — its system prompt yields clean JSON, where 'strategy'
+# (gpt-5.6-sol) returns strategy prose that fights the JSON contract. 'writing'
+# = claude-cli sonnet (subscription, unaffected by API credits).
+ROUTE_REASON = "analysis"
+ROUTE_WRITE = "writing"
+
+# Load founder-sourcer.py for its import side effects only: rick.env
+# setdefault-load + sys.path setup so `runtime` is importable (same pattern as
+# concierge-dossier.py / concierge-reply-assist.py). It fetches nothing at
+# import time.
+import importlib.util as _ilu  # noqa: E402
+_FS_PATH = Path(__file__).resolve().parent / "founder-sourcer.py"
+_fs_spec = _ilu.spec_from_file_location("founder_sourcer", _FS_PATH)
+_fs_mod = _ilu.module_from_spec(_fs_spec)
+_fs_spec.loader.exec_module(_fs_mod)
+
+_LLM_FALLBACK = "PILOT-DELIVERABLE-FALLBACK-DO-NOT-USE"
 
 
 # ---------------- intake helpers ----------------
@@ -105,33 +131,23 @@ def crawl_site(url: str) -> dict:
     return out
 
 
-def claude_call(model: str, prompt: str, max_tokens: int = 1500) -> str:
-    """Thin wrapper around Anthropic Messages API. Returns text or '' on any error."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return ""
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+def llm_generate(route: str, prompt: str) -> str:
+    """Generate via Rick's resilient route chain. Unlike the old direct
+    api.anthropic.com call, generate_text walks the route's provider ladder and
+    skips any rung that is credit-dead/cooling — so this survives the Anthropic
+    API being down (the current state), instead of silently degrading the whole
+    deliverable to a generic template. Returns text, or '' so callers fall back
+    to their deterministic template (fail loud is enforced in main())."""
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            payload = json.loads(r.read())
-            chunks = payload.get("content", [])
-            return "".join(c.get("text", "") for c in chunks if c.get("type") == "text")
-    except Exception as e:
-        return f"<!-- claude_call_failed model={model} err={e} -->"
+        from runtime.llm import generate_text
+    except Exception as exc:  # runtime unavailable — let callers degrade
+        print(f"[llm   ] runtime.llm import failed: {exc}", file=sys.stderr)
+        return ""
+    result = generate_text(route, prompt, _LLM_FALLBACK, force_fresh=True)
+    text = (result.content or "").strip()
+    if result.mode == "fallback" or _LLM_FALLBACK in text:
+        return ""
+    return text
 
 
 def infer_icp(intake: dict, crawl: dict) -> dict:
@@ -147,7 +163,7 @@ def infer_icp(intake: dict, crawl: dict) -> dict:
         f'(exactly 10 plausible real-world prospects)}}.\n\nReturn ONLY the JSON, no commentary.\n\n'
         f"=== CRAWL ===\n{crawl_blob}"
     )
-    raw = claude_call(MODEL_REASON, prompt, max_tokens=2400)
+    raw = llm_generate(ROUTE_REASON, prompt)
     # Pull out JSON (model sometimes wraps in fences)
     m = re.search(r"\{[\s\S]*\}", raw)
     if m:
@@ -157,9 +173,13 @@ def infer_icp(intake: dict, crawl: dict) -> dict:
                 return data
         except Exception:
             pass
-    # Deterministic fallback so the deliverable still ships.
+    # Deterministic fallback so the deliverable still ships. _degraded flags
+    # that the LLM reasoning was unavailable — the prospects below are generic
+    # placeholders, NOT this customer's ICP; main() refuses to ship it as a
+    # paid deliverable unless --degraded-ok is passed (fail loud, Rule 12).
     domain = urlparse(intake["company_url"]).netloc.replace("www.", "")
     return {
+        "_degraded": True,
         "company_one_liner": f"{domain} — autonomous category, niche unverified",
         "icp_segment": "indie founders + small-team SaaS",
         "icp_persona": "solo or 2-person founder",
@@ -203,7 +223,7 @@ def draft_emails(intake: dict, icp: dict) -> list[dict]:
             f"- No fake metrics. No 'I noticed you're a leader in your space'. No 'just circling back'.\n\n"
             f"Return JSON only: {{\"subject\": str, \"body\": str}}."
         )
-        raw = claude_call(MODEL_WRITE, prompt, max_tokens=600)
+        raw = llm_generate(ROUTE_WRITE, prompt)
         m = re.search(r"\{[\s\S]*\}", raw or "")
         if m:
             try:
@@ -336,7 +356,7 @@ def build_html(intake: dict, icp: dict, emails: list[dict]) -> str:
     <a class="cta alt" href="/this-week">SEE WHAT RICK SHIPPED THIS WEEK →</a>
   </div>
 </div>
-<footer>meetrick.ai/pilot/{escape(slugify(intake['company_url']))} — private deliverable for {escape(intake['email'])}. Generated {escape(now_pt)}.</footer>
+<footer>meetrick.ai/pilot/{escape(slugify(intake['company_url']))} — private deliverable for {escape(intake.get('email','')) or '(no email on file)'}. Generated {escape(now_pt)}.</footer>
 </body></html>
 """
 
@@ -353,7 +373,7 @@ def append_ledger(intake: dict, icp: dict, emails: list[dict], slug: str, out_pa
         "deliverable_path": str(out_path),
         "icp_one_liner": icp.get("company_one_liner"),
         "email_count": len(emails),
-        "models": {"reason": MODEL_REASON, "write": MODEL_WRITE},
+        "models": {"reason_route": ROUTE_REASON, "write_route": ROUTE_WRITE},
     }
     with INTAKE_LEDGER.open("a") as f:
         f.write(json.dumps(row) + "\n")
@@ -368,19 +388,36 @@ def main():
     ap.add_argument("--slug", help="when reading --jsonl, pick the row whose company_url slugifies to this")
     ap.add_argument("--out-dir", default=str(DELIVERABLE_DIR))
     ap.add_argument("--dry-run", action="store_true", help="print first 20 lines of HTML, don't write")
+    ap.add_argument("--degraded-ok", action="store_true",
+                    help="ship even if the LLM chain is dead and the ICP is the generic placeholder")
     args = ap.parse_args()
 
     intake = load_intake(args)
+    # Validate load-bearing fields BEFORE spending ~11 LLM calls; email is
+    # display-only, so it is optional (was a hard KeyError at final render —
+    # crashing the whole deliverable after all the work over a footer field).
+    for _req in ("company_url", "name", "bottleneck"):
+        if not str(intake.get(_req, "")).strip():
+            sys.exit(f"[err] intake missing required field {_req!r} — cannot build a real deliverable")
+    intake.setdefault("email", "")
     slug = slugify(intake["company_url"])
 
     print(f"[crawl ] {intake['company_url']}", file=sys.stderr)
     crawl = crawl_site(intake["company_url"])
     print(f"[crawl ] {len(crawl)} pages reached", file=sys.stderr)
 
-    print(f"[icp   ] inferring with {MODEL_REASON}", file=sys.stderr)
+    print(f"[icp   ] inferring via route={ROUTE_REASON}", file=sys.stderr)
     icp = infer_icp(intake, crawl)
+    if icp.get("_degraded") and not args.degraded_ok:
+        sys.exit(
+            f"[err] LLM chain unavailable — ICP fell back to the GENERIC placeholder "
+            f"(prospects are not {slug}'s). Refusing to ship a fake 'personalized' "
+            f"deliverable for a paid pilot. Fix the LLM chain (Anthropic API is "
+            f"credit-dead; check claude-cli + OpenAI rungs) and re-run, or pass "
+            f"--degraded-ok to ship the placeholder deliberately."
+        )
 
-    print(f"[draft ] {len(icp.get('sample_prospects', []))} emails with {MODEL_WRITE}", file=sys.stderr)
+    print(f"[draft ] {len(icp.get('sample_prospects', []))} emails via route={ROUTE_WRITE}", file=sys.stderr)
     emails = draft_emails(intake, icp)
 
     html = build_html(intake, icp, emails)
