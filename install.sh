@@ -83,9 +83,10 @@ print_rick_salute() {
   echo -e "${NC}"
 }
 
-step()  { echo -e "\n${CYAN}[$1/8]${NC} ${BOLD}$2${NC}"; log "STEP $1: $2"; }
+step()  { echo -e "\n${CYAN}[$1/9]${NC} ${BOLD}$2${NC}"; log "STEP $1: $2"; }
 ok()    { echo -e "  ${GREEN}✓ $1${NC}"; log "OK: $1"; }
 fail()  { echo -e "  ${RED}✗ $1${NC}"; log "FAIL: $1"; exit 1; }
+error() { echo -e "  ${RED}✗ $1${NC}"; log "ERROR: $1"; }  # like fail, but never exits — call sites handle exit themselves
 warn()  { echo -e "  ${YELLOW}! $1${NC}"; log "WARN: $1"; }
 info()  { echo -e "  $1"; log "INFO: $1"; }
 debug() { if [ "$VERBOSE" = true ]; then echo -e "  ${DIM}$1${NC}"; fi; log "DEBUG: $1"; }
@@ -137,7 +138,7 @@ usage() {
   echo "  --tier free|pro|lifetime|managed|business  Skip tier selection prompt"
   echo "  --license-key KEY           Provide license key (for pro/lifetime/managed)"
   echo "  --non-interactive           Skip all prompts (requires --tier)"
-  echo "  --no-telemetry              Opt out of anonymous install analytics"
+  echo "  --no-telemetry              Opt out of install analytics + network registration"
   echo "  --uninstall                 Remove Rick"
   echo "  --verbose                   Show debug output"
   echo "  --help                      Show this help message"
@@ -339,8 +340,9 @@ ping_api() {
 
 # Telemetry notice
 if [ "$NO_TELEMETRY" = false ]; then
-  echo -e "  ${DIM}Rick sends anonymous install analytics (approximate location, tier, version)"
-  echo -e "  to improve the product. No personal data is collected. Opt out: --no-telemetry${NC}"
+  echo -e "  ${DIM}Rick sends install analytics (approximate location, tier, version) and registers your"
+  echo -e "  Rick on the network — Rick ID, Telegram chat ID/username, and your email only if you"
+  echo -e "  type it or say yes when asked. Opt out of all of it: --no-telemetry${NC}"
   echo ""
 fi
 
@@ -505,7 +507,7 @@ if [ -z "$TIER" ]; then
     echo -e "  ${BOLD}[1]${NC} Rick Free — \$0/forever"
     echo "      5 skills, Telegram, community support"
     echo ""
-    echo -e "  ${BOLD}[2]${NC} Rick Pro — \$9/month"
+    echo -e "  ${BOLD}[2]${NC} Rick Pro — \$29/month"
     echo "      15+ skills, role templates, green dot on Rick Map"
     echo ""
     echo -e "  ${BOLD}[3]${NC} Rick Lifetime — \$199 one-time"
@@ -1119,11 +1121,21 @@ if [ -n "$RICK_SECRET" ]; then
 fi
 
 # ── Add to Rick Operators newsletter audience (non-blocking) ──
+# A typed email (step 7 prompt) is consent and always wins. The git-config/openclaw.json
+# fallback is only offered interactively, behind an explicit y/N opt-in (default: N).
 if [ "$NO_TELEMETRY" != true ]; then
-  USER_EMAIL=""
-  # Try to find email from git config, env, or openclaw config
-  USER_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
-  [ -z "$USER_EMAIL" ] && USER_EMAIL=$(grep -o '[^"]*@[^"]*' "$OPENCLAW_DIR/openclaw.json" 2>/dev/null | head -1 || echo "")
+  USER_EMAIL="${USER_EMAIL:-}"
+  if [ -z "$USER_EMAIL" ] && [ "$NON_INTERACTIVE" = false ]; then
+    FALLBACK_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
+    [ -z "$FALLBACK_EMAIL" ] && FALLBACK_EMAIL=$(grep -o '[^"]*@[^"]*' "$OPENCLAW_DIR/openclaw.json" 2>/dev/null | head -1 || echo "")
+    if [ -n "$FALLBACK_EMAIL" ]; then
+      echo ""
+      read -rp "  Found $FALLBACK_EMAIL in your git config — get Rick's weekly newsletter there? (y/N): " NEWSLETTER_CONSENT
+      if [[ "$NEWSLETTER_CONSENT" =~ ^[Yy] ]]; then
+        USER_EMAIL="$FALLBACK_EMAIL"
+      fi
+    fi
+  fi
   if [ -n "$USER_EMAIL" ]; then
     curl -s --max-time 5 -X POST "https://rick-api-production.up.railway.app/api/v1/subscribe" \
       -H "Content-Type: application/json" \
