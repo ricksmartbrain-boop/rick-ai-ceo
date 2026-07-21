@@ -233,10 +233,21 @@ PYEOF_SL
       launchctl kickstart -k "gui/$(id -u)/$agent" 2>/dev/null \
         || echo "[sibling-liveness] kickstart FAILED for $agent"
     fi
+  # COVERAGE INVARIANT: the reply rail (reply-watcher/reply-router/outbound)
+  # MUST be in this list — on 2026-07-20 and again 2026-07-21 (send-session
+  # day) those agents wedged for ~23h while this watchdog only covered three
+  # unrelated agents, so prospect replies went unseen. Thresholds ≈2.5x each
+  # agent's StartInterval (daemon loops every ${INTERVAL_SECONDS}s). Keep in
+  # sync with tests/test_daemon_liveness.py.
   done <<'LIVENESS'
 ai.rick.guardian|guardian.log|65
 ai.rick.email-sequence|email-send-outbox.log|20
 ai.rick.imap-watcher|imap-watcher.log|15
+ai.rick.reply-watcher|reply-watcher.log|25
+ai.rick.reply-router|reply-router.log|25
+ai.rick.outbound|outbound-drain.log|15
+ai.rick.pilot-lead-poll|pilot-lead-poll.log|15
+ai.rick.roast-lead-poll|roast-lead-poll.log|25
 LIVENESS
 
   sleep "$INTERVAL_SECONDS"
