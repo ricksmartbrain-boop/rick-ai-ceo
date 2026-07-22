@@ -131,7 +131,9 @@ def choose_content(now: datetime, queue_count: int, mrr: str) -> tuple[str, str,
             ),
         ),
     ]
-    return variants[now.hour % len(variants)]
+    # Use hour//6 so runs at 00/06/12/18 pick different variants (0,1,2,0)
+    # rather than hour%3 which always returns 0 for all multiples of 6.
+    return variants[(now.hour // 6) % len(variants)]
 
 
 def post_moltbook(title: str, content: str) -> tuple[bool, str]:
