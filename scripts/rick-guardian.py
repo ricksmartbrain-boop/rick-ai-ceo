@@ -163,6 +163,7 @@ _DEDUP_NORMALIZE_PATTERNS = [
     re.compile(r"\(suppressed x\d+ in last \d+h\)"),
     re.compile(r"\b[a-z]+_[0-9a-f]{6,}\b"),                      # ULIDs / hex IDs
     re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"),  # ISO ts
+    re.compile(r"\d+(\.\d+)?\s*h\b"),                            # age tokens "50h"/"51h" — no \b between digit and 'h', so the bare-number pattern misses them and every hourly re-render evaded dedup (2026-07-23 alert-spam)
     re.compile(r"\b\d+(\.\d+)?\b"),                              # bare numbers / countdowns
 ]
 
@@ -364,14 +365,57 @@ def _is_pending_draft(path: Path) -> bool:
     """True for a real queued draft; False for docs / held artifacts."""
     if path.name in ("README.md", "MANIFEST.md"):
         return False
-    return not any(
-        part.startswith(OUTBOX_HELD_DIR_PREFIXES)
-        for part in path.relative_to(OUTBOX_DIR).parts
-    )
+    if any(part.startswith(OUTBOX_HELD_DIR_PREFIXES)
+           for part in path.relative_to(OUTBOX_DIR).parts):
+        return False
+    # JSON drafts carry their own state — a real email draft is status
+    # pending/queued, addressed, and on an email channel. Held/blocked/sent
+    # items and non-email artifacts (e.g. channel=hackernews_comment, or the
+    # to=null signal-reply files) are NOT a stuck email queue. The old check
+    # only globbed *.md, so it was blind to every founder-*.json (2026-07-23).
+    if path.suffix == ".json":
+        try:
+            d = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        if str(d.get("status") or "") not in ("pending", "queued"):
+            return False
+        if str(d.get("channel") or "").strip() in _NON_EMAIL_CHANNELS:
+            return False
+        if not (d.get("to") or d.get("recipient")):
+            return False
+    return True
+
+
+_NON_EMAIL_CHANNELS = frozenset({
+    "hackernews_comment", "hackernews", "x", "twitter", "linkedin",
+    "producthunt", "reddit", "threads", "instagram", "moltbook",
+})
+
+
+def _email_reputation_hold() -> str | None:
+    """If the email channel is intentionally paused by the sender-reputation
+    circuit-breaker (warmup cap 0), return a short human reason; else None.
+    A reputation hold is self-healing (auto-resumes when bounces age out) — a
+    backed-up queue during one is EXPECTED, not a drain malfunction."""
+    try:
+        import importlib.util
+        p = ROOT / "scripts" / "sender-warmup-schedule.py"
+        spec = importlib.util.spec_from_file_location("sender_warmup_schedule", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if mod.get_today_cap() > 0:
+            return None
+        rep = mod.sender_rep_7d()
+        return (f"warmup cap 0: 7d bounce rate {rep.get('bounce_rate_pct', '?')}% "
+                f"over {rep.get('sends_7d', '?')} sends")
+    except Exception:
+        return None  # can't determine → don't suppress a real stuck alert
 
 def check_sender(alerts: list) -> dict:
     pending = (
-        [p for p in OUTBOX_DIR.rglob("*.md") if _is_pending_draft(p)]
+        [p for p in OUTBOX_DIR.rglob("*")
+         if p.suffix in (".md", ".json") and _is_pending_draft(p)]
         if OUTBOX_DIR.exists() else []
     )
     oldest_age_h = 0.0
@@ -402,18 +446,33 @@ def check_sender(alerts: list) -> dict:
             if ts >= cutoff:
                 delivered_24h += 1
 
-    stuck = len(pending) > 0 and oldest_age_h >= 24 and delivered_24h == 0
-    if stuck:
+    backed_up = len(pending) > 0 and oldest_age_h >= 24 and delivered_24h == 0
+    paused_reason = _email_reputation_hold() if backed_up else None
+    # A backed-up queue during a reputation hold is EXPECTED and self-healing —
+    # not a malfunction. Fire a calm, dedup-stable note (numbers stripped by the
+    # dedup normalizer → at most once/24h), NOT the 🚨 STUCK malfunction alert.
+    stuck = backed_up and not paused_reason
+    if paused_reason:
+        alerts.append(alert(
+            "guardian:sender_paused",
+            f"[rick-guardian] Cold-email queue paused by the sender-reputation "
+            f"circuit-breaker ({paused_reason}); {len(pending)} draft(s) held, "
+            f"oldest {oldest_age_h:.0f}h. Self-heals when bounces age out — no "
+            f"action unless it persists past ~7d.",
+        ))
+    elif stuck:
         alerts.append(alert(
             "guardian:sender_stuck",
             f"🚨 [rick-guardian] Email queue STUCK: {len(pending)} pending "
             f"draft(s) in mailbox/outbox, oldest {oldest_age_h:.0f}h old, "
-            f"0 delivered in 24h. Check email-sequence-send / channel pause.",
+            f"0 delivered in 24h, no reputation hold. Drain may be broken — "
+            f"check email-send-outbox / channel_state.",
         ))
     return {
         "pending": len(pending),
         "oldest_pending_hours": round(oldest_age_h, 1),
         "delivered_24h": delivered_24h,
+        "paused_reason": paused_reason,
         "stuck": stuck,
     }
 
