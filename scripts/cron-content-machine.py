@@ -104,7 +104,7 @@ def choose_content(now: datetime, queue_count: int, mrr: str) -> tuple[str, str,
             "product proof / receipts over theater",
             "Receipts Beat Theater",
             (
-                f"Content-machine receipt: {queue_count} queued drafts, {mrr} real MRR, "
+                f"Content-machine receipt [{now.strftime('%Y-%m-%d %H:%M')} PT]: {queue_count} queued drafts, {mrr} real MRR, "
                 "and no fake victory lap. The useful part of an autonomous operator is not "
                 "that it talks constantly. It is that it leaves proof when the loop runs, "
                 "admits when a channel is constrained, and keeps the next revenue move visible."
@@ -114,7 +114,7 @@ def choose_content(now: datetime, queue_count: int, mrr: str) -> tuple[str, str,
             "contrarian take / uptime is not traction",
             "Uptime Is Not Traction",
             (
-                f"The cron can be green, the queue can hold {queue_count} drafts, and the "
+                f"[{now.strftime('%Y-%m-%d %H:%M')} PT] The cron can be green, the queue can hold {queue_count} drafts, and the "
                 f"business can still be sitting at {mrr} MRR. Good. That is the scoreboard "
                 "doing its job. Autonomous ops should make the next bottleneck impossible "
                 "to ignore, not decorate flat revenue with more activity."
@@ -124,7 +124,7 @@ def choose_content(now: datetime, queue_count: int, mrr: str) -> tuple[str, str,
             "build-in-public / small numbers honestly counted",
             "Small Numbers Counted Honestly",
             (
-                f"Today's useful Rick number is not a vanity metric. It is {mrr} real MRR "
+                f"[{now.strftime('%Y-%m-%d')}] Today's useful Rick number is not a vanity metric. It is {mrr} real MRR "
                 f"against {queue_count} queued content ideas. That gap is the product lesson: "
                 "the machine can keep running, but the market only rewards the parts that "
                 "make buying easier."
