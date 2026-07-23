@@ -35,6 +35,28 @@ PERMANENT_BLOCK_PREFIXES = ("suppressed", "placeholder_domain", "role_account", 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 FROM_EMAIL = os.getenv("RICK_EMAIL_FROM", "rick@meetrick.ai")
 MAX_PER_BATCH = 20
+# Freshness gate (2026-07-23): a cold first-touch draft that missed its veto
+# window by this many hours is stale — the "just saw your Show HN" hook is dead,
+# AND a backlog of stale cold drafts would all fire at once the moment a
+# reputation hold lifts (2026-07-23: 10 founder drafts sat 24-49h behind a
+# bounce-rate cap of 0, sendable the instant it cleared). Park them as held so
+# they can never auto-send. Reversible: set status back to pending.
+STALE_COLD_HOURS = float(os.getenv("RICK_STALE_COLD_HOURS", "24"))
+
+
+def _is_stale_cold(msg: dict, now_iso: str) -> bool:
+    """True for a cold draft whose send_after is > STALE_COLD_HOURS in the past."""
+    if not msg.get("cold"):
+        return False
+    send_after = str(msg.get("send_after") or "")
+    if not send_after:
+        return False
+    try:
+        age_h = (datetime.fromisoformat(now_iso)
+                 - datetime.fromisoformat(send_after)).total_seconds() / 3600.0
+    except ValueError:
+        return False
+    return age_h > STALE_COLD_HOURS
 
 
 def _workspace_root() -> Path:
@@ -215,6 +237,39 @@ def process_outbox(dry_run: bool = False) -> dict:
         send_after = msg.get("send_after", "")
         if send_after and send_after > now:
             skipped += 1
+            continue
+
+        # Freshness gate BEFORE the channel-hold skip: a stale cold draft must
+        # be PARKED (not merely skipped), or it would auto-send the instant a
+        # reputation/volume hold lifts. Park regardless of transactional_only.
+        if _is_stale_cold(msg, now):
+            if dry_run:
+                print(f"[DRY RUN] Would hold stale cold {f.name}")
+                skipped += 1
+                continue
+            claim = f.with_name(f.name + ".sending")
+            try:
+                f.rename(claim)  # atomic claim so a concurrent consumer can't send it mid-park
+            except OSError:
+                continue
+            try:
+                sm = json.loads(claim.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                claim.rename(f)
+                continue
+            if sm.get("status") != "pending":
+                claim.rename(f)
+                continue
+            sm["prior_status"] = "pending"
+            sm["status"] = "held"
+            sm["held_at"] = now
+            sm["held_reason"] = (f"stale-cold: missed veto window by >{STALE_COLD_HOURS:.0f}h; "
+                                 "parked so a reputation/volume-cap restore can't auto-send a "
+                                 "dead-hook cold batch (reversible: status→pending)")
+            claim.write_text(json.dumps(sm, indent=2), encoding="utf-8")
+            claim.rename(f)  # stays in outbox as held; guardian + this drain both skip non-pending
+            skipped += 1
+            print(f"Held stale cold {f.name} (age > {STALE_COLD_HOURS:.0f}h past send_after)")
             continue
 
         # Channel blocked for marketing (quiet hours / volume caps):
