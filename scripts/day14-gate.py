@@ -256,14 +256,38 @@ def reply_counts():
 
 # ── 4. Calls booked (control/call-queue.jsonl) ───────────────────────────────
 
+# Automated / non-human senders that the reply-router sometimes tags CALL-intent
+# (e.g. updates@e.stripe.com on 2026-07-20) — a Stripe notification is not a
+# booked call and must never inflate the gate.
+_AUTOMATED_LOCALPARTS = frozenset({
+    "noreply", "no-reply", "donotreply", "notifications", "notification",
+    "updates", "update", "mailer-daemon", "postmaster", "bounce", "bounces", "no_reply",
+})
+_AUTOMATED_DOMAINS = ("stripe.com", "e.stripe.com", "e.stripe.com", "sentry.io")
+
+
+def _is_automated_sender(addr):
+    a = (addr or "").strip().lower()
+    if "@" not in a:
+        return False
+    localpart, _, domain = a.partition("@")
+    return (localpart in _AUTOMATED_LOCALPARTS
+            or any(domain == d or domain.endswith("." + d) for d in _AUTOMATED_DOMAINS))
+
+
 def call_counts():
-    real, drills = [], 0
+    real, drills, seen = [], 0, set()
     for row in read_jsonl(CALL_QUEUE):
         if row.get("intent") != "CALL" or (row.get("ts") or "")[:10] < WINDOW_START:
             continue
-        if looks_like_drill(row.get("lead"), row.get("subject"), row.get("src_id")):
-            drills += 1
+        lead = str(row.get("lead") or "").strip().lower()
+        if looks_like_drill(row.get("lead"), row.get("subject"), row.get("src_id")) \
+                or _is_automated_sender(lead):
+            drills += 1  # drill / automated-noise bucket, excluded from 'real'
             continue
+        if lead and lead in seen:
+            continue  # dedup — one prospect is one call, not one per reply
+        seen.add(lead)
         real.append((row.get("ts", "")[:10], row.get("lead"), row.get("status")))
     return {"real": real, "drills": drills, "exists": os.path.exists(CALL_QUEUE)}
 
@@ -396,12 +420,23 @@ def render():
     pilots_n = pilots["intake_real"] + pilots["db_rows"]
     new_subs = len(ll["new_active"])
 
-    # Engine 1 — meetrick concierge. COLD only counts once the touch
-    # precondition (>=60 hand-sends) was actually met; a 0-touch "COLD" would
-    # pivot on a test that never ran.
-    if calls_n > 0:
+    # Engine 1 — meetrick concierge. GREEN and COLD BOTH require that the test
+    # actually ran (>=1 concierge touch sent): a 0-touch GREEN would credit the
+    # engine for inbound replies it never generated (2026-07-23: 0 touches sent,
+    # yet 4 "calls" were all noise — a Stripe bot + westcoscia counted twice),
+    # and a 0-touch COLD would pivot on a test that never ran. With 0 touches
+    # the honest verdict is NOT-YET-TESTABLE regardless of unrelated inbound.
+    if con["sent"] == 0:
+        eng1 = "NOT-YET-TESTABLE"
+        eng1_note = ("0/%d touches sent — the concierge test is NOT RUNNING; "
+                     "at this pace 2026-07-27 arrives with no data"
+                     % TOUCH_TARGET_LOW)
+        if calls_n > 0:
+            eng1_note += (" (%d inbound call-intent repl(ies) exist but are NOT "
+                          "concierge-attributable — no touches were sent)" % calls_n)
+    elif calls_n > 0:
         eng1 = "GREEN"
-        eng1_note = "%d booked call(s) in the queue" % calls_n
+        eng1_note = "%d call-intent repl(ies) after %d touch(es)" % (calls_n, con["sent"])
     elif con["sent"] >= TOUCH_TARGET_LOW:
         eng1 = "COLD"
         eng1_note = "%d touches, zero booked calls" % con["sent"]
